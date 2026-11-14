@@ -1,0 +1,7 @@
+[package]
+name = "helix_core_spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+helix-core = { git = "https://github.com/helix-editor/helix", tag = "25.07.1" }
