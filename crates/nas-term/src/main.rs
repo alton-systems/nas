@@ -7,7 +7,7 @@ mod ui;
 use std::io;
 
 use nas_editor::{Document, OpenError};
-use nas_keys::ModalState;
+use nas_keys::{Layout, ModalState};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{self, SetCursorStyle};
@@ -29,7 +29,7 @@ async fn main() -> io::Result<()> {
     let log_path = logging::init()?;
     tracing::info!(path = %log_path.display(), "nas iniciado");
 
-    let mut app = App::new(open_document_from_args()?);
+    let mut app = App::with_layout(open_document_from_args()?, keyboard_layout());
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app).await;
@@ -56,6 +56,19 @@ fn open_document_from_args() -> io::Result<Document> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// Layout físico de teclado, escolhido por `NAS_KEYBOARD_LAYOUT`
+/// ("qwerty" ou "qwerty-abnt"). Sem a variável, ou com um nome
+/// desconhecido, usa qwerty (o padrão do próprio nas-keys).
+fn keyboard_layout() -> Layout {
+    let Ok(name) = std::env::var("NAS_KEYBOARD_LAYOUT") else {
+        return Layout::Qwerty;
+    };
+    Layout::from_name(&name).unwrap_or_else(|| {
+        tracing::warn!(name, "NAS_KEYBOARD_LAYOUT desconhecida; usando qwerty");
+        Layout::Qwerty
+    })
 }
 
 async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {

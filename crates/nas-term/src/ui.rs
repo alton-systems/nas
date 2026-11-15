@@ -140,6 +140,7 @@ mod tests {
     use super::*;
     use crate::app::App;
     use nas_editor::Document;
+    use nas_keys::Layout;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -165,7 +166,7 @@ mod tests {
         for ch in "café 🙂日本語".chars() {
             document.insert_char(ch);
         }
-        let mut app = App::new(document);
+        let mut app = App::with_layout(document, Layout::Qwerty);
 
         let rendered = render_to_string(&mut app, 30, 5);
         insta::assert_snapshot!(rendered);
@@ -176,7 +177,7 @@ mod tests {
         let long_path =
             "/um/caminho/bastante/longo/para/testar/o/truncamento/da/barra/de/status/arquivo.txt";
         let document = Document::open(long_path).expect("abrir caminho inexistente não falha");
-        let mut app = App::new(document);
+        let mut app = App::with_layout(document, Layout::Qwerty);
 
         let rendered = render_to_string(&mut app, 40, 3);
         insta::assert_snapshot!(rendered);

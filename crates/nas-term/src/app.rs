@@ -4,7 +4,7 @@
 //! antes de chegar à máquina de estados.
 
 use nas_editor::Document;
-use nas_keys::{Action, Key, KeyCode as NasKeyCode, Machine};
+use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub struct App {
@@ -18,10 +18,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(document: Document) -> Self {
+    /// Traduz teclas do layout físico de teclado dado antes de repassá-las
+    /// à máquina modal (ver `NAS_KEYBOARD_LAYOUT` em `main.rs`).
+    pub fn with_layout(document: Document, layout: Layout) -> Self {
         Self {
             document,
-            modal: Machine::new(),
+            modal: Machine::with_layout(layout),
             scroll_top: 0,
             scroll_left: 0,
             should_quit: false,
@@ -171,7 +173,7 @@ mod tests {
 
     #[test]
     fn despacho_de_apagar_e_desfazer_com_u_pelo_estado_visual() {
-        let mut app = App::new(Document::empty());
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         app.handle_key(key(KeyCode::Enter)); // Visual -> Insert
         for c in "abc".chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -193,7 +195,7 @@ mod tests {
     fn ctrl_mais_tecla_nao_mapeada_nao_e_reinterpretado_sem_o_ctrl() {
         // Ctrl+j não é parte do vocabulário do nas-keys; não deve mover o
         // cursor como se fosse só 'j' sem o Ctrl.
-        let mut app = App::new(Document::empty());
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         app.handle_key(key(KeyCode::Enter));
         for c in "abc".chars() {
             app.handle_key(key(KeyCode::Char(c)));
