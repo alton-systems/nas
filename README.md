@@ -28,6 +28,25 @@ docs/decisions/  # ADRs
 
 Decisões de arquitetura ficam registradas em `docs/decisions/`. Regras de trabalho para agentes/IA no repositório estão em `CLAUDE.md`.
 
+## Uso
+
+```
+cargo run -p nas-term -- caminho/do/arquivo.txt
+```
+
+Os atalhos seguem o [nas-keys](https://github.com/2gab/nas-keys) — ver
+`crates/nas-keys/keymap/default.toml` para a lista completa. São
+declarados por posição física num teclado US qwerty; se o seu teclado
+for outro layout, defina `NAS_KEYBOARD_LAYOUT` antes de rodar o nas para
+que as teclas continuem na posição certa:
+
+```sh
+export NAS_KEYBOARD_LAYOUT=qwerty-abnt  # ABNT2 — onde o qwerty tem ';', o ABNT2 tem 'ç'
+```
+
+Sem a variável (ou com um valor desconhecido), o nas usa `qwerty`, o
+padrão do próprio nas-keys. Layouts disponíveis: `qwerty`, `qwerty-abnt`.
+
 ## Licença
 
 MPL-2.0. Veja `LICENSE`.
