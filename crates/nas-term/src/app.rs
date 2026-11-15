@@ -38,6 +38,16 @@ pub struct App {
     pub quit_confirm_pending: bool,
     pub status_message: Option<String>,
     pub prompt: Option<Prompt>,
+    /// Registro interno da área de transferência — sempre atualizado em
+    /// copiar/recortar, e a fonte de `y` (paste). Garante que colar
+    /// funcione mesmo quando nem OSC 52 nem o `arboard` conseguem
+    /// alcançar uma área de transferência de verdade (ex.: SSH sem
+    /// terminal compatível, sessão sem display gráfico).
+    pub clipboard: String,
+    /// Texto que `main.rs` deve escrever na área de transferência do
+    /// sistema (OSC 52 + `arboard`) depois desta tecla — `App` não tem
+    /// acesso a E/S real, pra ficar testável sem terminal nem display.
+    pub pending_clipboard_write: Option<String>,
 }
 
 impl App {
@@ -53,6 +63,8 @@ impl App {
             quit_confirm_pending: false,
             status_message: None,
             prompt: None,
+            clipboard: String::new(),
+            pending_clipboard_write: None,
         }
     }
 
@@ -120,7 +132,68 @@ impl App {
                     search_origin: Some(self.document.cursor_offset()),
                 });
             }
+            Action::StartSelection => self.document.start_selection(),
+            Action::SelectAll => self.document.select_all(),
+            Action::Copy => self.copy(),
+            Action::Cut => self.cut(),
+            Action::Paste => {
+                let text = self.clipboard.clone();
+                self.paste_text(&text);
+            }
         }
+    }
+
+    fn copy(&mut self) {
+        if let Some(text) = self.document.selected_text() {
+            self.clipboard = text.clone();
+            self.pending_clipboard_write = Some(text);
+        }
+        self.document.clear_selection();
+    }
+
+    fn cut(&mut self) {
+        if let Some(text) = self.document.selected_text() {
+            self.clipboard = text.clone();
+            self.pending_clipboard_write = Some(text);
+        }
+        self.document.delete_selection();
+    }
+
+    /// Insere `text` no documento, caractere a caractere — exceto
+    /// quebras de linha (`"\n"`, `"\r\n"` ou `"\r"` sozinho, tratadas
+    /// como uma única quebra), que passam por `insert_newline` pra
+    /// respeitar o estilo de quebra de linha do documento atual, em vez
+    /// de reproduzir literalmente o que veio colado.
+    fn paste_text(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\n' => self.document.insert_newline(),
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    self.document.insert_newline();
+                }
+                _ => self.document.insert_char(c),
+            }
+        }
+    }
+
+    /// Texto colado pelo terminal via bracketed paste
+    /// (`Event::Paste` do crossterm) — nunca passa pela máquina modal,
+    /// então nunca é interpretado como comando do estado Visual, só
+    /// como texto. Vai pro prompt ativo, se houver um; senão, direto
+    /// pro documento, independente do estado modal.
+    pub fn handle_paste(&mut self, text: String) {
+        if self.prompt.is_some() {
+            if let Some(prompt) = &mut self.prompt {
+                prompt.input.push_str(&text);
+            }
+            self.update_incremental_search();
+            return;
+        }
+        self.paste_text(&text);
     }
 
     /// Enquanto uma linha de entrada está ativa, só ela recebe teclas —
@@ -478,5 +551,96 @@ mod tests {
             expand_path("/tmp/arquivo.txt"),
             PathBuf::from("/tmp/arquivo.txt")
         );
+    }
+
+    #[test]
+    fn selecionar_copiar_e_colar() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('s'))); // marca a seleção
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char(';')));
+        }
+        assert_eq!(app.document.selection_range(), Some((0, 3)));
+
+        app.handle_key(key(KeyCode::Char('c'))); // copia
+        assert_eq!(app.clipboard, "ola");
+        assert_eq!(app.pending_clipboard_write.take(), Some("ola".to_string()));
+        assert_eq!(
+            app.document.selection_range(),
+            None,
+            "copiar deveria descartar a seleção"
+        );
+
+        app.handle_key(key(KeyCode::Char('K'))); // fim do buffer
+        app.handle_key(key(KeyCode::Char('y'))); // cola
+
+        assert_eq!(text(&app), "ola mundoola");
+    }
+
+    #[test]
+    fn recortar_remove_o_trecho_e_pode_ser_colado_de_volta() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('s')));
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Char(';'))); // seleciona "ola "
+        }
+
+        app.handle_key(key(KeyCode::Char('x'))); // recorta
+        assert_eq!(text(&app), "mundo");
+        assert_eq!(app.clipboard, "ola ");
+
+        app.handle_key(key(KeyCode::Char('y'))); // cola de volta na posição atual
+        assert_eq!(text(&app), "ola mundo");
+    }
+
+    #[test]
+    fn select_all_seleciona_tudo_antes_de_copiar() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        app.handle_key(key(KeyCode::Char('S')));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.clipboard, "abc");
+    }
+
+    #[test]
+    fn copiar_sem_selecao_nao_faz_nada() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.clipboard, "");
+        assert_eq!(app.pending_clipboard_write, None);
+    }
+
+    #[test]
+    fn bracketed_paste_e_sempre_texto_nunca_comando_do_visual() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g'))); // cursor no início, estado Visual
+
+        // "dd" seria o despacho de apagar se passasse pela máquina modal
+        // (apagaria o "a" duas vezes); colado, deve só inserir o texto.
+        app.handle_paste("dd".to_string());
+
+        assert_eq!(text(&app), "ddabc");
+        assert_eq!(app.document.cursor_position().column, 2);
+    }
+
+    #[test]
+    fn bracketed_paste_vai_pro_prompt_quando_ativo() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        app.handle_key(key(KeyCode::Char('o'))); // abre o prompt de abrir arquivo
+
+        app.handle_paste("/tmp/colado.txt".to_string());
+
+        assert_eq!(app.prompt.as_ref().unwrap().input, "/tmp/colado.txt");
+        assert_eq!(text(&app), "abc", "o documento não deve ter sido tocado");
     }
 }
