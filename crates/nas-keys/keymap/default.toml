@@ -17,10 +17,9 @@
 #     mais uma tecla, mas com uma ação de "fallback" se a tecla não for
 #     uma das suas — ver a tabela [dispatches.NOME].
 #
-# Escopo desta etapa (marco 1, etapa 5a): abrir arquivo e busca
-# incremental já têm ação. O resto do nas-map.el (seleção, área de
-# transferência, trocar de buffer, janelas) ainda não tem ação
-# correspondente.
+# Escopo desta etapa (marco 1, etapa 5b): seleção e área de
+# transferência já têm ação. Trocar de buffer e janelas ainda não têm
+# ação correspondente (etapa 5c e além).
 
 [insert]
 "M-SPC" = "enter-visual"
@@ -46,6 +45,13 @@ u = "undo"
 
 # Abrir arquivo
 o = "prompt-open-file"
+
+# Seleção e área de transferência
+s = "start-selection"
+S = "select-all"
+c = "copy"
+x = "cut"
+y = "paste"
 
 # Prefixos e despacho
 g = { prefix = "go" }
