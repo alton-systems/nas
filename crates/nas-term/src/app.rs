@@ -43,7 +43,7 @@ impl App {
             KeyCode::Down => self.document.move_down(),
             KeyCode::Backspace => self.document.delete_backward(),
             KeyCode::Delete => self.document.delete_forward(),
-            KeyCode::Enter => self.document.insert_char('\n'),
+            KeyCode::Enter => self.document.insert_newline(),
             KeyCode::Tab => self.document.insert_char('\t'),
             KeyCode::Char('s') if ctrl => self.save(),
             KeyCode::Char('z') if ctrl => self.undo(),

@@ -59,30 +59,60 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if let Some(message) = &app.status_message {
-        message.clone()
+    let style = Style::default().add_modifier(Modifier::REVERSED);
+
+    if let Some(message) = &app.status_message {
+        frame.render_widget(Paragraph::new(message.clone()).style(style), area);
+        return;
+    }
+
+    let name = app
+        .document
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "[sem nome]".to_string());
+    let modified = if app.document.is_modified() {
+        " [+]"
     } else {
-        let name = app
-            .document
-            .path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "[sem nome]".to_string());
-        let modified = if app.document.is_modified() {
-            " [+]"
-        } else {
-            ""
-        };
-        let position = app.document.cursor_position();
-        format!(
-            "{name}{modified}  —  {}:{}",
-            position.line + 1,
-            position.column + 1
-        )
+        ""
     };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED)),
-        area,
-    );
+    let name = format!("{name}{modified}");
+
+    let position = app.document.cursor_position();
+    let position_text = format!("{}:{}", position.line + 1, position.column + 1);
+    let position_width = (position_text.chars().count() as u16).min(area.width);
+
+    let cols =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(position_width)]).split(area);
+    let name_area = cols[0];
+    let position_area = cols[1];
+
+    let gap: usize = 2;
+    let name_budget = (name_area.width as usize).saturating_sub(gap);
+    let truncated_name = truncate_left(&name, name_budget);
+
+    frame.render_widget(Paragraph::new(truncated_name).style(style), name_area);
+    frame.render_widget(Paragraph::new(position_text).style(style), position_area);
+}
+
+/// Corta `s` pela esquerda para caber em `max_width` caracteres, marcando
+/// o corte com "…". Usa contagem de caracteres, não largura visual — o
+/// caminho de um arquivo é, na prática, quase sempre ASCII.
+fn truncate_left(s: &str, max_width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let start = chars.len() - (max_width - 1);
+    std::iter::once('…')
+        .chain(chars[start..].iter().copied())
+        .collect()
 }
 
 fn place_cursor(frame: &mut Frame, content_area: Rect, app: &App) {
@@ -138,6 +168,17 @@ mod tests {
         let mut app = App::new(document);
 
         let rendered = render_to_string(&mut app, 30, 5);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_caminho_longo_trunca_pela_esquerda() {
+        let long_path =
+            "/um/caminho/bastante/longo/para/testar/o/truncamento/da/barra/de/status/arquivo.txt";
+        let document = Document::open(long_path).expect("abrir caminho inexistente não falha");
+        let mut app = App::new(document);
+
+        let rendered = render_to_string(&mut app, 40, 3);
         insta::assert_snapshot!(rendered);
     }
 }
