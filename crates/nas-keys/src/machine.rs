@@ -8,14 +8,13 @@
 //!
 //! ## Escopo desta etapa
 //!
-//! O nas-keys real tem comandos que o nas ainda não suporta: seleção/região
-//! (`s`, `S`), recortar/copiar/colar (`y`, `c`, `x`), os prefixos `g`/`SPC`
-//! além de "ir para o início do buffer", busca (`SPC f`), substituição
-//! (`SPC r`), trocar de buffer (`b`), abrir arquivo (`o`) e gerência de
-//! janelas. Essas teclas existem no nas-keys real mas, por ora, não têm
-//! `Action` correspondente aqui — resolvem para nenhuma ação (um "ainda
-//! não implementado" silencioso, não um erro), até que `nas-editor`/`nas-term`
-//! ganhem as capacidades que elas precisam.
+//! O nas-keys real tem comandos que o nas ainda não suporta: os prefixos
+//! `g`/`SPC` além de "ir para o início do buffer"/busca, substituição
+//! (`SPC r`), trocar de buffer (`b`) e gerência de janelas. Essas teclas
+//! existem no nas-keys real mas, por ora, não têm `Action` correspondente
+//! aqui — resolvem para nenhuma ação (um "ainda não implementado"
+//! silencioso, não um erro), até que `nas-editor`/`nas-term` ganhem as
+//! capacidades que elas precisam.
 //!
 //! ## Atalhos como dados
 //!
@@ -62,6 +61,16 @@ pub enum Action {
     /// Pede a quem chama pra abrir uma linha de entrada de busca
     /// incremental (`SPC f`, isearch-forward).
     PromptSearch,
+    /// Marca o início de uma seleção no cursor (`s`, set-mark-command).
+    StartSelection,
+    /// Seleciona o documento inteiro (`S`, mark-whole-buffer).
+    SelectAll,
+    /// Copia a seleção pra área de transferência (`c`, kill-ring-save).
+    Copy,
+    /// Recorta a seleção pra área de transferência (`x`, kill-region).
+    Cut,
+    /// Cola o que está na área de transferência (`y`, yank).
+    Paste,
 }
 
 /// Prefixo ou despacho aguardando a próxima tecla ("g" → go, Espaço →
@@ -477,6 +486,19 @@ mod tests {
         let mut machine = Machine::new();
         assert_eq!(run(&mut machine, " f"), vec![Action::PromptSearch]);
         assert_eq!(machine.state(), ModalState::Visual);
+    }
+
+    #[test]
+    fn selecao_e_area_de_transferencia() {
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine.handle_key(Key::char('s')),
+            vec![Action::StartSelection]
+        );
+        assert_eq!(machine.handle_key(Key::char('S')), vec![Action::SelectAll]);
+        assert_eq!(machine.handle_key(Key::char('c')), vec![Action::Copy]);
+        assert_eq!(machine.handle_key(Key::char('x')), vec![Action::Cut]);
+        assert_eq!(machine.handle_key(Key::char('y')), vec![Action::Paste]);
     }
 
     #[test]

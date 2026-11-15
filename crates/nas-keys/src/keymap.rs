@@ -192,6 +192,11 @@ fn parse_action(name: &str) -> Result<Action, KeymapError> {
         "undo" => Action::Undo,
         "prompt-open-file" => Action::PromptOpenFile,
         "prompt-search" => Action::PromptSearch,
+        "start-selection" => Action::StartSelection,
+        "select-all" => Action::SelectAll,
+        "copy" => Action::Copy,
+        "cut" => Action::Cut,
+        "paste" => Action::Paste,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
