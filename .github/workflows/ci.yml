@@ -23,3 +23,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (rust-version mínimo declarado em Cargo.toml)
+        run: cargo check --workspace
