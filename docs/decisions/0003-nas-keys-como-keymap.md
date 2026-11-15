@@ -2,8 +2,8 @@
 
 ## Status
 
-Aceita; o mecanismo de sincronia descrito aqui é para o marco 1 e será
-revisto no marco 2.
+Aceita e implementada (etapas 3 e 4 do marco 1). O mecanismo de sincronia
+descrito aqui é para o marco 1 e será revisto no marco 2.
 
 ## Contexto
 
@@ -24,14 +24,28 @@ dados — e os dois projetos divergem silenciosamente.
    nas.
 2. **Estados, atalhos, prefixos e despachos vivem como dados declarativos**,
    não espalhados no código Rust: um arquivo único em
-   `crates/nas-keys/keymap/default.toml` (etapa 4), espelhando a estrutura do
+   `crates/nas-keys/keymap/default.toml`, espelhando a estrutura do
    `nas-map.el` — mesmos estados (`Insert`, `Visual`, `Sequential`), mesmos
    prefixos (`g`, Espaço), mesmos despachos de uma tecla (`d …`) e a mesma
    semântica do estado Sequential (acumula teclas, mostra na barra de status,
    executa com Enter, cancela com Esc, remove a última tecla com Backspace).
+   O arquivo é embutido no binário em tempo de compilação
+   (`include_str!`) e carregado uma vez por `Keymap::default_keymap`;
+   `Machine` não conhece nenhuma tecla específica, só como estados,
+   prefixos, despachos e o Sequential funcionam.
 3. **Tradução de layout físico como tabela de dados**, não como `match` no
-   código: tabelas `qwerty` e `qwerty-abnt` (o autor usa ABNT2), permitindo
-   adicionar outros layouts sem tocar na lógica da máquina de estados.
+   código: tabelas `qwerty` e `qwerty-abnt` (o autor usa ABNT2) em
+   `crates/nas-keys/src/layout.rs`, espelhando `nas-layout-diagrams` do
+   nas-layout.el. A tradução acontece por tecla, antes do keymap ser
+   consultado (`Machine::handle_key`): o caractere realmente digitado é
+   traduzido para o equivalente na mesma posição no qwerty, e só essa
+   forma canônica é usada para procurar a ação — o inverso de como o
+   nas-keys real traduz (lá a tradução acontece uma vez, ao montar o
+   keymap do Emacs; aqui acontece a cada tecla, sobre um keymap que
+   nunca muda). As duas abordagens produzem o mesmo comportamento
+   observável; só muda quando a tradução acontece. O layout é escolhido
+   pela variável de ambiente `NAS_KEYBOARD_LAYOUT` (`qwerty` por padrão,
+   igual ao nas-keys; `qwerty-abnt` para o layout do autor).
 4. **Portar os testes do `nas-tests.el`** que fizerem sentido em Rust, para
    que a máquina de estados do `nas-keys` (crate) tenha a mesma cobertura de
    comportamento que o pacote Elisp original.
@@ -52,9 +66,10 @@ nunca divirjam de fato.
 
 ## Consequências
 
-- Até a etapa 4, o keymap pode viver como estrutura de dados em memória (Rust)
-  enquanto a máquina de estados é desenvolvida e testada (etapa 3); o arquivo
-  `default.toml` é introduzido na etapa 4 como a representação canônica.
+- Os 20+ testes de comportamento da máquina de estados (etapa 3) continuam
+  valendo sem alteração depois do keymap virar dados (etapa 4) — eles
+  passam a exercitar `default.toml` através de `Keymap::default_keymap`,
+  o que já é a prova de que a migração não mudou nenhum comportamento.
 - A partir do marco 2, quando o Lisp embutido (Steel) estiver disponível, o
   keymap deve migrar para ser definido em Lisp — como no nas-keys é feito em
   Elisp — reduzindo ainda mais a distância entre os dois projetos. Essa

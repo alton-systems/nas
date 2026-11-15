@@ -1,0 +1,63 @@
+# Atalhos do nas, espelhando nas-map.el (https://github.com/2gab/nas-keys).
+#
+# Teclas são escritas por posição física no teclado US qwerty,
+# independente do layout físico real do usuário — ver
+# crates/nas-keys/src/layout.rs (e nas-layout.el no nas-keys).
+#
+# Formato de uma tecla: um caractere ("j", ";", "g"), ou um destes
+# nomes: SPC, RET, ESC, DEL, TAB, <left>, <right>, <up>, <down>; com o
+# prefixo "M-" para Alt (ex.: "M-SPC").
+#
+# Valor de uma tecla:
+#   - uma string: o nome de uma ação, ou "enter-insert" / "enter-visual"
+#     / "enter-sequential";
+#   - { prefix = "NOME" }: entra no prefixo NOME, que espera mais uma
+#     tecla — ver a tabela [prefixes.NOME];
+#   - { dispatch = "NOME" }: entra no despacho NOME, que também espera
+#     mais uma tecla, mas com uma ação de "fallback" se a tecla não for
+#     uma das suas — ver a tabela [dispatches.NOME].
+#
+# Escopo desta etapa (marco 1, etapa 4): só os comandos que o
+# nas-editor/nas-term já sabem executar. O resto do nas-map.el (seleção,
+# área de transferência, busca, trocar de buffer, abrir arquivo,
+# janelas) ainda não tem ação correspondente — ver a proposta da
+# etapa 5.
+
+[insert]
+"M-SPC" = "enter-visual"
+
+[visual]
+RET = "enter-insert"
+"M-SPC" = "enter-insert"
+
+# Navegação por caractere/linha (j k l ; = esquerda baixo cima direita)
+j = "move-left"
+k = "move-down"
+l = "move-up"
+";" = "move-right"
+
+# Navegação — extremos (Shift = máxima potência)
+J = "move-line-start"
+":" = "move-line-end"
+L = "move-buffer-start"
+K = "move-buffer-end"
+
+# Desfazer
+u = "undo"
+
+# Prefixos e despacho
+g = { prefix = "go" }
+SPC = { prefix = "leader" }
+d = { dispatch = "delete" }
+
+[prefixes.go]
+g = "move-buffer-start"
+
+[prefixes.leader]
+SPC = "enter-sequential"
+
+[dispatches.delete]
+fallback = "delete-forward"
+d = "delete-forward"
+";" = "delete-forward"
+j = "delete-backward"

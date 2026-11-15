@@ -16,8 +16,20 @@
 //! `Action` correspondente aqui — resolvem para nenhuma ação (um "ainda
 //! não implementado" silencioso, não um erro), até que `nas-editor`/`nas-term`
 //! ganhem as capacidades que elas precisam.
+//!
+//! ## Atalhos como dados
+//!
+//! Quais teclas fazem o quê é dado, não código: vem de
+//! `keymap/default.toml` (ver [`crate::keymap`]), carregado uma vez em
+//! [`Keymap::default_keymap`]. Esta máquina só sabe *como* um estado,
+//! prefixo, despacho e o Sequential funcionam — não hardcoda nenhuma
+//! tecla específica.
+
+use std::collections::HashMap;
 
 use crate::key::{Key, KeyCode};
+use crate::keymap::{Binding, Keymap};
+use crate::layout::{self, Layout};
 
 /// Em qual dos três estados a máquina está.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,22 +59,23 @@ pub enum Action {
 }
 
 /// Prefixo ou despacho aguardando a próxima tecla ("g" → go, Espaço →
-/// leader, "d" → despacho de apagar). Equivalente ao que, no Emacs, seria
-/// o `read-key` de `nas-define-dispatch` ou a navegação dentro de um
-/// keymap de prefixo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// leader, "d" → despacho de apagar, nos nomes do keymap padrão).
+/// Equivalente ao que, no Emacs, seria o `read-key` de
+/// `nas-define-dispatch` ou a navegação dentro de um keymap de prefixo.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pending {
-    None,
-    Go,
-    Leader,
-    Delete,
+    Prefix(String),
+    Dispatch(String),
 }
 
 /// A máquina de estados. Testável sem terminal: alimente com [`Key`]s e
-/// confira as [`Action`]s e o estado resultantes.
+/// confira as [`Action`]s e o estado resultantes. As teclas que cada
+/// estado reconhece vêm do [`Keymap`] — ver [`crate::keymap`].
 pub struct Machine {
+    keymap: Keymap,
+    layout_table: HashMap<char, char>,
     state: ModalState,
-    pending: Pending,
+    pending: Option<Pending>,
     sequence: Vec<Key>,
 }
 
@@ -74,11 +87,21 @@ impl Default for Machine {
 
 impl Machine {
     /// Começa em Visual, como o nas-keys real (`nas--enable` chama
-    /// `nas-enter-visual`).
+    /// `nas-enter-visual`), com o keymap padrão (`keymap/default.toml`)
+    /// e o layout físico qwerty.
     pub fn new() -> Self {
+        Self::with_layout(Layout::Qwerty)
+    }
+
+    /// Como [`Machine::new`], mas traduzindo teclas de um layout físico
+    /// diferente (ex.: `Layout::QwertyAbnt`) de volta para o qwerty
+    /// canônico antes de consultar o keymap.
+    pub fn with_layout(layout: Layout) -> Self {
         Self {
+            keymap: Keymap::default_keymap(),
+            layout_table: layout.translation_table(),
             state: ModalState::Visual,
-            pending: Pending::None,
+            pending: None,
             sequence: Vec::new(),
         }
     }
@@ -118,8 +141,11 @@ impl Machine {
     /// Processa uma tecla e devolve as ações resultantes (zero, uma, ou
     /// mais de uma — por exemplo, o despacho de apagar reprocessa a tecla
     /// quando ela não é uma das suas, e executar o Sequential reexecuta
-    /// toda a sequência acumulada).
+    /// toda a sequência acumulada). A tecla é traduzida do layout físico
+    /// configurado para o qwerty canônico antes de qualquer outra coisa
+    /// — o keymap é sempre consultado em termos de qwerty.
     pub fn handle_key(&mut self, key: Key) -> Vec<Action> {
+        let key = layout::to_qwerty(&self.layout_table, key);
         match self.state {
             ModalState::Insert => self.handle_insert(key),
             ModalState::Visual => self.handle_visual(key),
@@ -129,26 +155,26 @@ impl Machine {
 
     fn enter_insert(&mut self) {
         self.state = ModalState::Insert;
-        self.pending = Pending::None;
+        self.pending = None;
     }
 
     fn enter_visual(&mut self) {
         self.state = ModalState::Visual;
-        self.pending = Pending::None;
+        self.pending = None;
     }
 
     fn enter_sequential(&mut self) {
         self.sequence.clear();
         self.state = ModalState::Sequential;
-        self.pending = Pending::None;
+        self.pending = None;
     }
 
-    /// Em insert, só M-SPC é interceptado — o resto cai para a edição
-    /// normal (`nas-insert-map` só sobrescreve a troca de modo).
+    /// Em insert, só as teclas do keymap (M-SPC) são interceptadas — o
+    /// resto cai para a edição normal (`nas-insert-map` só sobrescreve a
+    /// troca de modo).
     fn handle_insert(&mut self, key: Key) -> Vec<Action> {
-        if key == Key::alt_char(' ') {
-            self.enter_visual();
-            return Vec::new();
+        if let Some(binding) = self.keymap.insert.get(&key).cloned() {
+            return self.run_binding(binding);
         }
         if let Some(action) = universal_action(key) {
             return vec![action];
@@ -164,87 +190,82 @@ impl Machine {
     /// Backspace, Delete e Tab não são interceptados pelo nas-map.el e
     /// continuam funcionando normalmente.
     fn handle_visual(&mut self, key: Key) -> Vec<Action> {
-        if self.pending != Pending::None {
-            return self.resolve_pending(key);
+        if let Some(pending) = self.pending.take() {
+            return self.resolve_pending(pending, key);
         }
 
-        if key == Key::enter() || key == Key::alt_char(' ') {
-            self.enter_insert();
-            return Vec::new();
-        }
-
-        if !key.alt {
-            if let KeyCode::Char(c) = key.code {
-                match c {
-                    'g' => {
-                        self.pending = Pending::Go;
-                        return Vec::new();
-                    }
-                    ' ' => {
-                        self.pending = Pending::Leader;
-                        return Vec::new();
-                    }
-                    'd' => {
-                        self.pending = Pending::Delete;
-                        return Vec::new();
-                    }
-                    'j' => return vec![Action::MoveLeft],
-                    'k' => return vec![Action::MoveDown],
-                    'l' => return vec![Action::MoveUp],
-                    ';' => return vec![Action::MoveRight],
-                    'J' => return vec![Action::MoveLineStart],
-                    ':' => return vec![Action::MoveLineEnd],
-                    'L' => return vec![Action::MoveBufferStart],
-                    'K' => return vec![Action::MoveBufferEnd],
-                    'u' => return vec![Action::Undo],
-                    _ => {}
-                }
-            }
+        if let Some(binding) = self.keymap.visual.get(&key).cloned() {
+            return self.run_binding(binding);
         }
 
         universal_action(key).into_iter().collect()
     }
 
-    fn resolve_pending(&mut self, key: Key) -> Vec<Action> {
-        let pending = self.pending;
-        self.pending = Pending::None;
+    /// Executa uma ligação do keymap que não depende da tecla em si
+    /// (trocas de estado e entrada em prefixo/despacho já sabem qual
+    /// prefixo/despacho são pelo nome).
+    fn run_binding(&mut self, binding: Binding) -> Vec<Action> {
+        match binding {
+            Binding::Action(action) => vec![action],
+            Binding::EnterInsert => {
+                self.enter_insert();
+                Vec::new()
+            }
+            Binding::EnterVisual => {
+                self.enter_visual();
+                Vec::new()
+            }
+            Binding::EnterSequential => {
+                self.enter_sequential();
+                Vec::new()
+            }
+            Binding::Prefix(name) => {
+                self.pending = Some(Pending::Prefix(name));
+                Vec::new()
+            }
+            Binding::Dispatch(name) => {
+                self.pending = Some(Pending::Dispatch(name));
+                Vec::new()
+            }
+        }
+    }
+
+    fn resolve_pending(&mut self, pending: Pending, key: Key) -> Vec<Action> {
         match pending {
-            Pending::Go => match key {
-                Key {
-                    code: KeyCode::Char('g'),
-                    alt: false,
-                } => vec![Action::MoveBufferStart],
-                _ => Vec::new(),
-            },
-            Pending::Leader => match key {
-                Key {
-                    code: KeyCode::Char(' '),
-                    alt: false,
-                } => {
-                    self.enter_sequential();
-                    Vec::new()
+            Pending::Prefix(name) => {
+                let binding = self
+                    .keymap
+                    .prefixes
+                    .get(&name)
+                    .and_then(|bindings| bindings.get(&key))
+                    .cloned();
+                match binding {
+                    Some(binding) => self.run_binding(binding),
+                    None => Vec::new(),
                 }
-                _ => Vec::new(),
-            },
-            Pending::Delete => match key {
-                Key {
-                    code: KeyCode::Char('d' | ';'),
-                    alt: false,
-                } => vec![Action::DeleteForward],
-                Key {
-                    code: KeyCode::Char('j'),
-                    alt: false,
-                } => vec![Action::DeleteBackward],
-                _ => {
-                    // Fiel ao fallback de `nas-define-dispatch`: apaga pra
-                    // frente e reprocessa a tecla como um comando visual
-                    // normal (equivalente a `push key unread-command-events`).
-                    let mut actions = vec![Action::DeleteForward];
-                    actions.extend(self.handle_visual(key));
-                    actions
+            }
+            Pending::Dispatch(name) => {
+                let (matched, fallback) = {
+                    let dispatch = self
+                        .keymap
+                        .dispatches
+                        .get(&name)
+                        .expect("despacho pendente deveria existir no keymap");
+                    (dispatch.bindings.get(&key).copied(), dispatch.fallback)
+                };
+                match matched {
+                    Some(action) => vec![action],
+                    None => {
+                        // Fiel ao fallback de `nas-define-dispatch`: executa
+                        // o fallback e reprocessa a tecla como um comando
+                        // visual normal (equivalente a
+                        // `push key unread-command-events`).
+                        let mut actions = vec![fallback];
+                        actions.extend(self.handle_visual(key));
+                        actions
+                    }
                 }
-            },
-            Pending::None => unreachable!("resolve_pending só é chamado com um pending ativo"),
+            }
         }
     }
 
@@ -540,5 +561,27 @@ mod tests {
         let actions = machine.handle_key(Key::new(KeyCode::Left));
         assert_eq!(actions, Vec::<Action>::new());
         assert_eq!(machine.pending_sequence(), &[Key::new(KeyCode::Left)]);
+    }
+
+    #[test]
+    fn layout_abnt_traduz_antes_de_consultar_o_keymap() {
+        // No ABNT2 a posição do ';' do qwerty produz 'ç' — digitar 'ç'
+        // deve disparar o mesmo comando que ';' dispara no qwerty.
+        let mut qwerty = Machine::new();
+        let mut abnt = Machine::with_layout(Layout::QwertyAbnt);
+
+        assert_eq!(
+            qwerty.handle_key(Key::char(';')),
+            abnt.handle_key(Key::char('ç'))
+        );
+        assert_eq!(qwerty.handle_key(Key::char(';')), vec![Action::MoveRight]);
+    }
+
+    #[test]
+    fn layout_abnt_nao_muda_letras_identicas_nos_dois_layouts() {
+        // "g g" continua funcionando igual, já que 'g' é o mesmo nos
+        // dois layouts.
+        let mut machine = Machine::with_layout(Layout::QwertyAbnt);
+        assert_eq!(run(&mut machine, "gg"), vec![Action::MoveBufferStart]);
     }
 }
