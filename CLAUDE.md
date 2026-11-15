@@ -56,7 +56,10 @@ Crates futuras (não criar antes do marco correspondente): `nas-lisp`
   `cargo clippy -- -D warnings`, `cargo test`, commits pequenos e
   descritivos, resumo curto do que mudou e como testar na mão — depois
   **parar e esperar o ok** antes da próxima etapa.
-- **Nunca fazer push nem criar o repositório remoto sem pedido explícito.**
+- **Cada etapa numa branch própria** (ex.: `etapa-5b`), terminando com
+  um Pull Request aberto no GitHub com um resumo da etapa. Push na
+  branch da etapa está liberado. **Nunca fazer push direto na `main`
+  nem merge do próprio PR** — quem revisa e faz o merge é o autor.
 - Antes de uma decisão grande que não esteja registrada (trocar uma
   biblioteca, mudar a estrutura de crates), parar e perguntar.
 - Se uma API do `helix-core` (ou `helix-lsp`/`helix-loader`) não estiver
