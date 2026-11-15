@@ -8,7 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::app::{App, PromptKind};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = frame.area();
@@ -27,7 +27,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_gutter(frame, gutter_area, app, gutter_width);
     draw_content(frame, content_area, app);
     draw_status(frame, status_area, app);
-    place_cursor(frame, content_area, app);
+    if app.prompt.is_some() {
+        place_prompt_cursor(frame, status_area, app);
+    } else {
+        place_cursor(frame, content_area, app);
+    }
 }
 
 fn visible_line_range(app: &App, height: usize) -> std::ops::Range<usize> {
@@ -60,6 +64,16 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let style = Style::default().add_modifier(Modifier::REVERSED);
+
+    if let Some(prompt) = &app.prompt {
+        let label = match prompt.kind {
+            PromptKind::OpenFile => "Abrir arquivo",
+            PromptKind::Search => "Buscar",
+        };
+        let text = format!("{label}: {}", prompt.input);
+        frame.render_widget(Paragraph::new(text).style(style), area);
+        return;
+    }
 
     if let Some(message) = &app.status_message {
         frame.render_widget(Paragraph::new(message.clone()).style(style), area);
@@ -135,6 +149,20 @@ fn number_width(n: usize) -> usize {
     n.to_string().len()
 }
 
+/// Posiciona o cursor do terminal no fim do texto digitado na linha de
+/// entrada, não no documento (que fica em segundo plano enquanto o
+/// prompt está ativo).
+fn place_prompt_cursor(frame: &mut Frame, status_area: Rect, app: &App) {
+    let Some(prompt) = &app.prompt else { return };
+    let label = match prompt.kind {
+        PromptKind::OpenFile => "Abrir arquivo",
+        PromptKind::Search => "Buscar",
+    };
+    let text_len = label.chars().count() + 2 + prompt.input.chars().count(); // "label: input"
+    let x = status_area.x + (text_len as u16).min(status_area.width.saturating_sub(1));
+    frame.set_cursor_position((x, status_area.y));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +208,28 @@ mod tests {
         let mut app = App::with_layout(document, Layout::Qwerty);
 
         let rendered = render_to_string(&mut app, 40, 3);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_prompt_de_busca_ativo() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut document = Document::empty();
+        for ch in "ola mundo".chars() {
+            document.insert_char(ch);
+        }
+        let mut app = App::with_layout(document, Layout::Qwerty);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        for c in "mun".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let rendered = render_to_string(&mut app, 30, 3);
         insta::assert_snapshot!(rendered);
     }
 }

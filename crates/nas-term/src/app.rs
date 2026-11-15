@@ -3,9 +3,29 @@
 //! sair) não fazem parte do vocabulário do nas-keys — são tratados aqui,
 //! antes de chegar à máquina de estados.
 
-use nas_editor::Document;
+use nas_editor::{Document, OpenError};
 use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// O que uma linha de entrada está pedindo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    OpenFile,
+    Search,
+}
+
+/// Uma linha de entrada ativa na barra de status — equivalente ao
+/// minibuffer do Emacs que `o` (find-file) e `SPC f` (isearch-forward)
+/// abrem no nas-keys real. Enquanto ativa, nenhuma tecla chega à máquina
+/// modal: o texto digitado é só o conteúdo do prompt, nunca interpretado
+/// como comando do estado Visual.
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub input: String,
+    /// Posição do cursor antes da busca começar, pra restaurar se o
+    /// usuário cancelar. `None` fora de uma busca (ex.: abrir arquivo).
+    search_origin: Option<usize>,
+}
 
 pub struct App {
     pub document: Document,
@@ -15,6 +35,7 @@ pub struct App {
     pub should_quit: bool,
     pub quit_confirm_pending: bool,
     pub status_message: Option<String>,
+    pub prompt: Option<Prompt>,
 }
 
 impl App {
@@ -29,10 +50,16 @@ impl App {
             should_quit: false,
             quit_confirm_pending: false,
             status_message: None,
+            prompt: None,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.prompt.is_some() {
+            self.handle_prompt_key(key);
+            return;
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         if ctrl && key.code == KeyCode::Char('q') {
@@ -77,6 +104,111 @@ impl App {
             Action::Undo => self.undo(),
             Action::InsertChar(c) => self.document.insert_char(c),
             Action::InsertNewline => self.document.insert_newline(),
+            Action::PromptOpenFile => {
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::OpenFile,
+                    input: String::new(),
+                    search_origin: None,
+                });
+            }
+            Action::PromptSearch => {
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Search,
+                    input: String::new(),
+                    search_origin: Some(self.document.cursor_offset()),
+                });
+            }
+        }
+    }
+
+    /// Enquanto uma linha de entrada está ativa, só ela recebe teclas —
+    /// nada chega à máquina modal (equivalente ao `minibuffer-setup-hook`
+    /// do nas-keys real, que troca pra Insert, mas aqui é mais simples
+    /// nem repassar pra máquina nenhuma).
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.cancel_prompt(),
+            KeyCode::Enter => self.confirm_prompt(),
+            KeyCode::Backspace => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.input.pop();
+                }
+                self.update_incremental_search();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.input.push(c);
+                }
+                self.update_incremental_search();
+            }
+            _ => {}
+        }
+    }
+
+    /// A cada tecla da busca, refaz a busca inteira a partir de onde ela
+    /// começou (não de onde o cursor está agora, que já pode ter saltado
+    /// pro match anterior) — assim apagar um caractere da consulta pode
+    /// achar uma ocorrência mais cedo no documento.
+    fn update_incremental_search(&mut self) {
+        let Some(prompt) = &self.prompt else { return };
+        let (PromptKind::Search, Some(origin)) = (prompt.kind, prompt.search_origin) else {
+            return;
+        };
+        if let Some(pos) = self.document.find_from(origin, &prompt.input) {
+            self.document.set_cursor(pos);
+        }
+    }
+
+    fn confirm_prompt(&mut self) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        match prompt.kind {
+            PromptKind::OpenFile => self.open_file(&prompt.input),
+            // O cursor já está no último match encontrado (ou de volta
+            // na posição original, se nada bateu) — só sair do prompt.
+            PromptKind::Search => {}
+        }
+    }
+
+    fn cancel_prompt(&mut self) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        if let Some(origin) = prompt.search_origin {
+            self.document.set_cursor(origin);
+        }
+    }
+
+    fn open_file(&mut self, path: &str) {
+        let path = path.trim();
+        if path.is_empty() {
+            self.status_message = Some("Nenhum arquivo informado.".to_string());
+            return;
+        }
+        if self.document.is_modified() {
+            self.status_message = Some(
+                "Há alterações não salvas; salve (Ctrl+S) antes de abrir outro arquivo."
+                    .to_string(),
+            );
+            return;
+        }
+        match Document::open(path) {
+            Ok(document) => {
+                self.document = document;
+                self.scroll_top = 0;
+                self.scroll_left = 0;
+            }
+            Err(OpenError::NotUtf8) => {
+                self.status_message = Some(format!("'{path}' não é UTF-8 válido."));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Erro ao abrir '{path}': {err}"));
+            }
         }
     }
 
@@ -171,14 +303,18 @@ mod tests {
             .join("\n")
     }
 
-    #[test]
-    fn despacho_de_apagar_e_desfazer_com_u_pelo_estado_visual() {
-        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+    fn type_text(app: &mut App, s: &str) {
         app.handle_key(key(KeyCode::Enter)); // Visual -> Insert
-        for c in "abc".chars() {
+        for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(alt_key(KeyCode::Char(' '))); // Insert -> Visual
+    }
+
+    #[test]
+    fn despacho_de_apagar_e_desfazer_com_u_pelo_estado_visual() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
         app.handle_key(key(KeyCode::Char('g')));
         app.handle_key(key(KeyCode::Char('g'))); // início do buffer
         assert_eq!(text(&app), "abc");
@@ -196,15 +332,101 @@ mod tests {
         // Ctrl+j não é parte do vocabulário do nas-keys; não deve mover o
         // cursor como se fosse só 'j' sem o Ctrl.
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
-        app.handle_key(key(KeyCode::Enter));
-        for c in "abc".chars() {
-            app.handle_key(key(KeyCode::Char(c)));
-        }
-        app.handle_key(alt_key(KeyCode::Char(' ')));
+        type_text(&mut app, "abc");
         let position_before = app.document.cursor_position();
 
         app.handle_key(ctrl_key(KeyCode::Char('j')));
 
         assert_eq!(app.document.cursor_position(), position_before);
+    }
+
+    #[test]
+    fn busca_incremental_pula_pro_match_e_cancelar_restaura_o_cursor() {
+        // "ola mundo ola de novo": origem na posição 4 (início de
+        // "mundo"), pra que o match de "ola" (posição 10, a segunda
+        // ocorrência) seja claramente diferente da origem.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo ola de novo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g'))); // início do buffer
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Char(';'))); // move pra posição 4
+        }
+        let origin = app.document.cursor_offset();
+        assert_eq!(origin, 4);
+
+        app.handle_key(key(KeyCode::Char(' '))); // líder
+        app.handle_key(key(KeyCode::Char('f'))); // SPC f: busca
+        assert!(app.prompt.is_some());
+
+        for c in "ola".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        // achou a segunda ocorrência de "ola", a partir da origem
+        assert_eq!(app.document.cursor_offset(), 10);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.prompt.is_none());
+        assert_eq!(app.document.cursor_offset(), origin);
+    }
+
+    #[test]
+    fn busca_confirmada_com_enter_deixa_o_cursor_no_match() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('f')));
+        for c in "mundo".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.prompt.is_none());
+        assert_eq!(app.document.cursor_offset(), 4); // "ola " tem 4 chars
+    }
+
+    #[test]
+    fn durante_o_prompt_teclas_nunca_chegam_na_maquina_modal() {
+        // 'j' durante o prompt deve digitar 'j' no prompt, nunca mover o
+        // cursor do documento como comando visual.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        let position_before = app.document.cursor_position();
+
+        app.handle_key(key(KeyCode::Char('o'))); // abre o prompt de arquivo
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('k')));
+
+        assert_eq!(app.prompt.as_ref().unwrap().input, "jk");
+        assert_eq!(app.document.cursor_position(), position_before);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn abrir_arquivo_recusa_se_houver_alteracoes_nao_salvas() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        assert!(app.document.is_modified());
+
+        app.handle_key(key(KeyCode::Char('o')));
+        for c in "/tmp/qualquer-coisa.txt".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.prompt.is_none());
+        assert_eq!(
+            text(&app),
+            "abc",
+            "o documento modificado não deve ter sido substituído"
+        );
+        assert!(app.status_message.is_some());
     }
 }

@@ -1,0 +1,7 @@
+---
+source: crates/nas-term/src/ui.rs
+expression: rendered
+---
+1 ola mundo                   
+                              
+Buscar: mun

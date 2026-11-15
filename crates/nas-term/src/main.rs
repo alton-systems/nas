@@ -73,7 +73,7 @@ fn keyboard_layout() -> Layout {
 
 async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
     loop {
-        execute!(io::stdout(), cursor_style_for(app.modal.state()))?;
+        execute!(io::stdout(), cursor_style_for(app))?;
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         if let Event::Key(key) = event::read()?
@@ -88,11 +88,15 @@ async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> 
     }
 }
 
-/// Forma do cursor por estado modal: barra em Insert, bloco em Visual, e
-/// sublinhado em Sequential — o terminal não tem um cursor "oco" como o
-/// do Emacs, sublinhado é o mais distinto dos outros dois disponível.
-fn cursor_style_for(state: ModalState) -> SetCursorStyle {
-    match state {
+/// Forma do cursor: barra em Insert (e numa linha de entrada, que
+/// também é edição de texto), bloco em Visual, sublinhado em Sequential
+/// — o terminal não tem um cursor "oco" como o do Emacs, sublinhado é o
+/// mais distinto dos outros dois disponível.
+fn cursor_style_for(app: &App) -> SetCursorStyle {
+    if app.prompt.is_some() {
+        return SetCursorStyle::SteadyBar;
+    }
+    match app.modal.state() {
         ModalState::Insert => SetCursorStyle::SteadyBar,
         ModalState::Visual => SetCursorStyle::SteadyBlock,
         ModalState::Sequential => SetCursorStyle::SteadyUnderScore,
