@@ -62,6 +62,11 @@ pub struct Position {
 pub struct Document {
     rope: Rope,
     cursor: usize,
+    /// Onde a seleção começou (`set-mark-command`) — `None` quando não
+    /// há seleção ativa. O cursor é a outra ponta; mover o cursor
+    /// normalmente estende a seleção, sem precisar de nenhum estado
+    /// extra, igual ao helix_core::Selection/Range de duas pontas.
+    selection_anchor: Option<usize>,
     history: history::History,
     path: Option<PathBuf>,
     modified: bool,
@@ -74,6 +79,7 @@ impl Document {
         Self {
             rope: Rope::new(),
             cursor: 0,
+            selection_anchor: None,
             history: history::History::default(),
             path: None,
             modified: false,
@@ -104,6 +110,7 @@ impl Document {
         Ok(Self {
             rope,
             cursor: 0,
+            selection_anchor: None,
             history: history::History::default(),
             path: Some(path.to_path_buf()),
             modified: false,
@@ -240,6 +247,60 @@ impl Document {
             .find(|&pos| self.matches_at(pos, &query))
     }
 
+    /// Marca o início de uma seleção no cursor atual — como
+    /// `set-mark-command`. Mover o cursor depois disso estende a
+    /// seleção; chamar de novo move a marca pro cursor atual.
+    pub fn start_selection(&mut self) {
+        self.selection_anchor = Some(self.cursor);
+    }
+
+    /// Seleciona o documento inteiro — como `mark-whole-buffer`.
+    pub fn select_all(&mut self) {
+        self.selection_anchor = Some(0);
+        self.cursor = self.rope.len_chars();
+    }
+
+    /// Descarta a seleção ativa, se houver.
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// Início e fim (em caracteres, start ≤ end) da seleção ativa, se
+    /// houver uma.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        self.selection_anchor.map(|anchor| {
+            if anchor <= self.cursor {
+                (anchor, self.cursor)
+            } else {
+                (self.cursor, anchor)
+            }
+        })
+    }
+
+    /// O texto selecionado, se houver uma seleção (mesmo que vazia).
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        Some(self.rope.slice(start..end).to_string())
+    }
+
+    /// Apaga o texto selecionado e descarta a seleção — como
+    /// `kill-region`. Não faz nada se não houver seleção.
+    pub fn delete_selection(&mut self) {
+        let Some((start, end)) = self.selection_range() else {
+            return;
+        };
+        self.delete_range(start, end);
+        self.cursor = start;
+        self.selection_anchor = None;
+    }
+
+    /// Posição absoluta (em caracteres) do início da linha `idx` — para
+    /// quem renderiza a tela saber onde cada linha visível começa, ex.
+    /// pra destacar a seleção.
+    pub fn line_start_offset(&self, idx: usize) -> usize {
+        self.rope.line_to_char(idx)
+    }
+
     fn matches_at(&self, pos: usize, query: &[char]) -> bool {
         if pos + query.len() > self.rope.len_chars() {
             return false;
@@ -326,6 +387,9 @@ impl Document {
         transaction.apply(&mut self.rope);
         self.history.commit_revision(&transaction, &original);
         self.modified = true;
+        // Qualquer edição invalida uma seleção que estivesse ativa — sem
+        // isso, o destaque continuaria crescendo junto com o texto digitado.
+        self.selection_anchor = None;
     }
 
     /// Desfaz a última edição. Retorna `false` se não havia nada a desfazer.
@@ -336,6 +400,7 @@ impl Document {
         inversion.apply(&mut self.rope);
         self.cursor = self.cursor.min(self.rope.len_chars());
         self.modified = true;
+        self.selection_anchor = None;
         true
     }
 }
@@ -590,6 +655,94 @@ mod tests {
         }
         assert_eq!(doc.find_from(0, "xyz"), None);
         assert_eq!(doc.find_from(0, ""), None);
+    }
+
+    #[test]
+    fn selecao_estende_com_o_movimento_do_cursor() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        doc.start_selection();
+        assert_eq!(doc.selection_range(), Some((0, 0)));
+
+        for _ in 0..3 {
+            doc.move_right();
+        }
+        assert_eq!(doc.selection_range(), Some((0, 3)));
+        assert_eq!(doc.selected_text(), Some("ola".to_string()));
+    }
+
+    #[test]
+    fn selecao_funciona_com_a_ancora_depois_do_cursor_tambem() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        // âncora em 9 (fim), cursor volta pro início: intervalo (0, 9)
+        doc.start_selection();
+        doc.move_to_buffer_start();
+        assert_eq!(doc.selection_range(), Some((0, 9)));
+        assert_eq!(doc.selected_text(), Some("ola mundo".to_string()));
+    }
+
+    #[test]
+    fn select_all_seleciona_o_documento_inteiro() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        doc.select_all();
+        assert_eq!(doc.selection_range(), Some((0, 9)));
+    }
+
+    #[test]
+    fn editar_descarta_a_selecao_ativa() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        doc.start_selection();
+        doc.move_right();
+        assert!(doc.selection_range().is_some());
+
+        doc.insert_char('X');
+        assert_eq!(
+            doc.selection_range(),
+            None,
+            "editar deveria descartar a seleção, senão o destaque cresceria junto com o texto"
+        );
+    }
+
+    #[test]
+    fn delete_selection_apaga_o_trecho_e_descarta_a_selecao() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        doc.start_selection();
+        for _ in 0..4 {
+            doc.move_right(); // seleciona "ola "
+        }
+        doc.delete_selection();
+
+        assert_eq!(doc_text(&doc), "mundo");
+        assert_eq!(doc.selection_range(), None);
+        assert_eq!(doc.cursor_offset(), 0);
+    }
+
+    #[test]
+    fn delete_selection_sem_selecao_nao_faz_nada() {
+        let mut doc = Document::empty();
+        for ch in "ola".chars() {
+            doc.insert_char(ch);
+        }
+        doc.delete_selection();
+        assert_eq!(doc_text(&doc), "ola");
     }
 
     #[test]
