@@ -190,6 +190,8 @@ fn parse_action(name: &str) -> Result<Action, KeymapError> {
         "delete-forward" => Action::DeleteForward,
         "delete-backward" => Action::DeleteBackward,
         "undo" => Action::Undo,
+        "prompt-open-file" => Action::PromptOpenFile,
+        "prompt-search" => Action::PromptSearch,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }

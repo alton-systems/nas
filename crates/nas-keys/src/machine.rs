@@ -56,6 +56,12 @@ pub enum Action {
     Undo,
     InsertChar(char),
     InsertNewline,
+    /// Pede a quem chama pra abrir uma linha de entrada pedindo um
+    /// caminho de arquivo (`o`, find-file).
+    PromptOpenFile,
+    /// Pede a quem chama pra abrir uma linha de entrada de busca
+    /// incremental (`SPC f`, isearch-forward).
+    PromptSearch,
 }
 
 /// Prefixo ou despacho aguardando a próxima tecla ("g" → go, Espaço →
@@ -454,6 +460,22 @@ mod tests {
     fn prefixo_go_com_tecla_nao_mapeada_nao_faz_nada() {
         let mut machine = Machine::new();
         assert_eq!(run(&mut machine, "gz"), Vec::<Action>::new());
+        assert_eq!(machine.state(), ModalState::Visual);
+    }
+
+    #[test]
+    fn o_abre_prompt_de_arquivo() {
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "o"), vec![Action::PromptOpenFile]);
+        // "o" não é um prefixo: o estado não muda, quem decide o que
+        // fazer com o prompt é quem chama (nas-term).
+        assert_eq!(machine.state(), ModalState::Visual);
+    }
+
+    #[test]
+    fn leader_f_abre_prompt_de_busca() {
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, " f"), vec![Action::PromptSearch]);
         assert_eq!(machine.state(), ModalState::Visual);
     }
 

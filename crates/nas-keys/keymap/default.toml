@@ -17,11 +17,10 @@
 #     mais uma tecla, mas com uma ação de "fallback" se a tecla não for
 #     uma das suas — ver a tabela [dispatches.NOME].
 #
-# Escopo desta etapa (marco 1, etapa 4): só os comandos que o
-# nas-editor/nas-term já sabem executar. O resto do nas-map.el (seleção,
-# área de transferência, busca, trocar de buffer, abrir arquivo,
-# janelas) ainda não tem ação correspondente — ver a proposta da
-# etapa 5.
+# Escopo desta etapa (marco 1, etapa 5a): abrir arquivo e busca
+# incremental já têm ação. O resto do nas-map.el (seleção, área de
+# transferência, trocar de buffer, janelas) ainda não tem ação
+# correspondente.
 
 [insert]
 "M-SPC" = "enter-visual"
@@ -45,6 +44,9 @@ K = "move-buffer-end"
 # Desfazer
 u = "undo"
 
+# Abrir arquivo
+o = "prompt-open-file"
+
 # Prefixos e despacho
 g = { prefix = "go" }
 SPC = { prefix = "leader" }
@@ -55,6 +57,7 @@ g = "move-buffer-start"
 
 [prefixes.leader]
 SPC = "enter-sequential"
+f = "prompt-search"
 
 [dispatches.delete]
 fallback = "delete-forward"
