@@ -6,11 +6,50 @@
 //! `helix_core::Rope`, `Transaction` ou `History`.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::fs;
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
+use helix_core::line_ending::LineEnding;
 use helix_core::{Rope, Selection, Tendril, Transaction, graphemes, history, line_ending};
+use tempfile::NamedTempFile;
+
+/// Erro ao abrir um arquivo: além de erros de E/S comuns, um arquivo que
+/// não é UTF-8 válido é recusado — nunca chega a existir um `Document` com
+/// conteúdo corrompido, então salvar não tem como sobrescrever o original.
+#[derive(Debug)]
+pub enum OpenError {
+    Io(io::Error),
+    NotUtf8,
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenError::Io(err) => write!(f, "{err}"),
+            OpenError::NotUtf8 => write!(f, "o arquivo não é UTF-8 válido"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenError::Io(err) => Some(err),
+            OpenError::NotUtf8 => None,
+        }
+    }
+}
+
+impl From<OpenError> for io::Error {
+    fn from(err: OpenError) -> io::Error {
+        match err {
+            OpenError::Io(err) => err,
+            OpenError::NotUtf8 => io::Error::new(io::ErrorKind::InvalidData, err.to_string()),
+        }
+    }
+}
 
 /// Posição lógica do cursor no documento: linha e coluna em caracteres,
 /// ambas 0-indexadas.
@@ -27,6 +66,7 @@ pub struct Document {
     history: history::History,
     path: Option<PathBuf>,
     modified: bool,
+    line_ending: LineEnding,
 }
 
 impl Document {
@@ -38,18 +78,29 @@ impl Document {
             history: history::History::default(),
             path: None,
             modified: false,
+            line_ending: LineEnding::LF,
         }
     }
 
     /// Abre o arquivo em `path`. Se o arquivo não existir ainda, retorna um
-    /// buffer vazio com o caminho associado (para criar o arquivo ao salvar).
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    /// buffer vazio com o caminho associado (para criar o arquivo ao
+    /// salvar). Recusa arquivos que não são UTF-8 válido — nesse caso quem
+    /// chama decide o que mostrar, mas nenhum `Document` chega a existir
+    /// com o conteúdo inválido.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
         let path = path.as_ref();
         let rope = match fs::File::open(path) {
-            Ok(file) => Rope::from_reader(BufReader::new(file))?,
+            Ok(file) => Rope::from_reader(BufReader::new(file)).map_err(|err| {
+                if err.kind() == io::ErrorKind::InvalidData {
+                    OpenError::NotUtf8
+                } else {
+                    OpenError::Io(err)
+                }
+            })?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => Rope::new(),
-            Err(err) => return Err(err),
+            Err(err) => return Err(OpenError::Io(err)),
         };
+        let line_ending = line_ending::auto_detect_line_ending(&rope).unwrap_or(LineEnding::LF);
         tracing::info!(path = %path.display(), "documento aberto");
         Ok(Self {
             rope,
@@ -57,6 +108,7 @@ impl Document {
             history: history::History::default(),
             path: Some(path.to_path_buf()),
             modified: false,
+            line_ending,
         })
     }
 
@@ -68,14 +120,15 @@ impl Document {
         self.modified
     }
 
-    /// Escreve o buffer no caminho associado. Retorna `false` se o
-    /// documento não tiver um caminho (ainda não há "salvar como").
+    /// Escreve o buffer no caminho associado, atomicamente (arquivo
+    /// temporário na mesma pasta + fsync + rename por cima do original,
+    /// preservando as permissões). Retorna `false` se o documento não
+    /// tiver um caminho (ainda não há "salvar como").
     pub fn save(&mut self) -> io::Result<bool> {
         let Some(path) = &self.path else {
             return Ok(false);
         };
-        self.rope
-            .write_to(BufWriter::new(fs::File::create(path)?))?;
+        write_atomic(path, &self.rope)?;
         self.modified = false;
         tracing::info!(path = %path.display(), "documento salvo");
         Ok(true)
@@ -151,6 +204,20 @@ impl Document {
         self.cursor = pos;
     }
 
+    /// Insere uma quebra de linha no estilo do arquivo aberto (CRLF se o
+    /// arquivo já usava CRLF, LF por padrão em buffers novos).
+    pub fn insert_newline(&mut self) {
+        let selection = Selection::point(self.cursor);
+        let original = history::State {
+            doc: self.rope.clone(),
+            selection: selection.clone(),
+        };
+        let text: Tendril = self.line_ending.as_str().into();
+        let transaction = Transaction::insert(&self.rope, &selection, text);
+        self.apply(transaction, original);
+        self.cursor = graphemes::next_grapheme_boundary(self.rope.slice(..), self.cursor);
+    }
+
     pub fn insert_char(&mut self, ch: char) {
         let selection = Selection::point(self.cursor);
         let original = history::State {
@@ -207,6 +274,36 @@ impl Document {
         self.modified = true;
         true
     }
+}
+
+/// Escreve `rope` em `path` atomicamente: cria um arquivo temporário na
+/// mesma pasta (para que o rename final seja atômico no mesmo sistema de
+/// arquivos), copia as permissões do arquivo original se ele existir,
+/// sincroniza o conteúdo em disco (fsync) e só então substitui o arquivo
+/// original por rename. Se `path` ainda não existir, o arquivo novo fica
+/// com as permissões padrão (mais restritas) do `tempfile`.
+fn write_atomic(path: &Path, rope: &Rope) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+
+    let tmp = NamedTempFile::new_in(dir)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        tmp.as_file().set_permissions(metadata.permissions())?;
+    }
+
+    rope.write_to(BufWriter::new(tmp.as_file()))?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|err| err.error)?;
+
+    // fsync do diretório é uma garantia extra de durabilidade do rename;
+    // não é crítico o bastante para falhar o salvamento se não der.
+    if let Ok(dir_file) = fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+
+    Ok(())
 }
 
 /// Conta quantos graphemes existem entre `from` e `to` (em caracteres).
@@ -357,6 +454,89 @@ mod tests {
         }
         assert!(doc.save().expect("salvar deve funcionar"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "oi");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn salvar_e_atomico_e_preserva_permissoes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("atomic.txt");
+        fs::write(&path, "conteúdo original\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        doc.insert_char('X');
+        assert!(doc.save().expect("salvar deve funcionar"));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "Xconteúdo original\n");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "permissões do arquivo original devem ser preservadas"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn preserva_crlf_e_usa_crlf_em_linhas_novas() {
+        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("crlf.txt");
+        fs::write(&path, "linha um\r\nlinha dois\r\n").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        doc.insert_newline();
+        doc.insert_char('X');
+        assert!(doc.save().expect("salvar deve funcionar"));
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "\r\nXlinha um\r\nlinha dois\r\n"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn preserva_ausencia_de_quebra_de_linha_final() {
+        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("sem_quebra.txt");
+        fs::write(&path, "sem quebra no final").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        doc.insert_char('X');
+        assert!(doc.save().expect("salvar deve funcionar"));
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert_eq!(saved, "Xsem quebra no final");
+        assert!(!saved.ends_with('\n'));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn recusa_arquivo_que_nao_e_utf8_valido() {
+        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("binario.bin");
+        fs::write(&path, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+
+        match Document::open(&path) {
+            Err(OpenError::NotUtf8) => {}
+            Ok(_) => panic!("esperava recusa por UTF-8 inválido, mas o arquivo abriu"),
+            Err(other) => panic!("esperava OpenError::NotUtf8, obteve outro erro: {other}"),
+        }
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);

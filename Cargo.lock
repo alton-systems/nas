@@ -773,6 +773,7 @@ name = "nas-editor"
 version = "0.1.0"
 dependencies = [
  "helix-core",
+ "tempfile",
  "tracing",
 ]
 

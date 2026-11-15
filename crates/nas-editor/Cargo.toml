@@ -7,5 +7,6 @@ license.workspace = true
 
 [dependencies]
 helix-core = { git = "https://github.com/helix-editor/helix", tag = "25.07.1" }
+tempfile = "3.27.0"
 tracing = "0.1"
 

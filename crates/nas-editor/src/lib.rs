@@ -7,4 +7,4 @@
 
 mod document;
 
-pub use document::{Document, Position};
+pub use document::{Document, OpenError, Position};
