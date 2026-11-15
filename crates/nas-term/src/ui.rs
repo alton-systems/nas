@@ -76,7 +76,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         ""
     };
-    let name = format!("{name}{modified}");
+    let name = format!("[{}] {name}{modified}", app.modal.status_label());
 
     let position = app.document.cursor_position();
     let position_text = format!("{}:{}", position.line + 1, position.column + 1);

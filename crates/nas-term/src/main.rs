@@ -7,9 +7,10 @@ mod ui;
 use std::io;
 
 use nas_editor::{Document, OpenError};
+use nas_keys::ModalState;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::cursor;
+use ratatui::crossterm::cursor::{self, SetCursorStyle};
 use ratatui::crossterm::event::{self, Event, KeyEventKind, KeyboardEnhancementFlags};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -59,6 +60,7 @@ fn open_document_from_args() -> io::Result<Document> {
 
 async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
     loop {
+        execute!(io::stdout(), cursor_style_for(app.modal.state()))?;
         terminal.draw(|frame| ui::draw(frame, app))?;
 
         if let Event::Key(key) = event::read()? {
@@ -70,6 +72,17 @@ async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> 
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+/// Forma do cursor por estado modal: barra em Insert, bloco em Visual, e
+/// sublinhado em Sequential — o terminal não tem um cursor "oco" como o
+/// do Emacs, sublinhado é o mais distinto dos outros dois disponível.
+fn cursor_style_for(state: ModalState) -> SetCursorStyle {
+    match state {
+        ModalState::Insert => SetCursorStyle::SteadyBar,
+        ModalState::Visual => SetCursorStyle::SteadyBlock,
+        ModalState::Sequential => SetCursorStyle::SteadyUnderScore,
     }
 }
 
@@ -96,6 +109,7 @@ fn restore_terminal() {
         let _ = execute!(io::stdout(), event::PopKeyboardEnhancementFlags);
     }
     let _ = execute!(io::stdout(), cursor::Show);
+    let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
