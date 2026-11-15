@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 
 use helix_core::line_ending::LineEnding;
 use helix_core::{Rope, Selection, Tendril, Transaction, graphemes, history, line_ending};
-use tempfile::NamedTempFile;
 
 /// Erro ao abrir um arquivo: além de erros de E/S comuns, um arquivo que
 /// não é UTF-8 válido é recusado — nunca chega a existir um `Document` com
@@ -277,25 +276,39 @@ impl Document {
 }
 
 /// Escreve `rope` em `path` atomicamente: cria um arquivo temporário na
-/// mesma pasta (para que o rename final seja atômico no mesmo sistema de
-/// arquivos), copia as permissões do arquivo original se ele existir,
-/// sincroniza o conteúdo em disco (fsync) e só então substitui o arquivo
-/// original por rename. Se `path` ainda não existir, o arquivo novo fica
-/// com as permissões padrão (mais restritas) do `tempfile`.
+/// mesma pasta do arquivo *real* (seguindo a cadeia de symlinks, se
+/// `path` for um link — para não substituir o link por um arquivo
+/// comum, o que quebraria ferramentas como o GNU stow), copia as
+/// permissões do arquivo original se ele existir, sincroniza o conteúdo
+/// em disco (fsync) e só então substitui o arquivo real por rename. Se
+/// o arquivo real ainda não existir, usa 0o666 como os demais editores
+/// (ex.: `File::create`) — o kernel aplica o umask do processo por
+/// cima, então o resultado típico é 0o644.
 fn write_atomic(path: &Path, rope: &Rope) -> io::Result<()> {
-    let dir = match path.parent() {
+    let real_path = resolve_symlink_target(path)?;
+    let dir = match real_path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
 
-    let tmp = NamedTempFile::new_in(dir)?;
-    if let Ok(metadata) = fs::metadata(path) {
-        tmp.as_file().set_permissions(metadata.permissions())?;
+    let mut builder = tempfile::Builder::new();
+    match fs::metadata(&real_path) {
+        Ok(metadata) => {
+            builder.permissions(metadata.permissions());
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(fs::Permissions::from_mode(0o666));
+            }
+        }
     }
+    let tmp = builder.tempfile_in(dir)?;
 
     rope.write_to(BufWriter::new(tmp.as_file()))?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|err| err.error)?;
+    tmp.persist(&real_path).map_err(|err| err.error)?;
 
     // fsync do diretório é uma garantia extra de durabilidade do rename;
     // não é crítico o bastante para falhar o salvamento se não der.
@@ -304,6 +317,17 @@ fn write_atomic(path: &Path, rope: &Rope) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Se `path` for um symlink, segue a cadeia inteira até o arquivo real
+/// (para o rename do salvamento acontecer nele, mantendo o link
+/// intacto). Se não for um symlink (ou não existir ainda), devolve o
+/// próprio `path`.
+fn resolve_symlink_target(path: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path),
+        _ => Ok(path.to_path_buf()),
+    }
 }
 
 /// Conta quantos graphemes existem entre `from` e `to` (em caracteres).
@@ -479,6 +503,70 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "permissões do arquivo original devem ser preservadas"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn salvar_atraves_de_symlink_preserva_o_link() {
+        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let real = dir.join("symlink_real.txt");
+        let link = dir.join("symlink_link.txt");
+        fs::write(&real, "conteúdo original\n").unwrap();
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut doc = Document::open(&link).expect("abrir pelo link deve funcionar");
+        doc.insert_char('X');
+        assert!(doc.save().expect("salvar deve funcionar"));
+
+        let link_metadata = fs::symlink_metadata(&link).unwrap();
+        assert!(
+            link_metadata.file_type().is_symlink(),
+            "o link não deveria ter sido substituído por um arquivo comum"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), real);
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "Xconteúdo original\n",
+            "o conteúdo deve ter mudado no arquivo real"
+        );
+
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&real);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn salvar_arquivo_novo_aplica_o_mesmo_umask_que_file_create() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+
+        // Em vez de fixar um umask (processo inteiro, não por thread — e
+        // os testes correm em paralelo), usamos File::create como
+        // referência do que o umask atual do processo realmente produz.
+        let reference_path = dir.join("umask_referencia.txt");
+        fs::File::create(&reference_path).unwrap();
+        let expected_mode = fs::metadata(&reference_path).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_file(&reference_path);
+
+        let path = dir.join("umask_novo.txt");
+        let _ = fs::remove_file(&path);
+        let mut doc = Document::open(&path).expect("abrir arquivo inexistente não deve falhar");
+        doc.insert_char('X');
+        assert!(doc.save().expect("salvar deve funcionar"));
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, expected_mode,
+            "deveria aplicar o mesmo umask do processo que File::create aplica"
         );
 
         let _ = fs::remove_file(&path);
