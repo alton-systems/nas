@@ -4,5 +4,5 @@ members = ["crates/nas-term", "crates/nas-editor", "crates/nas-keys"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 license = "MPL-2.0"
