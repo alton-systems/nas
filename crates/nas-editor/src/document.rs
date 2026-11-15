@@ -185,6 +185,29 @@ impl Document {
         self.move_to_visual_column_on_line(line + 1, self.cursor_visual_column());
     }
 
+    /// Vai para o início da linha atual (coluna 0), como `beginning-of-line`.
+    pub fn move_to_line_start(&mut self) {
+        let line = self.rope.char_to_line(self.cursor);
+        self.cursor = self.rope.line_to_char(line);
+    }
+
+    /// Vai para o fim da linha atual, antes do terminador de linha, como
+    /// `end-of-line`.
+    pub fn move_to_line_end(&mut self) {
+        let line = self.rope.char_to_line(self.cursor);
+        self.cursor = line_ending::line_end_char_index(&self.rope.slice(..), line);
+    }
+
+    /// Vai para o início do buffer, como `beginning-of-buffer`.
+    pub fn move_to_buffer_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Vai para o fim do buffer, como `end-of-buffer`.
+    pub fn move_to_buffer_end(&mut self) {
+        self.cursor = self.rope.len_chars();
+    }
+
     fn move_to_visual_column_on_line(&mut self, line: usize, target_column: usize) {
         let line_start = self.rope.line_to_char(line);
         let line_end = line_ending::line_end_char_index(&self.rope.slice(..), line);
@@ -460,6 +483,26 @@ mod tests {
 
         doc.move_down();
         assert_eq!(doc.cursor_position(), Position { line: 1, column: 2 });
+    }
+
+    #[test]
+    fn move_to_line_e_buffer_start_end() {
+        let mut doc = Document::empty();
+        for ch in "um\ndois\ntres".chars() {
+            doc.insert_char(ch);
+        }
+        // cursor no fim de "tres" (linha 2)
+        doc.move_to_line_start();
+        assert_eq!(doc.cursor_position(), Position { line: 2, column: 0 });
+
+        doc.move_to_line_end();
+        assert_eq!(doc.cursor_position(), Position { line: 2, column: 4 });
+
+        doc.move_to_buffer_start();
+        assert_eq!(doc.cursor_position(), Position { line: 0, column: 0 });
+
+        doc.move_to_buffer_end();
+        assert_eq!(doc.cursor_position(), Position { line: 2, column: 4 });
     }
 
     #[test]
