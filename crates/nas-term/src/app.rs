@@ -3,6 +3,8 @@
 //! sair) não fazem parte do vocabulário do nas-keys — são tratados aqui,
 //! antes de chegar à máquina de estados.
 
+use std::path::{Path, PathBuf};
+
 use nas_editor::{Document, OpenError};
 use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -197,7 +199,7 @@ impl App {
             );
             return;
         }
-        match Document::open(path) {
+        match Document::open(expand_path(path)) {
             Ok(document) => {
                 self.document = document;
                 self.scroll_top = 0;
@@ -276,6 +278,26 @@ fn translate_key(key: KeyEvent) -> Option<Key> {
         _ => return None,
     };
     Some(Key { code, alt })
+}
+
+/// Resolve o caminho digitado no prompt de abrir arquivo: `~` (ou
+/// `~/...`) expande pro diretório home; um caminho relativo é resolvido
+/// a partir do diretório onde o nas foi iniciado — como o nas nunca
+/// troca de diretório durante a execução, isso é só o diretório atual
+/// do processo. Um caminho absoluto passa direto.
+fn expand_path(input: &str) -> PathBuf {
+    let path = Path::new(input);
+    if let Ok(rest) = path.strip_prefix("~")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    if path.is_relative()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return cwd.join(path);
+    }
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -428,5 +450,33 @@ mod tests {
             "o documento modificado não deve ter sido substituído"
         );
         assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn expande_til_para_o_diretorio_home() {
+        let home = std::env::var_os("HOME").expect("precisa de HOME pra este teste");
+        assert_eq!(
+            expand_path("~/notas/arquivo.txt"),
+            PathBuf::from(&home).join("notas/arquivo.txt")
+        );
+        assert_eq!(expand_path("~"), PathBuf::from(&home));
+    }
+
+    #[test]
+    fn resolve_caminho_relativo_a_partir_do_diretorio_atual() {
+        let cwd = std::env::current_dir().expect("diretório atual deveria existir");
+        assert_eq!(expand_path("arquivo.txt"), cwd.join("arquivo.txt"));
+        assert_eq!(
+            expand_path("sub/dir/arquivo.txt"),
+            cwd.join("sub/dir/arquivo.txt")
+        );
+    }
+
+    #[test]
+    fn caminho_absoluto_fica_inalterado() {
+        assert_eq!(
+            expand_path("/tmp/arquivo.txt"),
+            PathBuf::from("/tmp/arquivo.txt")
+        );
     }
 }
