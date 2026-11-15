@@ -76,10 +76,10 @@ async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> 
         execute!(io::stdout(), cursor_style_for(app.modal.state()))?;
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Release {
-                app.handle_key(key);
-            }
+        if let Event::Key(key) = event::read()?
+            && key.kind != KeyEventKind::Release
+        {
+            app.handle_key(key);
         }
 
         if app.should_quit {
