@@ -4,14 +4,18 @@ mod app;
 mod logging;
 mod ui;
 
-use std::io;
+use std::io::{self, Write as _};
 
+use base64::Engine as _;
 use nas_editor::{Document, OpenError};
 use nas_keys::{Layout, ModalState};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{self, SetCursorStyle};
-use ratatui::crossterm::event::{self, Event, KeyEventKind, KeyboardEnhancementFlags};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    KeyboardEnhancementFlags,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -76,15 +80,43 @@ async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> 
         execute!(io::stdout(), cursor_style_for(app))?;
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        if let Event::Key(key) = event::read()?
-            && key.kind != KeyEventKind::Release
-        {
-            app.handle_key(key);
+        match event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
+            // Texto colado via bracketed paste nunca passa pela máquina
+            // modal — sem isso, colar algo como "dd" seria interpretado
+            // tecla por tecla como comandos do estado Visual, em vez de
+            // simplesmente inserido como texto.
+            Event::Paste(text) => app.handle_paste(text),
+            _ => {}
+        }
+
+        if let Some(text) = app.pending_clipboard_write.take() {
+            write_system_clipboard(&text);
         }
 
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+/// Escreve `text` na área de transferência do sistema por dois
+/// caminhos independentes: OSC 52 (sequência de escape que o próprio
+/// terminal intercepta — funciona no Kitty e, por passar pelo próprio
+/// fluxo do terminal, também via SSH) e `arboard` (fala direto com o
+/// clipboard do sistema operacional — alternativa para quando o
+/// terminal não suporta OSC 52, mas não funciona via SSH sem um
+/// display local). Melhor esforço: nenhuma falha aqui é fatal — o
+/// registro interno (`App::clipboard`) já garante colar dentro do nas
+/// mesmo se os dois falharem.
+fn write_system_clipboard(text: &str) {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text);
     }
 }
 
@@ -106,6 +138,7 @@ fn cursor_style_for(app: &App) -> SetCursorStyle {
 fn setup_terminal() -> io::Result<Terminal<Backend>> {
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnableBracketedPaste)?;
     if supports_keyboard_enhancement().unwrap_or(false) {
         execute!(
             io::stdout(),
@@ -127,6 +160,7 @@ fn restore_terminal() {
     }
     let _ = execute!(io::stdout(), cursor::Show);
     let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }

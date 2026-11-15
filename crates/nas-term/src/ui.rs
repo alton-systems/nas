@@ -5,7 +5,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{App, PromptKind};
@@ -53,8 +53,13 @@ fn draw_gutter(frame: &mut Frame, area: Rect, app: &App, gutter_width: usize) {
 }
 
 fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
+    let selection = app.document.selection_range();
     let lines: Vec<Line> = visible_line_range(app, area.height as usize)
-        .map(|idx| Line::from(app.document.line(idx).into_owned()))
+        .map(|idx| {
+            let line_start = app.document.line_start_offset(idx);
+            let text = app.document.line(idx).into_owned();
+            line_with_selection(text, line_start, selection)
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).scroll((0, app.scroll_left as u16)),
@@ -107,6 +112,45 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(truncated_name).style(style), name_area);
     frame.render_widget(Paragraph::new(position_text).style(style), position_area);
+}
+
+/// Monta a linha destacando a parte que cai dentro da seleção ativa
+/// (`line_start` é a posição absoluta, em caracteres, de onde essa
+/// linha começa no documento).
+fn line_with_selection(
+    text: String,
+    line_start: usize,
+    selection: Option<(usize, usize)>,
+) -> Line<'static> {
+    let Some((sel_start, sel_end)) = selection else {
+        return Line::from(text);
+    };
+    let line_len = text.chars().count();
+    let line_end = line_start + line_len;
+    if sel_end <= line_start || sel_start >= line_end {
+        return Line::from(text);
+    }
+
+    let local_start = sel_start.saturating_sub(line_start).min(line_len);
+    let local_end = sel_end.saturating_sub(line_start).min(line_len);
+
+    let chars: Vec<char> = text.chars().collect();
+    let before: String = chars[..local_start].iter().collect();
+    let selected: String = chars[local_start..local_end].iter().collect();
+    let after: String = chars[local_end..].iter().collect();
+
+    let highlight = Style::default().add_modifier(Modifier::REVERSED);
+    let mut spans = Vec::new();
+    if !before.is_empty() {
+        spans.push(Span::raw(before));
+    }
+    if !selected.is_empty() {
+        spans.push(Span::styled(selected, highlight));
+    }
+    if !after.is_empty() {
+        spans.push(Span::raw(after));
+    }
+    Line::from(spans)
 }
 
 /// Corta `s` pela esquerda para caber em `max_width` caracteres, marcando
@@ -231,5 +275,69 @@ mod tests {
 
         let rendered = render_to_string(&mut app, 30, 3);
         insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_selecao_ativa() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut document = Document::empty();
+        for ch in "ola mundo".chars() {
+            document.insert_char(ch);
+        }
+        let mut app = App::with_layout(document, Layout::Qwerty);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE));
+        }
+
+        // o texto é o mesmo com ou sem seleção — o destaque (estilo
+        // reverso) não aparece no dump de caracteres; ver o teste
+        // seguinte, que confere o estilo de cada célula.
+        let rendered = render_to_string(&mut app, 30, 3);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn selecao_aplica_estilo_reverso_so_no_trecho_selecionado() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::style::Modifier as StyleModifier;
+
+        let mut document = Document::empty();
+        for ch in "ola mundo".chars() {
+            document.insert_char(ch);
+        }
+        let mut app = App::with_layout(document, Layout::Qwerty);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE));
+        }
+        assert_eq!(app.document.selection_range(), Some((0, 3)));
+
+        let backend = TestBackend::new(30, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal de teste");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("desenhar");
+        let buffer = terminal.backend().buffer();
+
+        let gutter_width = 2; // "1 " para um documento de 1 linha
+        for col in 0..9usize {
+            let is_selected = col < 3; // "ola" são as 3 primeiras colunas
+            let cell = &buffer[((gutter_width + col) as u16, 0)];
+            assert_eq!(
+                cell.modifier.contains(StyleModifier::REVERSED),
+                is_selected,
+                "coluna {col} ({:?}) deveria{} estar destacada",
+                cell.symbol(),
+                if is_selected { "" } else { " não" }
+            );
+        }
     }
 }
