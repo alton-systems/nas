@@ -208,6 +208,48 @@ impl Document {
         self.cursor = self.rope.len_chars();
     }
 
+    /// Posição do cursor em caracteres, desde o início do documento —
+    /// para guardar/restaurar de onde uma busca começou.
+    pub fn cursor_offset(&self) -> usize {
+        self.cursor
+    }
+
+    /// Move o cursor para uma posição em caracteres, sem passar do fim
+    /// do documento.
+    pub fn set_cursor(&mut self, offset: usize) {
+        self.cursor = offset.min(self.rope.len_chars());
+    }
+
+    /// Acha a primeira ocorrência de `query` a partir de `from`
+    /// (inclusive), dando a volta pro início do documento se não achar
+    /// antes do fim — como `isearch-forward`, mas sem parar quando a
+    /// busca "sai" do documento. `None` se `query` for vazia ou não
+    /// aparecer em lugar nenhum.
+    pub fn find_from(&self, from: usize, query: &str) -> Option<usize> {
+        let query: Vec<char> = query.chars().collect();
+        if query.is_empty() {
+            return None;
+        }
+        let len = self.rope.len_chars();
+        if len == 0 {
+            return None;
+        }
+        let from = from.min(len);
+        (from..len)
+            .chain(0..from)
+            .find(|&pos| self.matches_at(pos, &query))
+    }
+
+    fn matches_at(&self, pos: usize, query: &[char]) -> bool {
+        if pos + query.len() > self.rope.len_chars() {
+            return false;
+        }
+        self.rope
+            .chars_at(pos)
+            .take(query.len())
+            .eq(query.iter().copied())
+    }
+
     fn move_to_visual_column_on_line(&mut self, line: usize, target_column: usize) {
         let line_start = self.rope.line_to_char(line);
         let line_end = line_ending::line_end_char_index(&self.rope.slice(..), line);
@@ -503,6 +545,51 @@ mod tests {
 
         doc.move_to_buffer_end();
         assert_eq!(doc.cursor_position(), Position { line: 2, column: 4 });
+    }
+
+    #[test]
+    fn cursor_offset_e_set_cursor() {
+        let mut doc = Document::empty();
+        for ch in "abc".chars() {
+            doc.insert_char(ch);
+        }
+        assert_eq!(doc.cursor_offset(), 3);
+        doc.set_cursor(1);
+        assert_eq!(doc.cursor_offset(), 1);
+        doc.set_cursor(100); // além do fim: fica no fim
+        assert_eq!(doc.cursor_offset(), 3);
+    }
+
+    #[test]
+    fn find_from_acha_a_frente_do_cursor() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo ola de novo".chars() {
+            doc.insert_char(ch);
+        }
+        // a primeira ocorrência de "ola" a partir de 4 (depois do primeiro
+        // "ola ") é a segunda ocorrência, em "ola de novo"
+        assert_eq!(doc.find_from(4, "ola"), Some(10));
+    }
+
+    #[test]
+    fn find_from_da_a_volta_pro_inicio_se_nao_achar_antes_do_fim() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        // só há uma ocorrência de "ola", antes de onde a busca começa —
+        // dá a volta e encontra no início.
+        assert_eq!(doc.find_from(5, "ola"), Some(0));
+    }
+
+    #[test]
+    fn find_from_nao_acha_o_que_nao_existe_ou_consulta_vazia() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        assert_eq!(doc.find_from(0, "xyz"), None);
+        assert_eq!(doc.find_from(0, ""), None);
     }
 
     #[test]
