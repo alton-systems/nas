@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
+use helix_core::chars::{CharCategory, categorize_char};
 use helix_core::line_ending::LineEnding;
 use helix_core::{Rope, Selection, Tendril, Transaction, graphemes, history, line_ending};
 
@@ -299,6 +300,142 @@ impl Document {
     /// pra destacar a seleção.
     pub fn line_start_offset(&self, idx: usize) -> usize {
         self.rope.line_to_char(idx)
+    }
+
+    /// Vai para o início da linha `line` (1-indexada, como a maioria dos
+    /// editores mostra o número de linha) — como `goto-line`. Números
+    /// fora do documento vão para a primeira ou última linha.
+    pub fn goto_line(&mut self, line: usize) {
+        let target = line.saturating_sub(1).min(self.rope.len_lines() - 1);
+        self.cursor = self.rope.line_to_char(target);
+    }
+
+    /// Vai para o próximo limite de palavra — como `forward-word`.
+    pub fn move_word_forward(&mut self) {
+        self.cursor = self.next_word_boundary(self.cursor);
+    }
+
+    /// Vai para o limite de palavra anterior — como `backward-word`.
+    pub fn move_word_backward(&mut self) {
+        self.cursor = self.prev_word_boundary(self.cursor);
+    }
+
+    /// Vai para o início do próximo parágrafo (a primeira linha não
+    /// vazia depois de uma linha vazia) — como `forward-paragraph`.
+    pub fn move_paragraph_forward(&mut self) {
+        self.cursor = self.adjacent_paragraph_boundary(true);
+    }
+
+    /// Vai para o início do parágrafo anterior — como `backward-paragraph`.
+    pub fn move_paragraph_backward(&mut self) {
+        self.cursor = self.adjacent_paragraph_boundary(false);
+    }
+
+    /// Apaga da posição do cursor até o fim da linha — como `kill-line`.
+    /// Se o cursor já estiver no fim da linha, apaga o terminador de
+    /// linha, juntando com a próxima (igual ao `kill-line` real nesse
+    /// caso). Devolve o texto apagado, para quem chama copiar.
+    pub fn delete_to_line_end(&mut self) -> String {
+        let line = self.rope.char_to_line(self.cursor);
+        let line_end = line_ending::line_end_char_index(&self.rope.slice(..), line);
+        let end = if self.cursor < line_end {
+            line_end
+        } else {
+            graphemes::next_grapheme_boundary(self.rope.slice(..), self.cursor)
+        };
+        self.take_range(self.cursor, end)
+    }
+
+    /// Apaga do início da linha até o cursor — como `kill-line` com
+    /// argumento 0. Devolve o texto apagado.
+    pub fn delete_to_line_start(&mut self) -> String {
+        let start = self.rope.line_to_char(self.rope.char_to_line(self.cursor));
+        let text = self.take_range(start, self.cursor);
+        self.cursor = start;
+        text
+    }
+
+    /// Apaga da posição do cursor até o próximo limite de palavra —
+    /// como `kill-word`. Devolve o texto apagado.
+    pub fn delete_word_forward(&mut self) -> String {
+        let end = self.next_word_boundary(self.cursor);
+        self.take_range(self.cursor, end)
+    }
+
+    /// Apaga o documento inteiro — como `erase-buffer`. Ao contrário dos
+    /// `delete_*`/`kill_*` acima, não devolve o texto: `erase-buffer` no
+    /// Emacs não copia pra área de transferência, é só uma limpeza.
+    pub fn clear(&mut self) {
+        let len = self.rope.len_chars();
+        if len == 0 {
+            return;
+        }
+        self.delete_range(0, len);
+        self.cursor = 0;
+    }
+
+    fn take_range(&mut self, from: usize, to: usize) -> String {
+        let text = self.rope.slice(from..to).to_string();
+        self.delete_range(from, to);
+        text
+    }
+
+    fn next_word_boundary(&self, from: usize) -> usize {
+        let len = self.rope.len_chars();
+        let mut pos = from;
+        while pos < len && categorize_char(self.rope.char(pos)) != CharCategory::Word {
+            pos += 1;
+        }
+        while pos < len && categorize_char(self.rope.char(pos)) == CharCategory::Word {
+            pos += 1;
+        }
+        pos
+    }
+
+    fn prev_word_boundary(&self, from: usize) -> usize {
+        let mut pos = from;
+        while pos > 0 && categorize_char(self.rope.char(pos - 1)) != CharCategory::Word {
+            pos -= 1;
+        }
+        while pos > 0 && categorize_char(self.rope.char(pos - 1)) == CharCategory::Word {
+            pos -= 1;
+        }
+        pos
+    }
+
+    fn is_line_blank(&self, line: usize) -> bool {
+        self.rope.line_to_char(line) == line_ending::line_end_char_index(&self.rope.slice(..), line)
+    }
+
+    /// Posição do início do parágrafo adjacente (`forward`: o próximo;
+    /// senão, o anterior) — um parágrafo termina numa linha vazia.
+    fn adjacent_paragraph_boundary(&self, forward: bool) -> usize {
+        let total = self.rope.len_lines();
+        let mut line = self.rope.char_to_line(self.cursor);
+        if forward {
+            while line < total && !self.is_line_blank(line) {
+                line += 1;
+            }
+            while line < total && self.is_line_blank(line) {
+                line += 1;
+            }
+            if line >= total {
+                self.rope.len_chars()
+            } else {
+                self.rope.line_to_char(line)
+            }
+        } else {
+            // Primeiro pula linhas em branco logo antes (o "vão" entre
+            // parágrafos), depois pula o parágrafo em si — pra parar no
+            // começo dele, não no meio.
+            while line > 0 && self.is_line_blank(line - 1) {
+                line -= 1;
+            }
+            while line > 0 && !self.is_line_blank(line - 1) {
+                line -= 1;
+            }
+            self.rope.line_to_char(line)
+        }
     }
 
     fn matches_at(&self, pos: usize, query: &[char]) -> bool {
@@ -743,6 +880,110 @@ mod tests {
         }
         doc.delete_selection();
         assert_eq!(doc_text(&doc), "ola");
+    }
+
+    #[test]
+    fn goto_line_vai_para_o_inicio_da_linha_1_indexada() {
+        let mut doc = Document::empty();
+        for ch in "um\ndois\ntres".chars() {
+            doc.insert_char(ch);
+        }
+        doc.goto_line(2);
+        assert_eq!(doc.cursor_position(), Position { line: 1, column: 0 });
+
+        doc.goto_line(100); // além do fim: fica na última linha
+        assert_eq!(doc.cursor_position(), Position { line: 2, column: 0 });
+
+        doc.goto_line(0); // abaixo do início: fica na primeira
+        assert_eq!(doc.cursor_position(), Position { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn move_word_forward_e_backward() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo, tudo bem?".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+
+        doc.move_word_forward();
+        assert_eq!(doc.cursor_offset(), 3); // depois de "ola"
+        doc.move_word_forward();
+        assert_eq!(doc.cursor_offset(), 9); // depois de "mundo", antes da vírgula
+
+        doc.move_word_backward();
+        assert_eq!(doc.cursor_offset(), 4); // início de "mundo"
+    }
+
+    #[test]
+    fn delete_word_forward_apaga_a_palavra_e_devolve_o_texto() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        let removed = doc.delete_word_forward();
+        assert_eq!(removed, "ola");
+        assert_eq!(doc_text(&doc), " mundo");
+    }
+
+    #[test]
+    fn delete_to_line_end_apaga_ate_o_fim_e_junta_linhas_se_ja_estiver_no_fim() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo\ndois".chars() {
+            doc.insert_char(ch);
+        }
+        doc.set_cursor(4); // depois de "ola "
+        let removed = doc.delete_to_line_end();
+        assert_eq!(removed, "mundo");
+        assert_eq!(doc_text(&doc), "ola \ndois");
+
+        // já no fim da linha: apaga o terminador, junta com a próxima
+        let removed = doc.delete_to_line_end();
+        assert_eq!(removed, "\n");
+        assert_eq!(doc_text(&doc), "ola dois");
+    }
+
+    #[test]
+    fn delete_to_line_start_apaga_do_inicio_da_linha_ate_o_cursor() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.set_cursor(4);
+        let removed = doc.delete_to_line_start();
+        assert_eq!(removed, "ola ");
+        assert_eq!(doc_text(&doc), "mundo");
+        assert_eq!(doc.cursor_offset(), 0);
+    }
+
+    #[test]
+    fn move_paragraph_forward_e_backward() {
+        let mut doc = Document::empty();
+        for ch in "um\n\ndois\ntres\n\nquatro".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+
+        doc.move_paragraph_forward();
+        assert_eq!(doc.cursor_position(), Position { line: 2, column: 0 }); // início de "dois"
+
+        doc.move_paragraph_forward();
+        assert_eq!(doc.cursor_position(), Position { line: 5, column: 0 }); // início de "quatro"
+
+        doc.move_paragraph_backward();
+        assert_eq!(doc.cursor_position(), Position { line: 2, column: 0 }); // volta pra "dois"
+    }
+
+    #[test]
+    fn clear_apaga_o_documento_inteiro_sem_devolver_texto() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.clear();
+        assert_eq!(doc_text(&doc), "");
+        assert_eq!(doc.cursor_offset(), 0);
     }
 
     #[test]
