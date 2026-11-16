@@ -76,6 +76,13 @@ fn keyboard_layout() -> Layout {
 }
 
 async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> {
+    // Uma só instância, viva pelo resto do processo: se criarmos e
+    // derrubarmos um `arboard::Clipboard` a cada cópia, o X11 não tem
+    // tempo de entregar o conteúdo a um clipboard manager e o arboard
+    // imprime um aviso direto no stderr — o que corrompe a tela do TUI,
+    // já que stderr continua ligado ao terminal.
+    let mut clipboard = arboard::Clipboard::new().ok();
+
     loop {
         execute!(io::stdout(), cursor_style_for(app))?;
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -91,7 +98,19 @@ async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> 
         }
 
         if let Some(text) = app.pending_clipboard_write.take() {
-            write_system_clipboard(&text);
+            write_system_clipboard(&mut clipboard, &text);
+        }
+
+        if app.pending_paste {
+            // Lê a área de transferência do sistema primeiro, pra colar
+            // o que foi copiado em outro programa; se não der (sem
+            // display, terminal sem suporte), o que já está em
+            // `app.clipboard` (o último copiar/recortar dentro do nas)
+            // continua valendo.
+            if let Some(text) = read_system_clipboard(&mut clipboard) {
+                app.clipboard = text;
+            }
+            app.apply_pending_paste();
         }
 
         if app.should_quit {
@@ -109,15 +128,26 @@ async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> 
 /// display local). Melhor esforço: nenhuma falha aqui é fatal — o
 /// registro interno (`App::clipboard`) já garante colar dentro do nas
 /// mesmo se os dois falharem.
-fn write_system_clipboard(text: &str) {
+fn write_system_clipboard(clipboard: &mut Option<arboard::Clipboard>, text: &str) {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let mut stdout = io::stdout();
     let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
     let _ = stdout.flush();
 
-    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+    if let Some(clipboard) = clipboard {
         let _ = clipboard.set_text(text);
     }
+}
+
+/// Lê a área de transferência do sistema via `arboard`. `None` se não
+/// houver acesso a uma de verdade (sem display gráfico, por exemplo —
+/// o caso comum numa sessão SSH) ou se estiver vazia; quem chama volta
+/// pro registro interno (`App::clipboard`) nesse caso. OSC 52 não
+/// participa daqui: ler a área de transferência por OSC 52 depende do
+/// terminal responder à consulta, o que a maioria não faz por padrão
+/// (questão de segurança) — só `arboard` é confiável pra leitura.
+fn read_system_clipboard(clipboard: &mut Option<arboard::Clipboard>) -> Option<String> {
+    clipboard.as_mut()?.get_text().ok()
 }
 
 /// Forma do cursor: barra em Insert (e numa linha de entrada, que
