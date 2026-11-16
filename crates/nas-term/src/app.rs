@@ -39,15 +39,21 @@ pub struct App {
     pub status_message: Option<String>,
     pub prompt: Option<Prompt>,
     /// Registro interno da área de transferência — sempre atualizado em
-    /// copiar/recortar, e a fonte de `y` (paste). Garante que colar
-    /// funcione mesmo quando nem OSC 52 nem o `arboard` conseguem
-    /// alcançar uma área de transferência de verdade (ex.: SSH sem
-    /// terminal compatível, sessão sem display gráfico).
+    /// copiar/recortar. É o que `y` cola quando a área de transferência
+    /// do sistema não está acessível (ex.: SSH sem terminal compatível,
+    /// sessão sem display gráfico); quando está, `y` lê de lá primeiro,
+    /// pra colar o que foi copiado em outro programa.
     pub clipboard: String,
     /// Texto que `main.rs` deve escrever na área de transferência do
     /// sistema (OSC 52 + `arboard`) depois desta tecla — `App` não tem
     /// acesso a E/S real, pra ficar testável sem terminal nem display.
     pub pending_clipboard_write: Option<String>,
+    /// `y` foi pressionado: `main.rs` deve tentar atualizar `clipboard`
+    /// a partir da área de transferência do sistema (`arboard`) e então
+    /// chamar `apply_pending_paste`. Mesmo motivo do campo acima — ler
+    /// a área de transferência do sistema é E/S de verdade, que `App`
+    /// não faz sozinho.
+    pub pending_paste: bool,
 }
 
 impl App {
@@ -65,6 +71,7 @@ impl App {
             prompt: None,
             clipboard: String::new(),
             pending_clipboard_write: None,
+            pending_paste: false,
         }
     }
 
@@ -136,11 +143,22 @@ impl App {
             Action::SelectAll => self.document.select_all(),
             Action::Copy => self.copy(),
             Action::Cut => self.cut(),
-            Action::Paste => {
-                let text = self.clipboard.clone();
-                self.paste_text(&text);
-            }
+            Action::Paste => self.pending_paste = true,
         }
+    }
+
+    /// Insere o conteúdo atual de `clipboard` no documento, e desarma
+    /// `pending_paste`. Chamado por `main.rs` depois de tentar atualizar
+    /// `clipboard` a partir da área de transferência do sistema — se
+    /// essa tentativa falhar (sem display, terminal sem suporte), o
+    /// registro interno (o que já estava em `clipboard`) é quem cola.
+    /// Não faz nada se não houver um `y` pendente.
+    pub fn apply_pending_paste(&mut self) {
+        if !std::mem::take(&mut self.pending_paste) {
+            return;
+        }
+        let text = self.clipboard.clone();
+        self.paste_text(&text);
     }
 
     fn copy(&mut self) {
@@ -575,7 +593,9 @@ mod tests {
         );
 
         app.handle_key(key(KeyCode::Char('K'))); // fim do buffer
-        app.handle_key(key(KeyCode::Char('y'))); // cola
+        app.handle_key(key(KeyCode::Char('y'))); // pede pra colar
+        assert!(app.pending_paste);
+        app.apply_pending_paste(); // main.rs faria isso depois de tentar o clipboard do sistema
 
         assert_eq!(text(&app), "ola mundoola");
     }
@@ -595,8 +615,46 @@ mod tests {
         assert_eq!(text(&app), "mundo");
         assert_eq!(app.clipboard, "ola ");
 
-        app.handle_key(key(KeyCode::Char('y'))); // cola de volta na posição atual
+        app.handle_key(key(KeyCode::Char('y'))); // pede pra colar de volta
+        app.apply_pending_paste();
         assert_eq!(text(&app), "ola mundo");
+    }
+
+    #[test]
+    fn y_marca_pending_paste_sem_inserir_nada_sozinho() {
+        // A inserção de verdade só acontece em apply_pending_paste,
+        // depois que main.rs tenta atualizar o clipboard a partir do
+        // sistema — y por si só não insere nada.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.clipboard = "preexistente".to_string();
+        app.handle_key(key(KeyCode::Char('y')));
+
+        assert!(app.pending_paste);
+        assert_eq!(text(&app), "");
+    }
+
+    #[test]
+    fn apply_pending_paste_cola_o_que_estiver_em_clipboard_no_momento() {
+        // Simula main.rs: aperta y, "atualiza" clipboard a partir da
+        // área de transferência do sistema (aqui, só trocando o campo
+        // direto), e só então aplica.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.pending_paste);
+
+        app.clipboard = "do sistema".to_string();
+        app.apply_pending_paste();
+
+        assert_eq!(text(&app), "do sistema");
+        assert!(!app.pending_paste);
+    }
+
+    #[test]
+    fn apply_pending_paste_sem_pedido_pendente_nao_faz_nada() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.clipboard = "nao deveria colar".to_string();
+        app.apply_pending_paste();
+        assert_eq!(text(&app), "");
     }
 
     #[test]
