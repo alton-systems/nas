@@ -28,9 +28,23 @@ docs/decisions/  # ADRs
 
 Decisões de arquitetura ficam registradas em `docs/decisions/`. Regras de trabalho para agentes/IA no repositório estão em `CLAUDE.md`.
 
+## Instalação
+
+```sh
+cargo install --path crates/nas-term --locked
+```
+
+Isso instala o binário como `nas`.
+
 ## Uso
 
+```sh
+nas caminho/do/arquivo.txt
 ```
+
+Durante o desenvolvimento, sem instalar:
+
+```sh
 cargo run -p nas-term -- caminho/do/arquivo.txt
 ```
 
