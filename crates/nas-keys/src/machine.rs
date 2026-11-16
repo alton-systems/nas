@@ -8,13 +8,13 @@
 //!
 //! ## Escopo desta etapa
 //!
-//! O nas-keys real tem comandos que o nas ainda não suporta: os prefixos
-//! `g`/`SPC` além de "ir para o início do buffer"/busca, substituição
-//! (`SPC r`), trocar de buffer (`b`) e gerência de janelas. Essas teclas
-//! existem no nas-keys real mas, por ora, não têm `Action` correspondente
-//! aqui — resolvem para nenhuma ação (um "ainda não implementado"
-//! silencioso, não um erro), até que `nas-editor`/`nas-term` ganhem as
-//! capacidades que elas precisam.
+//! Só faltam duas coisas do nas-map.el real: `SPC r` (query-replace)
+//! e a gerência de janelas (`M-j`/`M-k`/... — nas-term não tem painéis
+//! múltiplos). As duas resolvem para nenhuma ação (um "ainda não
+//! implementado" silencioso, não um erro) até existir a capacidade que
+//! precisam: query-replace precisa de um fluxo interativo de
+//! confirmação por ocorrência, bem maior que um prompt de uma linha;
+//! janelas precisam de um `nas-term` com mais de um painel.
 //!
 //! ## Atalhos como dados
 //!
@@ -71,6 +71,28 @@ pub enum Action {
     Cut,
     /// Cola o que está na área de transferência (`y`, yank).
     Paste,
+    /// Apaga do cursor até o fim da linha (`d k`, kill-line).
+    DeleteToLineEnd,
+    /// Apaga do início da linha até o cursor (`d l`, kill-line 0).
+    DeleteToLineStart,
+    /// Apaga da posição do cursor até o fim da palavra (`d w`, kill-word).
+    DeleteWordForward,
+    /// Apaga o documento inteiro, com confirmação (`d a`, erase-buffer).
+    EraseBuffer,
+    /// Vai pro limite de palavra anterior (líder `j`, backward-word).
+    MoveWordBackward,
+    /// Vai pro próximo limite de palavra (líder `;`, forward-word).
+    MoveWordForward,
+    /// Vai pro próximo parágrafo (líder `k`, forward-paragraph).
+    MoveParagraphForward,
+    /// Vai pro parágrafo anterior (líder `l`, backward-paragraph).
+    MoveParagraphBackward,
+    /// Pede a quem chama pra abrir uma linha de entrada pedindo um
+    /// número de linha (prefixo `g`, `l`, goto-line).
+    PromptGotoLine,
+    /// Pede a quem chama pra abrir uma linha de entrada pra trocar de
+    /// buffer (`b`, switch-to-buffer).
+    PromptSwitchBuffer,
 }
 
 /// Prefixo ou despacho aguardando a próxima tecla ("g" → go, Espaço →
@@ -502,6 +524,36 @@ mod tests {
     }
 
     #[test]
+    fn b_abre_prompt_de_trocar_buffer() {
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine.handle_key(Key::char('b')),
+            vec![Action::PromptSwitchBuffer]
+        );
+    }
+
+    #[test]
+    fn prefixo_go_l_abre_prompt_de_ir_para_linha() {
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "gl"), vec![Action::PromptGotoLine]);
+    }
+
+    #[test]
+    fn leader_motion_de_palavra_e_paragrafo() {
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, " j"), vec![Action::MoveWordBackward]);
+
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, " ;"), vec![Action::MoveWordForward]);
+
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, " k"), vec![Action::MoveParagraphForward]);
+
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, " l"), vec![Action::MoveParagraphBackward]);
+    }
+
+    #[test]
     fn despacho_de_apagar_direto() {
         let mut machine = Machine::new();
         assert_eq!(run(&mut machine, "dd"), vec![Action::DeleteForward]);
@@ -511,6 +563,18 @@ mod tests {
 
         let mut machine = Machine::new();
         assert_eq!(run(&mut machine, "dj"), vec![Action::DeleteBackward]);
+
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "dk"), vec![Action::DeleteToLineEnd]);
+
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "dl"), vec![Action::DeleteToLineStart]);
+
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "dw"), vec![Action::DeleteWordForward]);
+
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "da"), vec![Action::EraseBuffer]);
     }
 
     #[test]

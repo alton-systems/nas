@@ -197,6 +197,16 @@ fn parse_action(name: &str) -> Result<Action, KeymapError> {
         "copy" => Action::Copy,
         "cut" => Action::Cut,
         "paste" => Action::Paste,
+        "delete-to-line-end" => Action::DeleteToLineEnd,
+        "delete-to-line-start" => Action::DeleteToLineStart,
+        "delete-word-forward" => Action::DeleteWordForward,
+        "erase-buffer" => Action::EraseBuffer,
+        "move-word-backward" => Action::MoveWordBackward,
+        "move-word-forward" => Action::MoveWordForward,
+        "move-paragraph-forward" => Action::MoveParagraphForward,
+        "move-paragraph-backward" => Action::MoveParagraphBackward,
+        "prompt-goto-line" => Action::PromptGotoLine,
+        "prompt-switch-buffer" => Action::PromptSwitchBuffer,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
