@@ -8,7 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, PromptKind};
+use crate::app::{App, PromptKind, buffer_name};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = frame.area();
@@ -16,7 +16,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let text_area = rows[0];
     let status_area = rows[1];
 
-    let gutter_width = number_width(app.document.len_lines().max(1)) + 1;
+    let gutter_width = number_width(app.document().len_lines().max(1)) + 1;
     let cols = Layout::horizontal([Constraint::Length(gutter_width as u16), Constraint::Min(1)])
         .split(text_area);
     let gutter_area = cols[0];
@@ -35,8 +35,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn visible_line_range(app: &App, height: usize) -> std::ops::Range<usize> {
-    let total = app.document.len_lines();
-    let start = app.scroll_top.min(total);
+    let total = app.document().len_lines();
+    let start = app.scroll_top().min(total);
     let end = (start + height).min(total);
     start..end
 }
@@ -53,16 +53,16 @@ fn draw_gutter(frame: &mut Frame, area: Rect, app: &App, gutter_width: usize) {
 }
 
 fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
-    let selection = app.document.selection_range();
+    let selection = app.document().selection_range();
     let lines: Vec<Line> = visible_line_range(app, area.height as usize)
         .map(|idx| {
-            let line_start = app.document.line_start_offset(idx);
-            let text = app.document.line(idx).into_owned();
+            let line_start = app.document().line_start_offset(idx);
+            let text = app.document().line(idx).into_owned();
             line_with_selection(text, line_start, selection)
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).scroll((0, app.scroll_left as u16)),
+        Paragraph::new(lines).scroll((0, app.scroll_left() as u16)),
         area,
     );
 }
@@ -71,10 +71,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let style = Style::default().add_modifier(Modifier::REVERSED);
 
     if let Some(prompt) = &app.prompt {
-        let label = match prompt.kind {
-            PromptKind::OpenFile => "Abrir arquivo",
-            PromptKind::Search => "Buscar",
-        };
+        let label = prompt_label(app, prompt.kind);
         let text = format!("{label}: {}", prompt.input);
         frame.render_widget(Paragraph::new(text).style(style), area);
         return;
@@ -85,19 +82,15 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let name = app
-        .document
-        .path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "[sem nome]".to_string());
-    let modified = if app.document.is_modified() {
+    let name = buffer_name(app.document());
+    let modified = if app.document().is_modified() {
         " [+]"
     } else {
         ""
     };
     let name = format!("[{}] {name}{modified}", app.modal.status_label());
 
-    let position = app.document.cursor_position();
+    let position = app.document().cursor_position();
     let position_text = format!("{}:{}", position.line + 1, position.column + 1);
     let position_width = (position_text.chars().count() as u16).min(area.width);
 
@@ -174,17 +167,19 @@ fn truncate_left(s: &str, max_width: usize) -> String {
 }
 
 fn place_cursor(frame: &mut Frame, content_area: Rect, app: &App) {
-    let position = app.document.cursor_position();
-    let visual_column = app.document.cursor_visual_column();
+    let position = app.document().cursor_position();
+    let visual_column = app.document().cursor_visual_column();
+    let scroll_top = app.scroll_top();
+    let scroll_left = app.scroll_left();
 
-    let within_rows = position.line >= app.scroll_top
-        && position.line - app.scroll_top < content_area.height as usize;
-    let within_cols = visual_column >= app.scroll_left
-        && visual_column - app.scroll_left < content_area.width as usize;
+    let within_rows =
+        position.line >= scroll_top && position.line - scroll_top < content_area.height as usize;
+    let within_cols =
+        visual_column >= scroll_left && visual_column - scroll_left < content_area.width as usize;
 
     if within_rows && within_cols {
-        let x = content_area.x + (visual_column - app.scroll_left) as u16;
-        let y = content_area.y + (position.line - app.scroll_top) as u16;
+        let x = content_area.x + (visual_column - scroll_left) as u16;
+        let y = content_area.y + (position.line - scroll_top) as u16;
         frame.set_cursor_position((x, y));
     }
 }
@@ -198,13 +193,30 @@ fn number_width(n: usize) -> usize {
 /// prompt está ativo).
 fn place_prompt_cursor(frame: &mut Frame, status_area: Rect, app: &App) {
     let Some(prompt) = &app.prompt else { return };
-    let label = match prompt.kind {
-        PromptKind::OpenFile => "Abrir arquivo",
-        PromptKind::Search => "Buscar",
-    };
+    let label = prompt_label(app, prompt.kind);
     let text_len = label.chars().count() + 2 + prompt.input.chars().count(); // "label: input"
     let x = status_area.x + (text_len as u16).min(status_area.width.saturating_sub(1));
     frame.set_cursor_position((x, status_area.y));
+}
+
+/// Rótulo exibido na barra de status enquanto um prompt está ativo. O
+/// de trocar de buffer lista os buffers abertos, como pedido na etapa
+/// 5c — é a única informação que o usuário precisa pra saber o que
+/// digitar.
+fn prompt_label(app: &App, kind: PromptKind) -> String {
+    match kind {
+        PromptKind::OpenFile => "Abrir arquivo".to_string(),
+        PromptKind::Search => "Buscar".to_string(),
+        PromptKind::GotoLine => "Ir para linha".to_string(),
+        PromptKind::SwitchBuffer => {
+            let names: Vec<String> = app
+                .buffers
+                .iter()
+                .map(|buffer| buffer_name(&buffer.document))
+                .collect();
+            format!("Trocar buffer ({})", names.join(", "))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -318,7 +330,7 @@ mod tests {
         for _ in 0..3 {
             app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE));
         }
-        assert_eq!(app.document.selection_range(), Some((0, 3)));
+        assert_eq!(app.document().selection_range(), Some((0, 3)));
 
         let backend = TestBackend::new(30, 3);
         let mut terminal = Terminal::new(backend).expect("terminal de teste");

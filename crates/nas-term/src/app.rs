@@ -1,7 +1,7 @@
 //! Estado da aplicação: liga o teclado (crossterm) à máquina de estados
-//! do nas-keys e suas ações ao documento. Atalhos com Ctrl (salvar,
-//! sair) não fazem parte do vocabulário do nas-keys — são tratados aqui,
-//! antes de chegar à máquina de estados.
+//! do nas-keys e suas ações aos documentos abertos. Atalhos com Ctrl
+//! (salvar, sair) não fazem parte do vocabulário do nas-keys — são
+//! tratados aqui, antes de chegar à máquina de estados.
 
 use std::path::{Path, PathBuf};
 
@@ -9,33 +9,62 @@ use nas_editor::{Document, OpenError};
 use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Um buffer aberto: o documento mais o estado de rolagem que é dele,
+/// não da aplicação como um todo (voltar a um buffer deveria mostrar
+/// onde você o deixou). O cursor, a seleção e o histórico de desfazer
+/// já são do próprio `Document`.
+pub struct Buffer {
+    pub document: Document,
+    pub scroll_top: usize,
+    pub scroll_left: usize,
+}
+
+impl Buffer {
+    fn new(document: Document) -> Self {
+        Self {
+            document,
+            scroll_top: 0,
+            scroll_left: 0,
+        }
+    }
+}
+
 /// O que uma linha de entrada está pedindo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     OpenFile,
     Search,
+    SwitchBuffer,
+    GotoLine,
 }
 
 /// Uma linha de entrada ativa na barra de status — equivalente ao
-/// minibuffer do Emacs que `o` (find-file) e `SPC f` (isearch-forward)
-/// abrem no nas-keys real. Enquanto ativa, nenhuma tecla chega à máquina
-/// modal: o texto digitado é só o conteúdo do prompt, nunca interpretado
-/// como comando do estado Visual.
+/// minibuffer do Emacs que `o` (find-file), `SPC f` (isearch-forward),
+/// `b` (switch-to-buffer) e `g l` (goto-line) abrem no nas-keys real.
+/// Enquanto ativa, nenhuma tecla chega à máquina modal: o texto
+/// digitado é só o conteúdo do prompt, nunca interpretado como comando
+/// do estado Visual.
 pub struct Prompt {
     pub kind: PromptKind,
     pub input: String,
     /// Posição do cursor antes da busca começar, pra restaurar se o
-    /// usuário cancelar. `None` fora de uma busca (ex.: abrir arquivo).
+    /// usuário cancelar. `None` fora de uma busca.
     search_origin: Option<usize>,
 }
 
 pub struct App {
-    pub document: Document,
+    pub buffers: Vec<Buffer>,
+    pub active: usize,
     pub modal: Machine,
-    pub scroll_top: usize,
-    pub scroll_left: usize,
     pub should_quit: bool,
     pub quit_confirm_pending: bool,
+    /// "d a" (apagar o buffer inteiro) foi pressionado uma vez; a
+    /// mesma sequência de novo confirma. Ao contrário de
+    /// `quit_confirm_pending`, não é limpo incondicionalmente a cada
+    /// tecla (isso cancelaria a confirmação no meio do "d a" repetido)
+    /// — só quando uma ação diferente de `EraseBuffer` é aplicada, em
+    /// `apply_action`.
+    erase_confirm_pending: bool,
     pub status_message: Option<String>,
     pub prompt: Option<Prompt>,
     /// Registro interno da área de transferência — sempre atualizado em
@@ -61,18 +90,34 @@ impl App {
     /// à máquina modal (ver `NAS_KEYBOARD_LAYOUT` em `main.rs`).
     pub fn with_layout(document: Document, layout: Layout) -> Self {
         Self {
-            document,
+            buffers: vec![Buffer::new(document)],
+            active: 0,
             modal: Machine::with_layout(layout),
-            scroll_top: 0,
-            scroll_left: 0,
             should_quit: false,
             quit_confirm_pending: false,
+            erase_confirm_pending: false,
             status_message: None,
             prompt: None,
             clipboard: String::new(),
             pending_clipboard_write: None,
             pending_paste: false,
         }
+    }
+
+    pub fn document(&self) -> &Document {
+        &self.buffers[self.active].document
+    }
+
+    pub fn document_mut(&mut self) -> &mut Document {
+        &mut self.buffers[self.active].document
+    }
+
+    pub fn scroll_top(&self) -> usize {
+        self.buffers[self.active].scroll_top
+    }
+
+    pub fn scroll_left(&self) -> usize {
+        self.buffers[self.active].scroll_left
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -111,39 +156,79 @@ impl App {
     }
 
     fn apply_action(&mut self, action: Action) {
+        if !matches!(action, Action::EraseBuffer) {
+            self.erase_confirm_pending = false;
+        }
+
         match action {
-            Action::MoveLeft => self.document.move_left(),
-            Action::MoveRight => self.document.move_right(),
-            Action::MoveUp => self.document.move_up(),
-            Action::MoveDown => self.document.move_down(),
-            Action::MoveLineStart => self.document.move_to_line_start(),
-            Action::MoveLineEnd => self.document.move_to_line_end(),
-            Action::MoveBufferStart => self.document.move_to_buffer_start(),
-            Action::MoveBufferEnd => self.document.move_to_buffer_end(),
-            Action::DeleteForward => self.document.delete_forward(),
-            Action::DeleteBackward => self.document.delete_backward(),
+            Action::MoveLeft => self.document_mut().move_left(),
+            Action::MoveRight => self.document_mut().move_right(),
+            Action::MoveUp => self.document_mut().move_up(),
+            Action::MoveDown => self.document_mut().move_down(),
+            Action::MoveLineStart => self.document_mut().move_to_line_start(),
+            Action::MoveLineEnd => self.document_mut().move_to_line_end(),
+            Action::MoveBufferStart => self.document_mut().move_to_buffer_start(),
+            Action::MoveBufferEnd => self.document_mut().move_to_buffer_end(),
+            Action::MoveWordForward => self.document_mut().move_word_forward(),
+            Action::MoveWordBackward => self.document_mut().move_word_backward(),
+            Action::MoveParagraphForward => self.document_mut().move_paragraph_forward(),
+            Action::MoveParagraphBackward => self.document_mut().move_paragraph_backward(),
+            Action::DeleteForward => self.document_mut().delete_forward(),
+            Action::DeleteBackward => self.document_mut().delete_backward(),
+            Action::DeleteToLineEnd => self.kill(|doc| doc.delete_to_line_end()),
+            Action::DeleteToLineStart => self.kill(|doc| doc.delete_to_line_start()),
+            Action::DeleteWordForward => self.kill(|doc| doc.delete_word_forward()),
+            Action::EraseBuffer => self.erase_buffer_with_confirmation(),
             Action::Undo => self.undo(),
-            Action::InsertChar(c) => self.document.insert_char(c),
-            Action::InsertNewline => self.document.insert_newline(),
-            Action::PromptOpenFile => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::OpenFile,
-                    input: String::new(),
-                    search_origin: None,
-                });
-            }
+            Action::InsertChar(c) => self.document_mut().insert_char(c),
+            Action::InsertNewline => self.document_mut().insert_newline(),
+            Action::PromptOpenFile => self.open_prompt(PromptKind::OpenFile),
             Action::PromptSearch => {
+                let origin = self.document().cursor_offset();
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Search,
                     input: String::new(),
-                    search_origin: Some(self.document.cursor_offset()),
+                    search_origin: Some(origin),
                 });
             }
-            Action::StartSelection => self.document.start_selection(),
-            Action::SelectAll => self.document.select_all(),
+            Action::PromptSwitchBuffer => self.open_prompt(PromptKind::SwitchBuffer),
+            Action::PromptGotoLine => self.open_prompt(PromptKind::GotoLine),
+            Action::StartSelection => self.document_mut().start_selection(),
+            Action::SelectAll => self.document_mut().select_all(),
             Action::Copy => self.copy(),
             Action::Cut => self.cut(),
             Action::Paste => self.pending_paste = true,
+        }
+    }
+
+    fn open_prompt(&mut self, kind: PromptKind) {
+        self.prompt = Some(Prompt {
+            kind,
+            input: String::new(),
+            search_origin: None,
+        });
+    }
+
+    fn erase_buffer_with_confirmation(&mut self) {
+        if self.erase_confirm_pending {
+            self.erase_confirm_pending = false;
+            self.document_mut().clear();
+            self.status_message = None;
+        } else {
+            self.erase_confirm_pending = true;
+            self.status_message =
+                Some("Apagar o buffer inteiro? \"d a\" de novo confirma.".to_string());
+        }
+    }
+
+    /// Apaga com `delete` e, se algo foi apagado, copia pra área de
+    /// transferência — como os `kill-*` do Emacs (ao contrário de
+    /// Backspace/Delete, que só apagam).
+    fn kill(&mut self, delete: impl FnOnce(&mut Document) -> String) {
+        let text = delete(self.document_mut());
+        if !text.is_empty() {
+            self.clipboard = text.clone();
+            self.pending_clipboard_write = Some(text);
         }
     }
 
@@ -162,19 +247,19 @@ impl App {
     }
 
     fn copy(&mut self) {
-        if let Some(text) = self.document.selected_text() {
+        if let Some(text) = self.document().selected_text() {
             self.clipboard = text.clone();
             self.pending_clipboard_write = Some(text);
         }
-        self.document.clear_selection();
+        self.document_mut().clear_selection();
     }
 
     fn cut(&mut self) {
-        if let Some(text) = self.document.selected_text() {
+        if let Some(text) = self.document().selected_text() {
             self.clipboard = text.clone();
             self.pending_clipboard_write = Some(text);
         }
-        self.document.delete_selection();
+        self.document_mut().delete_selection();
     }
 
     /// Insere `text` no documento, caractere a caractere — exceto
@@ -186,14 +271,14 @@ impl App {
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
-                '\n' => self.document.insert_newline(),
+                '\n' => self.document_mut().insert_newline(),
                 '\r' => {
                     if chars.peek() == Some(&'\n') {
                         chars.next();
                     }
-                    self.document.insert_newline();
+                    self.document_mut().insert_newline();
                 }
-                _ => self.document.insert_char(c),
+                _ => self.document_mut().insert_char(c),
             }
         }
     }
@@ -251,8 +336,9 @@ impl App {
         let (PromptKind::Search, Some(origin)) = (prompt.kind, prompt.search_origin) else {
             return;
         };
-        if let Some(pos) = self.document.find_from(origin, &prompt.input) {
-            self.document.set_cursor(pos);
+        let query = prompt.input.clone();
+        if let Some(pos) = self.document().find_from(origin, &query) {
+            self.document_mut().set_cursor(pos);
         }
     }
 
@@ -265,6 +351,8 @@ impl App {
             // O cursor já está no último match encontrado (ou de volta
             // na posição original, se nada bateu) — só sair do prompt.
             PromptKind::Search => {}
+            PromptKind::SwitchBuffer => self.switch_buffer(&prompt.input),
+            PromptKind::GotoLine => self.goto_line(&prompt.input),
         }
     }
 
@@ -273,28 +361,32 @@ impl App {
             return;
         };
         if let Some(origin) = prompt.search_origin {
-            self.document.set_cursor(origin);
+            self.document_mut().set_cursor(origin);
         }
     }
 
+    /// Abre `path` num buffer novo — ou troca pro buffer já aberto com
+    /// esse caminho, se houver um. Diferente da etapa anterior (quando
+    /// só existia um buffer), não precisa mais recusar por causa de
+    /// alterações não salvas: o buffer atual continua intacto em
+    /// segundo plano.
     fn open_file(&mut self, path: &str) {
         let path = path.trim();
         if path.is_empty() {
             self.status_message = Some("Nenhum arquivo informado.".to_string());
             return;
         }
-        if self.document.is_modified() {
-            self.status_message = Some(
-                "Há alterações não salvas; salve (Ctrl+S) antes de abrir outro arquivo."
-                    .to_string(),
-            );
+        let resolved = expand_path(path);
+
+        if let Some(index) = self.find_buffer_by_path(&resolved) {
+            self.active = index;
             return;
         }
-        match Document::open(expand_path(path)) {
+
+        match Document::open(&resolved) {
             Ok(document) => {
-                self.document = document;
-                self.scroll_top = 0;
-                self.scroll_left = 0;
+                self.buffers.push(Buffer::new(document));
+                self.active = self.buffers.len() - 1;
             }
             Err(OpenError::NotUtf8) => {
                 self.status_message = Some(format!("'{path}' não é UTF-8 válido."));
@@ -305,38 +397,84 @@ impl App {
         }
     }
 
-    /// Ajusta `scroll_top`/`scroll_left` para que o cursor fique visível
-    /// numa área de `width` x `height` células.
-    pub fn ensure_cursor_visible(&mut self, width: usize, height: usize) {
-        let position = self.document.cursor_position();
-        if position.line < self.scroll_top {
-            self.scroll_top = position.line;
-        } else if position.line >= self.scroll_top + height {
-            self.scroll_top = position.line + 1 - height;
-        }
+    fn find_buffer_by_path(&self, path: &Path) -> Option<usize> {
+        self.buffers
+            .iter()
+            .position(|b| b.document.path() == Some(path))
+    }
 
-        let visual_column = self.document.cursor_visual_column();
-        if visual_column < self.scroll_left {
-            self.scroll_left = visual_column;
-        } else if width > 0 && visual_column >= self.scroll_left + width {
-            self.scroll_left = visual_column + 1 - width;
+    /// Troca pro primeiro buffer aberto cujo nome contém `query`. Com
+    /// `query` vazia, ou sem nenhum buffer batendo, mostra uma mensagem
+    /// em vez de trocar.
+    fn switch_buffer(&mut self, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            self.status_message = Some("Nenhum buffer informado.".to_string());
+            return;
+        }
+        match self
+            .buffers
+            .iter()
+            .position(|b| buffer_name(&b.document).contains(query))
+        {
+            Some(index) => self.active = index,
+            None => {
+                self.status_message = Some(format!("Nenhum buffer encontrado para {query:?}."));
+            }
         }
     }
 
+    fn goto_line(&mut self, input: &str) {
+        match input.trim().parse::<usize>() {
+            Ok(line) if line >= 1 => self.document_mut().goto_line(line),
+            _ => self.status_message = Some("Número de linha inválido.".to_string()),
+        }
+    }
+
+    /// Ajusta a rolagem do buffer ativo para que o cursor fique visível
+    /// numa área de `width` x `height` células.
+    pub fn ensure_cursor_visible(&mut self, width: usize, height: usize) {
+        let position = self.document().cursor_position();
+        let visual_column = self.document().cursor_visual_column();
+        let buffer = &mut self.buffers[self.active];
+
+        if position.line < buffer.scroll_top {
+            buffer.scroll_top = position.line;
+        } else if position.line >= buffer.scroll_top + height {
+            buffer.scroll_top = position.line + 1 - height;
+        }
+
+        if visual_column < buffer.scroll_left {
+            buffer.scroll_left = visual_column;
+        } else if width > 0 && visual_column >= buffer.scroll_left + width {
+            buffer.scroll_left = visual_column + 1 - width;
+        }
+    }
+
+    /// Pergunta só se algum buffer tiver alterações não salvas,
+    /// dizendo quais — Ctrl+S só salva o buffer atual, então a mensagem
+    /// deixa isso claro quando há mais de um.
     fn handle_quit_request(&mut self) {
-        if !self.document.is_modified() || self.quit_confirm_pending {
+        let modified: Vec<String> = self
+            .buffers
+            .iter()
+            .filter(|b| b.document.is_modified())
+            .map(|b| buffer_name(&b.document))
+            .collect();
+
+        if modified.is_empty() || self.quit_confirm_pending {
             self.should_quit = true;
             return;
         }
         self.quit_confirm_pending = true;
-        self.status_message = Some(
-            "Alterações não salvas — Ctrl+Q de novo para saír sem salvar, Ctrl+S para salvar"
-                .to_string(),
-        );
+        self.status_message = Some(format!(
+            "Alterações não salvas em: {} — Ctrl+Q de novo sai sem salvar, Ctrl+S salva o buffer atual",
+            modified.join(", ")
+        ));
     }
 
     fn save(&mut self) {
-        self.status_message = Some(match self.document.save() {
+        self.status_message = Some(match self.document_mut().save() {
             Ok(true) => "Salvo.".to_string(),
             Ok(false) => "Sem nome de arquivo; nada para salvar.".to_string(),
             Err(err) => format!("Erro ao salvar: {err}"),
@@ -344,10 +482,20 @@ impl App {
     }
 
     fn undo(&mut self) {
-        if !self.document.undo() {
+        if !self.document_mut().undo() {
             self.status_message = Some("Nada para desfazer.".to_string());
         }
     }
+}
+
+/// Nome de exibição de um buffer: o caminho do arquivo, ou
+/// `[sem nome]` se ainda não tiver um — usado na barra de status, no
+/// prompt de trocar de buffer e na mensagem de confirmação de saída.
+pub fn buffer_name(document: &Document) -> String {
+    document
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "[sem nome]".to_string())
 }
 
 /// Traduz um `KeyEvent` do crossterm para a tecla neutra do nas-keys.
@@ -410,8 +558,8 @@ mod tests {
     }
 
     fn text(app: &App) -> String {
-        (0..app.document.len_lines())
-            .map(|i| app.document.line(i).into_owned())
+        (0..app.document().len_lines())
+            .map(|i| app.document().line(i).into_owned())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -446,11 +594,11 @@ mod tests {
         // cursor como se fosse só 'j' sem o Ctrl.
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc");
-        let position_before = app.document.cursor_position();
+        let position_before = app.document().cursor_position();
 
         app.handle_key(ctrl_key(KeyCode::Char('j')));
 
-        assert_eq!(app.document.cursor_position(), position_before);
+        assert_eq!(app.document().cursor_position(), position_before);
     }
 
     #[test]
@@ -465,7 +613,7 @@ mod tests {
         for _ in 0..4 {
             app.handle_key(key(KeyCode::Char(';'))); // move pra posição 4
         }
-        let origin = app.document.cursor_offset();
+        let origin = app.document().cursor_offset();
         assert_eq!(origin, 4);
 
         app.handle_key(key(KeyCode::Char(' '))); // líder
@@ -476,11 +624,11 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         // achou a segunda ocorrência de "ola", a partir da origem
-        assert_eq!(app.document.cursor_offset(), 10);
+        assert_eq!(app.document().cursor_offset(), 10);
 
         app.handle_key(key(KeyCode::Esc));
         assert!(app.prompt.is_none());
-        assert_eq!(app.document.cursor_offset(), origin);
+        assert_eq!(app.document().cursor_offset(), origin);
     }
 
     #[test]
@@ -498,7 +646,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.prompt.is_none());
-        assert_eq!(app.document.cursor_offset(), 4); // "ola " tem 4 chars
+        assert_eq!(app.document().cursor_offset(), 4); // "ola " tem 4 chars
     }
 
     #[test]
@@ -509,38 +657,151 @@ mod tests {
         type_text(&mut app, "abc");
         app.handle_key(key(KeyCode::Char('g')));
         app.handle_key(key(KeyCode::Char('g')));
-        let position_before = app.document.cursor_position();
+        let position_before = app.document().cursor_position();
 
         app.handle_key(key(KeyCode::Char('o'))); // abre o prompt de arquivo
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Char('k')));
 
         assert_eq!(app.prompt.as_ref().unwrap().input, "jk");
-        assert_eq!(app.document.cursor_position(), position_before);
+        assert_eq!(app.document().cursor_position(), position_before);
 
         app.handle_key(key(KeyCode::Esc));
         assert!(app.prompt.is_none());
     }
 
     #[test]
-    fn abrir_arquivo_recusa_se_houver_alteracoes_nao_salvas() {
+    fn abrir_arquivo_com_alteracoes_nao_salvas_abre_em_buffer_novo() {
+        // Comportamento mudou na etapa 5c: antes recusava; agora abre
+        // num buffer novo, deixando o atual intocado em segundo plano.
+        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("outro.txt");
+        let _ = std::fs::remove_file(&path);
+
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc");
-        assert!(app.document.is_modified());
+        assert!(app.document().is_modified());
 
         app.handle_key(key(KeyCode::Char('o')));
-        for c in "/tmp/qualquer-coisa.txt".chars() {
+        for c in path.to_str().unwrap().chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(key(KeyCode::Enter));
 
         assert!(app.prompt.is_none());
-        assert_eq!(
-            text(&app),
-            "abc",
-            "o documento modificado não deve ter sido substituído"
-        );
+        assert_eq!(app.buffers.len(), 2);
+        assert_eq!(app.active, 1);
+        assert_eq!(text(&app), "", "o buffer novo começa vazio");
+
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn abrir_arquivo_ja_aberto_troca_pro_buffer_em_vez_de_duplicar() {
+        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("existente.txt");
+        std::fs::write(&path, "conteudo").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let open = |app: &mut App| {
+            app.handle_key(key(KeyCode::Char('o')));
+            for c in path.to_str().unwrap().chars() {
+                app.handle_key(key(KeyCode::Char(c)));
+            }
+            app.handle_key(key(KeyCode::Enter));
+        };
+        open(&mut app);
+        assert_eq!(app.buffers.len(), 2);
+        let first_open_index = app.active;
+
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        open(&mut app); // abre o mesmo caminho de novo
+
+        assert_eq!(app.buffers.len(), 2, "não deveria duplicar o buffer");
+        assert_eq!(app.active, first_open_index);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn trocar_de_buffer_pelo_nome() {
+        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("segundo.txt");
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(key(KeyCode::Char('o')));
+        for c in path.to_str().unwrap().chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.active, 1);
+
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.prompt.as_ref().unwrap().kind, PromptKind::SwitchBuffer);
+        for c in "sem nome".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active, 0, "deveria ter voltado pro buffer [sem nome]");
+
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn trocar_de_buffer_sem_match_mostra_mensagem_e_nao_troca() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(key(KeyCode::Char('b')));
+        for c in "nao existe".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.active, 0);
         assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn ctrl_q_lista_os_buffers_com_alteracoes_nao_salvas() {
+        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("terceiro.txt");
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc"); // modifica o buffer [sem nome]
+
+        app.handle_key(key(KeyCode::Char('o')));
+        for c in path.to_str().unwrap().chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "def"); // modifica o segundo buffer também
+
+        app.handle_key(ctrl_key(KeyCode::Char('q')));
+
+        assert!(!app.should_quit);
+        let message = app.status_message.as_ref().unwrap();
+        assert!(message.contains("[sem nome]"));
+        assert!(message.contains(path.to_str().unwrap()));
+
+        app.handle_key(ctrl_key(KeyCode::Char('q'))); // confirma
+        assert!(app.should_quit);
+
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn ctrl_q_sem_alteracoes_sai_direto() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(ctrl_key(KeyCode::Char('q')));
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -581,13 +842,13 @@ mod tests {
         for _ in 0..3 {
             app.handle_key(key(KeyCode::Char(';')));
         }
-        assert_eq!(app.document.selection_range(), Some((0, 3)));
+        assert_eq!(app.document().selection_range(), Some((0, 3)));
 
         app.handle_key(key(KeyCode::Char('c'))); // copia
         assert_eq!(app.clipboard, "ola");
         assert_eq!(app.pending_clipboard_write.take(), Some("ola".to_string()));
         assert_eq!(
-            app.document.selection_range(),
+            app.document().selection_range(),
             None,
             "copiar deveria descartar a seleção"
         );
@@ -687,7 +948,7 @@ mod tests {
         app.handle_paste("dd".to_string());
 
         assert_eq!(text(&app), "ddabc");
-        assert_eq!(app.document.cursor_position().column, 2);
+        assert_eq!(app.document().cursor_position().column, 2);
     }
 
     #[test]
@@ -700,5 +961,93 @@ mod tests {
 
         assert_eq!(app.prompt.as_ref().unwrap().input, "/tmp/colado.txt");
         assert_eq!(text(&app), "abc", "o documento não deve ter sido tocado");
+    }
+
+    #[test]
+    fn kill_line_e_kill_word_copiam_pra_area_de_transferencia() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('w'))); // d w: apaga "ola"
+        assert_eq!(text(&app), " mundo");
+        assert_eq!(app.clipboard, "ola");
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('k'))); // d k: apaga até o fim da linha
+        assert_eq!(text(&app), "");
+        assert_eq!(app.clipboard, " mundo");
+    }
+
+    #[test]
+    fn erase_buffer_precisa_de_confirmacao() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('a'))); // primeiro "d a": só avisa
+        assert_eq!(text(&app), "ola mundo", "não deveria ter apagado ainda");
+        assert!(app.status_message.is_some());
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('a'))); // segundo "d a": confirma
+        assert_eq!(text(&app), "");
+    }
+
+    #[test]
+    fn erase_buffer_e_cancelado_por_qualquer_outra_acao() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('a'))); // primeiro "d a"
+
+        app.handle_key(key(KeyCode::Char('j'))); // qualquer outra ação cancela
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('a'))); // "d a" de novo: é um primeiro pedido, não confirma
+        assert_eq!(
+            text(&app),
+            "ola mundo",
+            "a confirmação deveria ter sido cancelada pelo 'j'"
+        );
+    }
+
+    #[test]
+    fn goto_line_vai_para_a_linha_pedida() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "um\ndois\ntres");
+
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.prompt.as_ref().unwrap().kind, PromptKind::GotoLine);
+        for c in "2".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.document().cursor_position().line, 1);
+    }
+
+    #[test]
+    fn word_e_paragraph_motion() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo\n\ndois");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char(';'))); // líder ; : próxima palavra
+        assert_eq!(app.document().cursor_offset(), 3);
+
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('k'))); // líder k: próximo parágrafo
+        assert_eq!(app.document().cursor_position().line, 2);
+
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('l'))); // líder l: parágrafo anterior
+        assert_eq!(app.document().cursor_position().line, 0);
     }
 }
