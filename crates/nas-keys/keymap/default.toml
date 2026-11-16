@@ -17,9 +17,10 @@
 #     mais uma tecla, mas com uma ação de "fallback" se a tecla não for
 #     uma das suas — ver a tabela [dispatches.NOME].
 #
-# Escopo desta etapa (marco 1, etapa 5b): seleção e área de
-# transferência já têm ação. Trocar de buffer e janelas ainda não têm
-# ação correspondente (etapa 5c e além).
+# Escopo desta etapa (marco 1, etapa 5c): todo o nas-map.el tem ação
+# aqui, exceto busca-e-substituição (SPC r, query-replace) — precisa de
+# um fluxo interativo de confirmação por ocorrência que ainda não
+# existe — e gerência de janelas (nas-term não tem múltiplos painéis).
 
 [insert]
 "M-SPC" = "enter-visual"
@@ -53,6 +54,9 @@ c = "copy"
 x = "cut"
 y = "paste"
 
+# Trocar de buffer
+b = "prompt-switch-buffer"
+
 # Prefixos e despacho
 g = { prefix = "go" }
 SPC = { prefix = "leader" }
@@ -60,13 +64,24 @@ d = { dispatch = "delete" }
 
 [prefixes.go]
 g = "move-buffer-start"
+l = "prompt-goto-line"
 
 [prefixes.leader]
 SPC = "enter-sequential"
 f = "prompt-search"
+j = "move-word-backward"
+";" = "move-word-forward"
+k = "move-paragraph-forward"
+l = "move-paragraph-backward"
+# "r" (query-replace) fica de fora — precisa de um fluxo interativo de
+# confirmação por ocorrência que ainda não existe.
 
 [dispatches.delete]
 fallback = "delete-forward"
 d = "delete-forward"
 ";" = "delete-forward"
 j = "delete-backward"
+k = "delete-to-line-end"
+l = "delete-to-line-start"
+w = "delete-word-forward"
+a = "erase-buffer"
