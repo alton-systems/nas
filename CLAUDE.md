@@ -59,7 +59,10 @@ Crates futuras (não criar antes do marco correspondente): `nas-lisp`
 - **Cada etapa numa branch própria** (ex.: `etapa-5b`), terminando com
   um Pull Request aberto no GitHub com um resumo da etapa. Push na
   branch da etapa está liberado. **Nunca fazer push direto na `main`
-  nem merge do próprio PR** — quem revisa e faz o merge é o autor.
+  nem merge do próprio PR** — quem revisa e faz o merge é o autor. Essa
+  regra vale pra toda mudança, inclusive de processo e documentação
+  (como esta própria linha) — nenhuma exceção por ser "só" um ajuste
+  pequeno.
 - Antes de uma decisão grande que não esteja registrada (trocar uma
   biblioteca, mudar a estrutura de crates), parar e perguntar.
 - Se uma API do `helix-core` (ou `helix-lsp`/`helix-loader`) não estiver
