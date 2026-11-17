@@ -2,8 +2,15 @@
 
 ## Status
 
-Aceita e implementada (etapas 3 e 4 do marco 1). O mecanismo de sincronia
-descrito aqui é para o marco 1 e será revisto no marco 2.
+Aceita e implementada (etapas 3 e 4 do marco 1). **Parcialmente
+substituída por `0004-especificacao-de-teclas-no-nas.md`**: o ponto 1
+da decisão abaixo ("o repositório nas-keys é a fonte da verdade") não
+vale mais — a especificação agora vive em `docs/keys.md`, no próprio
+nas. Os pontos 2 a 4 (keymap como dados declarativos, tradução de
+layout como tabela, testes portados) continuam valendo sem alteração.
+O mecanismo de sincronia descrito aqui era para o marco 1; com a
+0004, a sincronia passa a ser nas-keys *lendo* do nas, não o
+contrário.
 
 ## Contexto
 

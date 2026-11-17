@@ -27,14 +27,21 @@ permissões por efeito, propostas da IA) enquanto o marco 1 não estiver pronto.
   do TUI. **Testes:** `cargo test` + `insta` para snapshots de tela.
 - **Licença:** MPL-2.0 no projeto inteiro. Ver
   `docs/decisions/0002-licenca-mpl.md`.
-- **O sistema de teclas é o nas-keys** (https://github.com/2gab/nas-keys,
-  arquivos `nas.el`/`nas-state.el`/`nas-map.el`/`nas-layout.el`). O
-  repositório do nas-keys é a fonte da verdade — ele continua mudando, e
-  diverge do que está documentado aqui. Antes de tocar em `nas-keys` (crate),
-  clone e leia a versão atual do nas-keys. Atalhos, estados, prefixos e
-  despachos vivem como **dados declarativos** (ex.:
-  `crates/nas-keys/keymap/default.toml`), nunca espalhados pelo código Rust.
-  Ver `docs/decisions/0003-nas-keys-como-keymap.md`.
+- **A especificação das teclas é `docs/keys.md`**, no próprio nas — a
+  ideia dos radicais e compostos (verbo + objeto, unidades, classes
+  por modificador), as regras, a tabela completa e o que falta. O
+  pacote de Emacs [nas-keys](https://github.com/2gab/nas-keys) deixou
+  de ser a fonte da verdade (ver
+  `docs/decisions/0004-especificacao-de-teclas-no-nas.md`); ele
+  continua existindo e será atualizado a partir de `docs/keys.md`,
+  não o contrário. Antes de tocar em `nas-keys` (crate), leia
+  `docs/keys.md`. Atalhos, estados, prefixos, verbos, unidades e
+  objetos vivem como **dados declarativos** (ex.:
+  `crates/nas-keys/keymap/default.toml`), nunca espalhados pelo
+  código Rust — a lógica em `machine.rs` só pode ser genérica (válida
+  pra qualquer verbo/unidade/prefixo), nunca uma tecla específica
+  hardcoded. Ver `docs/decisions/0003-nas-keys-como-keymap.md` e
+  `0004-especificacao-de-teclas-no-nas.md`.
 
 ## Estrutura do workspace
 
