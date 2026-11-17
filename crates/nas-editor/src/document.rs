@@ -59,6 +59,28 @@ pub struct Position {
     pub column: usize,
 }
 
+/// O objeto de um verbo (ver `nas_keys::Object`, docs/keys.md §4.3):
+/// a região sobre a qual um verbo age, relativa ao cursor atual. Este
+/// é o tipo equivalente do lado do documento — `nas-keys` não conhece
+/// `Document`, então quem chama (`nas-term`) traduz de um pro outro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionObject {
+    CharLeft,
+    CharRight,
+    LineStart,
+    LineEnd,
+    LineDown,
+    LineUp,
+    BufferEnd,
+    BufferStart,
+    WordBackward,
+    WordForward,
+    ParagraphForward,
+    ParagraphBackward,
+    CurrentLine,
+    WholeBuffer,
+}
+
 /// Um buffer de texto editável, com desfazer.
 pub struct Document {
     rope: Rope,
@@ -331,53 +353,92 @@ impl Document {
         self.cursor = self.adjacent_paragraph_boundary(false);
     }
 
-    /// Apaga da posição do cursor até o fim da linha — como `kill-line`.
-    /// Se o cursor já estiver no fim da linha, apaga o terminador de
-    /// linha, juntando com a próxima (igual ao `kill-line` real nesse
-    /// caso). Devolve o texto apagado, para quem chama copiar.
-    pub fn delete_to_line_end(&mut self) -> String {
-        let line = self.rope.char_to_line(self.cursor);
-        let line_end = line_ending::line_end_char_index(&self.rope.slice(..), line);
-        let end = if self.cursor < line_end {
-            line_end
-        } else {
-            graphemes::next_grapheme_boundary(self.rope.slice(..), self.cursor)
-        };
-        self.take_range(self.cursor, end)
-    }
-
-    /// Apaga do início da linha até o cursor — como `kill-line` com
-    /// argumento 0. Devolve o texto apagado.
-    pub fn delete_to_line_start(&mut self) -> String {
-        let start = self.rope.line_to_char(self.rope.char_to_line(self.cursor));
-        let text = self.take_range(start, self.cursor);
-        self.cursor = start;
-        text
-    }
-
-    /// Apaga da posição do cursor até o próximo limite de palavra —
-    /// como `kill-word`. Devolve o texto apagado.
-    pub fn delete_word_forward(&mut self) -> String {
-        let end = self.next_word_boundary(self.cursor);
-        self.take_range(self.cursor, end)
-    }
-
-    /// Apaga o documento inteiro — como `erase-buffer`. Ao contrário dos
-    /// `delete_*`/`kill_*` acima, não devolve o texto: `erase-buffer` no
-    /// Emacs não copia pra área de transferência, é só uma limpeza.
-    pub fn clear(&mut self) {
-        let len = self.rope.len_chars();
-        if len == 0 {
-            return;
+    /// A região (início, fim — início ≤ fim, em caracteres) que `object`
+    /// descreve a partir do cursor atual — docs/keys.md §4.3. Pura: não
+    /// move o cursor nem altera o documento, então serve tanto pra
+    /// apagar/recortar (via [`Document::delete_region`]) quanto pra
+    /// copiar (via [`Document::text_in`], sem apagar nada).
+    pub fn region_for(&self, object: RegionObject) -> (usize, usize) {
+        match object {
+            RegionObject::CharLeft => (
+                graphemes::prev_grapheme_boundary(self.rope.slice(..), self.cursor),
+                self.cursor,
+            ),
+            RegionObject::CharRight => (
+                self.cursor,
+                graphemes::next_grapheme_boundary(self.rope.slice(..), self.cursor),
+            ),
+            RegionObject::LineStart => (self.rope.line_to_char(self.current_line()), self.cursor),
+            RegionObject::LineEnd => (
+                self.cursor,
+                line_ending::line_end_char_index(&self.rope.slice(..), self.current_line()),
+            ),
+            RegionObject::WordBackward => (self.prev_word_boundary(self.cursor), self.cursor),
+            RegionObject::WordForward => (self.cursor, self.next_word_boundary(self.cursor)),
+            RegionObject::LineDown => {
+                self.line_region(self.current_line(), self.current_line() + 1)
+            }
+            RegionObject::LineUp => {
+                self.line_region(self.current_line().saturating_sub(1), self.current_line())
+            }
+            RegionObject::BufferEnd => {
+                self.line_region(self.current_line(), self.rope.len_lines() - 1)
+            }
+            RegionObject::BufferStart => self.line_region(0, self.current_line()),
+            RegionObject::ParagraphForward => {
+                let target = self
+                    .rope
+                    .char_to_line(self.adjacent_paragraph_boundary(true));
+                self.line_region(self.current_line(), target)
+            }
+            RegionObject::ParagraphBackward => {
+                let target = self
+                    .rope
+                    .char_to_line(self.adjacent_paragraph_boundary(false));
+                self.line_region(target, self.current_line())
+            }
+            RegionObject::CurrentLine => self.line_region(self.current_line(), self.current_line()),
+            RegionObject::WholeBuffer => (0, self.rope.len_chars()),
         }
-        self.delete_range(0, len);
-        self.cursor = 0;
     }
 
-    fn take_range(&mut self, from: usize, to: usize) -> String {
+    /// O texto entre `from` e `to` (em caracteres), sem alterar o
+    /// documento nem o cursor — para copiar uma região.
+    pub fn text_in(&self, from: usize, to: usize) -> String {
+        self.rope.slice(from..to).to_string()
+    }
+
+    /// Apaga o texto entre `from` e `to` (em caracteres) e devolve o
+    /// que foi apagado, para quem chama copiar pra área de
+    /// transferência — para apagar ou recortar uma região. O cursor
+    /// vai para `from`.
+    pub fn delete_region(&mut self, from: usize, to: usize) -> String {
         let text = self.rope.slice(from..to).to_string();
         self.delete_range(from, to);
+        self.cursor = from;
         text
+    }
+
+    fn current_line(&self) -> usize {
+        self.rope.char_to_line(self.cursor)
+    }
+
+    /// Linhas inteiras de `line_a` até `line_b` (em qualquer ordem),
+    /// inclusive, com a quebra de linha de cada uma — exceto a última,
+    /// se for a última linha do documento (sem quebra final).
+    fn line_region(&self, line_a: usize, line_b: usize) -> (usize, usize) {
+        let (lo, hi) = if line_a <= line_b {
+            (line_a, line_b)
+        } else {
+            (line_b, line_a)
+        };
+        let start = self.rope.line_to_char(lo);
+        let end = if hi + 1 < self.rope.len_lines() {
+            self.rope.line_to_char(hi + 1)
+        } else {
+            self.rope.len_chars()
+        };
+        (start, end)
     }
 
     fn next_word_boundary(&self, from: usize) -> usize {
@@ -916,48 +977,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_word_forward_apaga_a_palavra_e_devolve_o_texto() {
-        let mut doc = Document::empty();
-        for ch in "ola mundo".chars() {
-            doc.insert_char(ch);
-        }
-        doc.move_to_buffer_start();
-        let removed = doc.delete_word_forward();
-        assert_eq!(removed, "ola");
-        assert_eq!(doc_text(&doc), " mundo");
-    }
-
-    #[test]
-    fn delete_to_line_end_apaga_ate_o_fim_e_junta_linhas_se_ja_estiver_no_fim() {
-        let mut doc = Document::empty();
-        for ch in "ola mundo\ndois".chars() {
-            doc.insert_char(ch);
-        }
-        doc.set_cursor(4); // depois de "ola "
-        let removed = doc.delete_to_line_end();
-        assert_eq!(removed, "mundo");
-        assert_eq!(doc_text(&doc), "ola \ndois");
-
-        // já no fim da linha: apaga o terminador, junta com a próxima
-        let removed = doc.delete_to_line_end();
-        assert_eq!(removed, "\n");
-        assert_eq!(doc_text(&doc), "ola dois");
-    }
-
-    #[test]
-    fn delete_to_line_start_apaga_do_inicio_da_linha_ate_o_cursor() {
-        let mut doc = Document::empty();
-        for ch in "ola mundo".chars() {
-            doc.insert_char(ch);
-        }
-        doc.set_cursor(4);
-        let removed = doc.delete_to_line_start();
-        assert_eq!(removed, "ola ");
-        assert_eq!(doc_text(&doc), "mundo");
-        assert_eq!(doc.cursor_offset(), 0);
-    }
-
-    #[test]
     fn move_paragraph_forward_e_backward() {
         let mut doc = Document::empty();
         for ch in "um\n\ndois\ntres\n\nquatro".chars() {
@@ -976,12 +995,96 @@ mod tests {
     }
 
     #[test]
-    fn clear_apaga_o_documento_inteiro_sem_devolver_texto() {
+    fn region_for_movimentos_horizontais() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo, tudo bem?".chars() {
+            doc.insert_char(ch);
+        }
+        doc.set_cursor(4); // início de "mundo"
+
+        assert_eq!(doc.region_for(RegionObject::CharLeft), (3, 4));
+        assert_eq!(doc.region_for(RegionObject::CharRight), (4, 5));
+        assert_eq!(doc.region_for(RegionObject::LineStart), (0, 4));
+        assert_eq!(doc.region_for(RegionObject::LineEnd), (4, 20));
+        assert_eq!(doc.region_for(RegionObject::WordBackward), (0, 4));
+        assert_eq!(doc.region_for(RegionObject::WordForward), (4, 9));
+    }
+
+    #[test]
+    fn region_for_movimentos_verticais() {
+        let mut doc = Document::empty();
+        for ch in "um\ndois\ntres\nquatro".chars() {
+            doc.insert_char(ch);
+        }
+        doc.goto_line(2); // "dois"
+
+        assert_eq!(doc.region_for(RegionObject::LineDown), (3, 13)); // "dois\ntres\n"
+        assert_eq!(doc.region_for(RegionObject::LineUp), (0, 8)); // "um\ndois\n"
+        assert_eq!(doc.region_for(RegionObject::BufferEnd), (3, 19)); // "dois\ntres\nquatro"
+        assert_eq!(doc.region_for(RegionObject::BufferStart), (0, 8)); // "um\ndois\n"
+        assert_eq!(doc.region_for(RegionObject::CurrentLine), (3, 8)); // "dois\n"
+    }
+
+    #[test]
+    fn region_for_paragrafos() {
+        let mut doc = Document::empty();
+        for ch in "um\n\ndois\ntres\n\nquatro".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+
+        // do início de "um" até o início de "dois" (a linha em branco
+        // entre eles também entra, inclusive)
+        assert_eq!(doc.region_for(RegionObject::ParagraphForward), (0, 9));
+
+        doc.goto_line(4); // "tres"
+        // de "tres" (linha 3) de volta até o início de "dois" (linha 2)
+        assert_eq!(doc.region_for(RegionObject::ParagraphBackward), (4, 14));
+    }
+
+    #[test]
+    fn region_for_whole_buffer() {
         let mut doc = Document::empty();
         for ch in "ola mundo".chars() {
             doc.insert_char(ch);
         }
-        doc.clear();
+        assert_eq!(doc.region_for(RegionObject::WholeBuffer), (0, 9));
+    }
+
+    #[test]
+    fn text_in_nao_apaga_nem_move_o_cursor() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        assert_eq!(doc.text_in(0, 3), "ola");
+        assert_eq!(doc_text(&doc), "ola mundo");
+        assert_eq!(doc.cursor_offset(), 0);
+    }
+
+    #[test]
+    fn delete_region_apaga_e_devolve_o_texto_com_cursor_no_inicio() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        let removed = doc.delete_region(4, 9);
+        assert_eq!(removed, "mundo");
+        assert_eq!(doc_text(&doc), "ola ");
+        assert_eq!(doc.cursor_offset(), 4);
+    }
+
+    #[test]
+    fn delete_region_do_arquivo_inteiro() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        let (from, to) = doc.region_for(RegionObject::WholeBuffer);
+        let removed = doc.delete_region(from, to);
+        assert_eq!(removed, "ola mundo");
         assert_eq!(doc_text(&doc), "");
         assert_eq!(doc.cursor_offset(), 0);
     }
