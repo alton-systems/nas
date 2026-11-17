@@ -36,8 +36,8 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
 
 - **Radical**: uma tecla com um significado fixo (ex.: `;` = direita).
 - **Classe**: o que o modificador (ou a ausência dele) indica sobre
-  *onde* o radical age — texto, intensidade, espaço (janelas) ou
-  sistema (o editor como programa). Ver §3.
+  *onde* o radical age — texto, intensidade, alternância (entre duas
+  coisas) ou sistema (o editor como programa). Ver §3.
 - **Verbo**: uma tecla que inicia uma ação sobre uma região de texto
   (`d` apagar, `c` copiar, `x` recortar). Espera um **objeto**, a
   menos que já exista uma seleção ativa.
@@ -64,7 +64,17 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
    baixo" sozinho, depois de um verbo, e em qualquer prefixo.
 2. **O modificador define a classe.** A mesma tecla em outra classe
    mantém a ideia (a direção, por exemplo) e muda o "mundo" onde ela
-   age: texto, janelas ou sistema.
+   age: texto, alternância ou sistema.
+
+   `Espaço` é o radical de **comando**: falar com o editor, em vez de
+   escrever texto nele. Sozinho, abre o líder — um comando (`Espaço f`
+   busca, por exemplo). Dobrado (`Espaço Espaço`), entra no
+   Sequential — uma frase inteira de comandos. Com Alt (`Alt+Espaço`),
+   alterna entre escrever texto e dar comandos (Insert ↔ Visual) — o
+   exemplo central da classe alternar (§4). `Espaço t` fica reservado
+   para falar com a IA (a "tia"); `Shift+Espaço`, para uma futura
+   paleta de comandos — essa combinação depende do protocolo de
+   teclado do Kitty pra distinguir de um `Espaço` comum (ver §6/§7).
 3. **Shift intensifica.** Leva o significado ao extremo — tanto a
    *distância* de uma direção (`j` → `J`: um caractere → o início da
    linha) quanto o *tamanho* de uma unidade (`w` → `W`: palavra →
@@ -90,14 +100,14 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
 |---|---|---|---|
 | Texto | tecla sem modificador | mover e editar o texto | Visual |
 | Intensidade | Shift | o mesmo significado, no extremo | Visual |
-| Espaço | Alt | janelas e painéis | todos |
+| Alternar | Alt | trocar entre duas coisas — texto e comando (`Alt+Espaço`), ou janelas (`Alt+direção`, reservado) | todos |
 | Sistema | Ctrl | o editor como programa: arquivos, buffers, sessão | todos |
 | Ir para | prefixo `g` | saltar para um destino | Visual |
 | Líder | prefixo `Espaço` | comandos de alto nível sobre o texto | Visual |
 
 Para decidir onde uma ação nova entra: mexe no **texto**, sem
-modificador; mexe na **organização da tela**, Alt; mexe no **editor
-como programa**, Ctrl; é um **comando de alto nível**, líder.
+modificador; **alterna** entre duas coisas, Alt; mexe no **editor como
+programa**, Ctrl; é um **comando de alto nível**, líder.
 
 ## 5. A especificação completa das teclas
 
@@ -161,7 +171,9 @@ tecla inválida, um verbo pendente persiste até um objeto válido ou
 espera de `j`/`;`): ainda estamos resolvendo o objeto do verbo. Uma
 unidade **sozinha** (sem verbo, §5.1) cancela numa direção inválida,
 como um prefixo — não há verbo em jogo. `Esc` cancela qualquer verbo,
-prefixo ou unidade pendente, em qualquer um dos dois casos.
+prefixo ou unidade pendente, em qualquer um dos dois casos. Sem nada
+pendente, `Esc` desfaz uma seleção ativa, sem apagar nada; sem
+pendente nem seleção, não faz nada — um cancelamento de cada vez.
 
 Os objetos horizontal e vertical não são declarados numa tabela
 separada — são **derivados** das próprias ações de movimento já
@@ -176,7 +188,7 @@ dois lugares.
 | Tecla | Efeito |
 |---|---|
 | `Enter` (Visual) | entra no Insert |
-| `Alt+Espaço` | alterna entre Insert e Visual. É uma **exceção conhecida** à classe Alt, mantida porque alternar o estado é a ação mais frequente e precisa ser acessível com uma tecla em qualquer estado |
+| `Alt+Espaço` | alterna entre Insert e Visual — o exemplo central da classe alternar (§4), acessível em qualquer estado |
 | `Espaço Espaço` | entra no Sequential |
 | `Enter` / `Esc` / `Backspace` (Sequential) | executa a frase / cancela / apaga a última tecla |
 
@@ -224,14 +236,20 @@ Não use combinações de Ctrl que cheguem iguais a outras teclas no
 terminal: `Ctrl+i` (Tab), `Ctrl+m` e `Ctrl+j` (Enter), `Ctrl+[` (Esc),
 `Ctrl+h` (Backspace em alguns terminais).
 
-### 5.8 Classe espaço (Alt, em todos os estados)
+### 5.8 Classe alternar (Alt, em todos os estados)
+
+Alt é a classe de **alternar entre duas coisas** — não só janelas.
+`Alt+Espaço` (§5.4) é o exemplo central: alterna entre escrever texto
+e dar comandos. `Alt+direção` fica reservado pra alternar entre
+janelas, a mesma ideia aplicada à tela:
 
 | Atalho | Ação |
 |---|---|
-| `Alt+j` / `Alt+;` / `Alt+k` / `Alt+l` | ir para a janela à esquerda / direita / abaixo / acima |
+| `Alt+Espaço` | alterna entre Insert e Visual (texto ↔ comando) |
+| `Alt+j` / `Alt+;` / `Alt+k` / `Alt+l` | ir para a janela à esquerda / direita / abaixo / acima (reservado) |
 
-O nas ainda não tem janelas: nele, essa classe fica só documentada —
-ver §7.
+O nas ainda não tem janelas: `Alt+direção` fica só documentado — ver
+§7. Ver também §10 (decisão em aberto sobre `Ctrl+b`).
 
 ## 6. Teclas reservadas (não implementadas)
 
@@ -245,6 +263,8 @@ ver §7.
 | `g f` | ir para a definição de uma função (LSP) |
 | `Espaço r` | substituir (query-replace) |
 | `Espaço h` | ajuda |
+| `Espaço t` | falar com a IA (a "tia") |
+| `Shift+Espaço` | futura paleta de comandos (depende do protocolo de teclado do Kitty) |
 | `Alt+j`/`;`/`k`/`l` | gerência de janelas |
 
 ## 7. O que não está implementado, e por quê
@@ -257,9 +277,15 @@ ver §7.
   catálogo de comandos navegável no nas-term. As dicas de verbo/
   prefixo/unidade (regra 8) já cobrem boa parte da necessidade
   imediata.
-- **Gerência de janelas (classe Espaço/Alt):** `nas-term` não tem
-  múltiplos painéis — só um buffer visível por vez (trocar de buffer
-  não divide a tela).
+- **Gerência de janelas (classe alternar, `Alt+direção`):** `nas-term`
+  não tem múltiplos painéis — só um buffer visível por vez (trocar de
+  buffer não divide a tela).
+- **`Espaço t` (falar com a IA) e `Shift+Espaço` (paleta de
+  comandos):** não há IA integrada neste marco (ver README, Marco 4);
+  a paleta de comandos, além de não ter interface ainda, depende de
+  diferenciar `Shift+Espaço` de `Espaço`, o que só o protocolo de
+  teclado do Kitty permite (`supports_keyboard_enhancement`, já usado
+  em `nas-term` para outra coisa).
 - **`g c` / `g f`:** `g c` (posição em caracteres) não tem um caso de
   uso claro ainda; `g f` depende de um cliente LSP, que não existe
   neste marco.
@@ -276,9 +302,9 @@ ver §7.
   alterou o texto) vem de lá também.
 - **Emacs:** comandos com nome e docstring (regra 7), prefixos de duas
   teclas (`C-x` no Emacs real; `g`/Espaço aqui) e `C-g` como cancelar
-  universal — nosso `Esc` cancela verbo, prefixo ou unidade do mesmo
-  jeito. `kill-line`/`kill-ring` também inspiram "apagar copia pra
-  área de transferência".
+  universal — nosso `Esc` cancela verbo, prefixo, unidade ou (sem nada
+  pendente) uma seleção ativa, do mesmo jeito. `kill-line`/`kill-ring`
+  também inspiram "apagar copia pra área de transferência".
 - **VS Code:** a paleta de comandos (todo comando é descobrível por
   nome, não só por atalho) e atalhos que mudam de significado por
   contexto — aqui, o contexto é o estado (Visual/Insert/Sequential) e
@@ -310,3 +336,15 @@ ver §7.
    método do `Document`, por exemplo), ela só deveria mexer em
    `crates/nas-term/src/app.rs` — nunca direto em `nas-keys` nem em
    `nas-editor`, que não se conhecem.
+
+## 10. Decisões em aberto
+
+- **`Ctrl+b` (trocar de buffer) talvez pertença à classe alternar, não
+  à classe sistema.** Trocar de buffer é "alternar entre duas coisas"
+  — a mesma ideia central da classe Alt agora (§4). Hoje `b` vive em
+  `[system]` porque trocar de buffer é o editor "como programa"; mas
+  pela nova definição de Alt, a tecla poderia ser `Alt+b`, por
+  exemplo. Não decidido: mudar isso tiraria `b` de `[system]`, exigiria
+  escolher uma combinação Alt livre (as direções já são de janela) e
+  provavelmente quebraria o hábito de quem já usa `Ctrl+b`. Ver §9
+  antes de mexer nisso.
