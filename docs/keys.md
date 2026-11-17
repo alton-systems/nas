@@ -46,7 +46,8 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
   ou "o arquivo inteiro". Ver §4.3.
 - **Unidade**: uma tecla que, sozinha, espera uma direção para
   completar um movimento maior que um caractere ou uma linha — `w`
-  (palavra) e `p` (parágrafo). Funciona tanto sozinha (movimento puro)
+  (palavra) e `W`, Shift+`w` (parágrafo, a mesma unidade intensificada
+  pela regra 3). Funciona tanto sozinha (movimento puro)
   quanto depois de um verbo (formando um objeto composto, ex. `d w ;`).
 - **Composto**: a sequência completa de teclas até ela resolver numa
   ação — `d ;`, `d w ;`, `g l`, `SPC f` são todos compostos.
@@ -64,7 +65,12 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
 2. **O modificador define a classe.** A mesma tecla em outra classe
    mantém a ideia (a direção, por exemplo) e muda o "mundo" onde ela
    age: texto, janelas ou sistema.
-3. **Shift intensifica.** Leva o significado ao extremo.
+3. **Shift intensifica.** Leva o significado ao extremo — tanto a
+   *distância* de uma direção (`j` → `J`: um caractere → o início da
+   linha) quanto o *tamanho* de uma unidade (`w` → `W`: palavra →
+   parágrafo). As duas seguem a mesma escala, cada degrau maior que o
+   anterior: caractere → palavra → parágrafo → extremos (linha/
+   arquivo).
 4. **Verbo + objeto.** Todo verbo aceita os mesmos objetos.
 5. **Seleção primeiro.** Com uma seleção ativa, o verbo age nela na
    hora, sem pedir objeto.
@@ -107,11 +113,14 @@ comportamento é o que `default.toml` implementa.
 | `J` / `:` | início / fim da linha |
 | `K` / `L` | fim / início do arquivo |
 | `w j` / `w ;` | palavra anterior / próxima palavra |
-| `p k` / `p l` | próximo parágrafo / parágrafo anterior |
+| `W k` / `W l` | próximo parágrafo / parágrafo anterior |
 
-`w` e `p` são radicais de unidade: sozinhos, não fazem nada e esperam
-uma direção. Uma direção sem sentido para a unidade (ex.: `w k`) não
-faz nada — a unidade é cancelada, como um prefixo.
+`w` é um radical de unidade: sozinho, não faz nada e espera uma
+direção. `W` (Shift+`w`) é a mesma unidade, intensificada pela regra 3
+— parágrafo em vez de palavra, a próxima escala. Uma direção sem
+sentido para a unidade (ex.: `w k`) não faz nada — a unidade é
+cancelada, como um prefixo. `p` sozinho (sem Shift) é reservado e não
+faz nada — ver §6.
 
 ### 5.2 Verbos e ações (estado Visual)
 
@@ -140,7 +149,7 @@ de transferência, a de `x` fala ("recorta").
 | Objeto | Região |
 |---|---|
 | qualquer movimento **horizontal** (`j`, `;`, `J`, `:`, `w j`, `w ;`) | do cursor até o destino do movimento, por caractere. Pra frente, o caractere de destino **não** entra: `d ;` apaga exatamente um caractere; `d w ;` apaga até o início da próxima palavra; `d :` apaga até o fim da linha, sem a quebra de linha |
-| qualquer movimento **vertical** (`k`, `l`, `K`, `L`, `p k`, `p l`) | por linha: linhas inteiras, da linha do cursor até a linha de destino, inclusive. `d k` apaga a linha atual e a de baixo; `d K` apaga da linha atual até o fim do arquivo |
+| qualquer movimento **vertical** (`k`, `l`, `K`, `L`, `W k`, `W l`) | por linha: linhas inteiras, da linha do cursor até a linha de destino, inclusive. `d k` apaga a linha atual e a de baixo; `d K` apaga da linha atual até o fim do arquivo |
 | o próprio verbo repetido (`d d`, `c c`, `x x`) | a linha atual inteira, com a quebra de linha |
 | `a` | o arquivo inteiro. `d a` e `x a` pedem confirmação (a mesma combinação repetida confirma) e, como qualquer outro objeto de `d`/`x`, copiam o conteúdo pra área de transferência antes de apagar |
 
@@ -189,8 +198,8 @@ dois lugares.
 | `Espaço h` | ajuda (reservado, não implementado — ver §7) |
 | `Espaço Espaço` | entrar no Sequential |
 
-Os movimentos por palavra e parágrafo **não** ficam no líder — são as
-unidades `w` e `p` (§5.1).
+Os movimentos por palavra e parágrafo **não** ficam no líder — são a
+unidade `w`/`W` (§5.1).
 
 ### 5.7 Classe sistema (Ctrl, em todos os estados)
 
@@ -229,6 +238,7 @@ ver §7.
 | Teclas | Reservadas para |
 |---|---|
 | `i` / `o` | objetos "dentro de" e "em volta de" (como o `i"` e o `a(` do Vim) |
+| `p` | sem uso — a unidade parágrafo é `W` (Shift+`w`), não `p` |
 | números `0`–`9` | contagem antes de um comando (ex.: `3 w ;`) |
 | `m` | prefixo livre para atalhos do próprio usuário, vazio por padrão |
 | `g c` | ir para uma posição em caracteres |
