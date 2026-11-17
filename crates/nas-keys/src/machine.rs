@@ -24,9 +24,9 @@
 //! `SPC r` (substituir) e `SPC h` (ajuda) não têm binding no keymap
 //! padrão — substituir precisa de um fluxo interativo de confirmação
 //! por ocorrência que ainda não existe, e ajuda não tem pra onde
-//! apontar ainda. A gerência de janelas (classe Espaço/Alt) também não
-//! está implementada — `nas-term` não tem painéis múltiplos. Ver
-//! `docs/keys.md` para os detalhes.
+//! apontar ainda. A gerência de janelas (classe alternar,
+//! `Alt+direção`) também não está implementada — `nas-term` não tem
+//! painéis múltiplos. Ver `docs/keys.md` para os detalhes.
 
 use std::collections::HashMap;
 
@@ -186,6 +186,10 @@ pub enum Action {
     /// `d a`, ...) — docs/keys.md §4.2 e §4.3. Quem chama resolve a
     /// região de verdade a partir do objeto e aplica o verbo sobre ela.
     VerbObject(Verb, Object),
+    /// Desfaz a seleção ativa, sem apagar nada — `Esc` sem nenhum
+    /// verbo/prefixo/unidade pendente (docs/keys.md §3, "Esc
+    /// cancela").
+    ClearSelection,
 }
 
 impl Action {
@@ -220,7 +224,8 @@ impl Action {
             | Action::Copy
             | Action::Cut
             | Action::DeleteSelection
-            | Action::VerbObject(_, _) => return None,
+            | Action::VerbObject(_, _)
+            | Action::ClearSelection => return None,
         })
     }
 
@@ -458,10 +463,20 @@ impl Machine {
     /// Backspace, Delete e Tab não são interceptados pelo nas-map.el e
     /// continuam funcionando normalmente.
     fn handle_visual(&mut self, key: Key, has_selection: bool) -> Vec<Action> {
-        // Esc cancela qualquer verbo, prefixo ou unidade pendente —
-        // docs/keys.md §4.7. Não existe ação de Esc fora disso.
-        if matches!(key.code, KeyCode::Escape) && !key.alt && self.pending.is_some() {
-            self.pending = None;
+        // Esc cancela qualquer verbo, prefixo ou unidade pendente; sem
+        // nada pendente, desfaz uma seleção ativa — docs/keys.md §3
+        // (Esc = cancelar). Um cancela de cada vez: se há algo
+        // pendente E uma seleção ativa ao mesmo tempo (ex.: seleção
+        // iniciada antes de um prefixo `g`), o primeiro Esc só cancela
+        // o pendente, um segundo desfaz a seleção.
+        if matches!(key.code, KeyCode::Escape) && !key.alt {
+            if self.pending.is_some() {
+                self.pending = None;
+                return Vec::new();
+            }
+            if has_selection {
+                return vec![Action::ClearSelection];
+            }
             return Vec::new();
         }
 
@@ -1065,6 +1080,45 @@ mod tests {
         assert!(machine.pending_hint().is_some());
         machine.handle_key(Key::escape(), false);
         assert!(machine.pending_hint().is_none());
+    }
+
+    #[test]
+    fn esc_desfaz_a_selecao_ativa_quando_nao_ha_nada_pendente() {
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine.handle_key(Key::escape(), true),
+            vec![Action::ClearSelection]
+        );
+    }
+
+    #[test]
+    fn esc_sem_pendente_nem_selecao_nao_faz_nada() {
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine.handle_key(Key::escape(), false),
+            Vec::<Action>::new()
+        );
+    }
+
+    #[test]
+    fn esc_cancela_o_pendente_antes_de_desfazer_a_selecao() {
+        // Com um prefixo pendente E uma seleção ativa ao mesmo tempo
+        // (ex.: seleção marcada antes de "g"), o primeiro Esc só
+        // cancela o prefixo — a seleção precisa de outro Esc.
+        let mut machine = Machine::new();
+        run(&mut machine, "g");
+        assert!(machine.pending_hint().is_some());
+
+        assert_eq!(
+            machine.handle_key(Key::escape(), true),
+            Vec::<Action>::new()
+        );
+        assert!(machine.pending_hint().is_none());
+
+        assert_eq!(
+            machine.handle_key(Key::escape(), true),
+            vec![Action::ClearSelection]
+        );
     }
 
     #[test]
