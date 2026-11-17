@@ -1,6 +1,6 @@
 # nas
 
-Um editor de texto para o terminal em que a IA é um usuário de primeira classe: ela entende, usa e reescreve o próprio editor, e cada mudança dela é tipada, permitida e reversível. Nos outros editores a IA edita arquivos; no nas ela edita o editor, com contrato, permissão e desfazer. O sistema de teclas é o [nas-keys](https://github.com/2gab/nas-keys).
+Um editor de texto para o terminal em que a IA é um usuário de primeira classe: ela entende, usa e reescreve o próprio editor, e cada mudança dela é tipada, permitida e reversível. Nos outros editores a IA edita arquivos; no nas ela edita o editor, com contrato, permissão e desfazer. As teclas seguem um sistema próprio de radicais e compostos, inspirado no [nas-keys](https://github.com/2gab/nas-keys) — ver [`docs/keys.md`](docs/keys.md).
 
 ## Os quatro pilares
 
@@ -48,11 +48,22 @@ Durante o desenvolvimento, sem instalar:
 cargo run -p nas-term -- caminho/do/arquivo.txt
 ```
 
-Os atalhos seguem o [nas-keys](https://github.com/2gab/nas-keys) — ver
-`crates/nas-keys/keymap/default.toml` para a lista completa. São
-declarados por posição física num teclado US qwerty; se o seu teclado
-for outro layout, defina `NAS_KEYBOARD_LAYOUT` antes de rodar o nas para
-que as teclas continuem na posição certa:
+As teclas seguem um sistema de radicais e compostos — cada tecla tem
+um significado fixo, e combiná-las forma comandos (ex.: `d` apagar +
+`;` direita = apagar um caractere). A especificação completa está em
+[`docs/keys.md`](docs/keys.md); por classe, resumindo:
+
+| Classe | Como se aciona | Exemplos |
+|---|---|---|
+| Texto | tecla sem modificador | `j`/`k`/`l`/`;` movem; `d`/`c`/`x` apagam/copiam/recortam um objeto |
+| Intensidade | Shift | `J`/`K`/`L`/`:` vão aos extremos (início/fim da linha ou do arquivo) |
+| Ir para | prefixo `g` | `g g` início do arquivo, `g l` ir para uma linha |
+| Líder | prefixo `Espaço` | `Espaço f` buscar, `Espaço Espaço` modo sequencial |
+| Sistema | Ctrl | `Ctrl+s` salvar, `Ctrl+o` abrir, `Ctrl+b` trocar de buffer, `Ctrl+q` sair |
+
+As teclas são declaradas por posição física num teclado US qwerty; se
+o seu teclado for outro layout, defina `NAS_KEYBOARD_LAYOUT` antes de
+rodar o nas para que as teclas continuem na posição certa:
 
 ```sh
 export NAS_KEYBOARD_LAYOUT=qwerty-abnt  # ABNT2 — onde o qwerty tem ';', o ABNT2 tem 'ç'
