@@ -1,26 +1,37 @@
-# Atalhos do nas, espelhando nas-map.el (https://github.com/2gab/nas-keys).
+# Atalhos do nas. A partir do redesenho "teclas como ideogramas", a
+# especificação vive em docs/keys.md — este arquivo é a implementação
+# dela em dados, não o contrário. Veja lá a ideia central (radicais e
+# compostos), as regras, as classes e a tabela completa de teclas.
 #
 # Teclas são escritas por posição física no teclado US qwerty,
 # independente do layout físico real do usuário — ver
-# crates/nas-keys/src/layout.rs (e nas-layout.el no nas-keys).
+# crates/nas-keys/src/layout.rs.
 #
 # Formato de uma tecla: um caractere ("j", ";", "g"), ou um destes
 # nomes: SPC, RET, ESC, DEL, TAB, <left>, <right>, <up>, <down>; com o
 # prefixo "M-" para Alt (ex.: "M-SPC").
 #
-# Valor de uma tecla:
-#   - uma string: o nome de uma ação, ou "enter-insert" / "enter-visual"
-#     / "enter-sequential";
+# Valor de uma tecla, em [insert]/[visual]/[prefixes.*]:
+#   - uma string: o nome de uma ação (ver [commands]), ou
+#     "enter-insert" / "enter-visual" / "enter-sequential" / "repeat";
 #   - { prefix = "NOME" }: entra no prefixo NOME, que espera mais uma
 #     tecla — ver a tabela [prefixes.NOME];
-#   - { dispatch = "NOME" }: entra no despacho NOME, que também espera
-#     mais uma tecla, mas com uma ação de "fallback" se a tecla não for
-#     uma das suas — ver a tabela [dispatches.NOME].
+#   - { verb = "delete" | "copy" | "cut" }: entra no verbo, que espera
+#     um objeto (ver [objects.*] abaixo) — docs/keys.md §4.2 e §4.3;
+#   - { unit = "word" | "paragraph" }: entra na unidade, que espera uma
+#     direção — ver [objects.word]/[objects.paragraph] e docs/keys.md §4.1.
 #
-# Escopo desta etapa (marco 1, etapa 5c): todo o nas-map.el tem ação
-# aqui, exceto busca-e-substituição (SPC r, query-replace) — precisa de
-# um fluxo interativo de confirmação por ocorrência que ainda não
-# existe — e gerência de janelas (nas-term não tem múltiplos painéis).
+# [objects.horizontal] e [objects.vertical] são os objetos que um verbo
+# aceita diretamente (movimento por caractere e por linha,
+# respectivamente); [objects.word] e [objects.paragraph] são também
+# usados tanto por uma unidade sozinha (movimento puro) quanto por um
+# verbo seguido da unidade (ex.: "d w ;"); [objects.whole] é o arquivo
+# inteiro (tecla "a"). O objeto "linha atual" (verbo repetido, ex.
+# "d d") não é dado — é a própria gramática do verbo, em machine.rs.
+#
+# [commands] dá uma descrição curta pra cada nome de ação/verbo/unidade/
+# prefixo/objeto, usada pelas dicas que o nas-term mostra na barra de
+# status enquanto um verbo, prefixo ou unidade está pendente.
 
 [insert]
 "M-SPC" = "enter-visual"
@@ -35,7 +46,7 @@ k = "move-down"
 l = "move-up"
 ";" = "move-right"
 
-# Navegação — extremos (Shift = máxima potência)
+# Navegação — extremos (Shift = intensidade máxima)
 J = "move-line-start"
 ":" = "move-line-end"
 L = "move-buffer-start"
@@ -44,44 +55,102 @@ K = "move-buffer-end"
 # Desfazer
 u = "undo"
 
-# Abrir arquivo
-o = "prompt-open-file"
-
 # Seleção e área de transferência
 s = "start-selection"
 S = "select-all"
-c = "copy"
-x = "cut"
 y = "paste"
 
-# Trocar de buffer
-b = "prompt-switch-buffer"
+# Verbos (esperam um objeto — ver [objects.*]) e unidades (esperam uma
+# direção — ver [objects.word]/[objects.paragraph])
+d = { verb = "delete" }
+c = { verb = "copy" }
+x = { verb = "cut" }
+w = { unit = "word" }
+p = { unit = "paragraph" }
 
-# Prefixos e despacho
+# Repetir o último composto que alterou o texto
+"." = "repeat"
+
+# Prefixos
 g = { prefix = "go" }
 SPC = { prefix = "leader" }
-d = { dispatch = "delete" }
 
 [prefixes.go]
 g = "move-buffer-start"
 l = "prompt-goto-line"
+# "c" (ir para uma posição em caracteres) e "f" (ir para a definição de
+# uma função, via LSP) ficam reservados — ver docs/keys.md §4.9.
 
 [prefixes.leader]
 SPC = "enter-sequential"
 f = "prompt-search"
-j = "move-word-backward"
-";" = "move-word-forward"
-k = "move-paragraph-forward"
-l = "move-paragraph-backward"
-# "r" (query-replace) fica de fora — precisa de um fluxo interativo de
-# confirmação por ocorrência que ainda não existe.
+# "r" (substituir) e "h" (ajuda) ficam de fora por ora: substituir
+# precisa de um fluxo interativo de confirmação por ocorrência que
+# ainda não existe, e ajuda não tem pra onde apontar ainda — ver
+# docs/keys.md §5 (o que não implementamos).
 
-[dispatches.delete]
-fallback = "delete-forward"
-d = "delete-forward"
-";" = "delete-forward"
-j = "delete-backward"
-k = "delete-to-line-end"
-l = "delete-to-line-start"
-w = "delete-word-forward"
-a = "erase-buffer"
+[objects.horizontal]
+j = "char-left"
+";" = "char-right"
+J = "line-start"
+":" = "line-end"
+
+[objects.vertical]
+k = "line-down"
+l = "line-up"
+K = "buffer-end"
+L = "buffer-start"
+
+[objects.word]
+j = "word-backward"
+";" = "word-forward"
+
+[objects.paragraph]
+k = "paragraph-forward"
+l = "paragraph-backward"
+
+[objects.whole]
+a = "whole-buffer"
+
+[commands]
+move-left = "caractere anterior"
+move-right = "próximo caractere"
+move-down = "linha abaixo"
+move-up = "linha acima"
+move-line-start = "início da linha"
+move-line-end = "fim da linha"
+move-buffer-start = "início do arquivo"
+move-buffer-end = "fim do arquivo"
+move-word-backward = "palavra anterior"
+move-word-forward = "próxima palavra"
+move-paragraph-forward = "próximo parágrafo"
+move-paragraph-backward = "parágrafo anterior"
+undo = "desfazer"
+start-selection = "marcar seleção"
+select-all = "selecionar tudo"
+paste = "colar"
+repeat = "repetir o último comando que alterou o texto"
+prompt-search = "buscar"
+prompt-goto-line = "ir para uma linha"
+enter-sequential = "modo sequencial"
+delete = "apagar"
+copy = "copiar"
+cut = "recortar"
+word = "palavra"
+paragraph = "parágrafo"
+go = "ir para"
+leader = "líder"
+char-left = "até aqui, pra trás"
+char-right = "até aqui"
+line-start = "até o início da linha"
+line-end = "até o fim da linha"
+line-down = "a linha atual e a de baixo"
+line-up = "a linha atual e a de cima"
+buffer-end = "até o fim do arquivo"
+buffer-start = "até o início do arquivo"
+word-backward = "até a palavra anterior"
+word-forward = "até a próxima palavra"
+paragraph-forward = "até o próximo parágrafo"
+paragraph-backward = "até o parágrafo anterior"
+current-line = "a linha atual"
+whole-buffer = "o arquivo inteiro"
