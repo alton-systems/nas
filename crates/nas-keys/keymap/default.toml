@@ -21,17 +21,24 @@
 #   - { unit = "word" | "paragraph" }: entra na unidade, que espera uma
 #     direção — ver [objects.word]/[objects.paragraph] e docs/keys.md §4.1.
 #
-# [objects.horizontal] e [objects.vertical] são os objetos que um verbo
-# aceita diretamente (movimento por caractere e por linha,
-# respectivamente); [objects.word] e [objects.paragraph] são também
-# usados tanto por uma unidade sozinha (movimento puro) quanto por um
-# verbo seguido da unidade (ex.: "d w ;"); [objects.whole] é o arquivo
-# inteiro (tecla "a"). O objeto "linha atual" (verbo repetido, ex.
-# "d d") não é dado — é a própria gramática do verbo, em machine.rs.
+# Os objetos horizontais e verticais que um verbo aceita (movimento por
+# caractere e por linha) não são declarados aqui — são derivados direto
+# das ações de movimento já ligadas em [visual] (cada ação sabe se é
+# horizontal ou vertical, em machine.rs). Mudar a tecla de um movimento
+# acima muda o objeto correspondente automaticamente. [objects.word] e
+# [objects.paragraph] são também usados tanto por uma unidade sozinha
+# (movimento puro) quanto por um verbo seguido da unidade (ex.:
+# "d w ;"); [objects.whole] é o arquivo inteiro (tecla "a"). O objeto
+# "linha atual" (verbo repetido, ex. "d d") não é dado — é a própria
+# gramática do verbo, em machine.rs.
+#
+# [system] são os atalhos da classe sistema (Ctrl + tecla), válidos em
+# qualquer estado — nunca interceptados pela máquina modal.
 #
 # [commands] dá uma descrição curta pra cada nome de ação/verbo/unidade/
-# prefixo/objeto, usada pelas dicas que o nas-term mostra na barra de
-# status enquanto um verbo, prefixo ou unidade está pendente.
+# prefixo/objeto/comando de sistema, usada pelas dicas que o nas-term
+# mostra na barra de status enquanto um verbo, prefixo ou unidade está
+# pendente.
 
 [insert]
 "M-SPC" = "enter-visual"
@@ -89,18 +96,6 @@ f = "prompt-search"
 # ainda não existe, e ajuda não tem pra onde apontar ainda — ver
 # docs/keys.md §5 (o que não implementamos).
 
-[objects.horizontal]
-j = "char-left"
-";" = "char-right"
-J = "line-start"
-":" = "line-end"
-
-[objects.vertical]
-k = "line-down"
-l = "line-up"
-K = "buffer-end"
-L = "buffer-start"
-
 [objects.word]
 j = "word-backward"
 ";" = "word-forward"
@@ -111,6 +106,13 @@ l = "paragraph-backward"
 
 [objects.whole]
 a = "whole-buffer"
+
+[system]
+s = "save"
+q = "quit"
+o = "open-file"
+b = "switch-buffer"
+k = "close-buffer"
 
 [commands]
 move-left = "caractere anterior"
@@ -154,3 +156,8 @@ paragraph-forward = "até o próximo parágrafo"
 paragraph-backward = "até o parágrafo anterior"
 current-line = "a linha atual"
 whole-buffer = "o arquivo inteiro"
+save = "salvar"
+quit = "sair do editor"
+open-file = "abrir arquivo"
+switch-buffer = "trocar de buffer"
+close-buffer = "fechar o buffer atual"

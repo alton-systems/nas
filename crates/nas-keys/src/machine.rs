@@ -13,7 +13,11 @@
 //! Não conhece `nas-editor::Document` nem nenhuma biblioteca de
 //! terminal — recebe [`Key`] (e, pra decidir se um verbo age na hora
 //! numa seleção, um `bool` dizendo se há uma seleção ativa) e devolve
-//! [`Action`]s abstratas; quem chama decide como executá-las.
+//! [`Action`]s abstratas; quem chama decide como executá-las. A classe
+//! sistema (Ctrl + tecla, docs/keys.md §5.7) é resolvida por
+//! [`Machine::system_action`], separado da máquina modal — ela vale
+//! em qualquer estado, então não faz sentido passar pelo
+//! Insert/Visual/Sequential.
 //!
 //! ## Escopo desta etapa
 //!
@@ -120,6 +124,21 @@ impl Object {
     }
 }
 
+/// Um comando da classe sistema (docs/keys.md §5.7): Ctrl + tecla, em
+/// qualquer estado — abrir/salvar/fechar arquivo, trocar de buffer,
+/// sair do editor. Resolvido por [`Machine::system_action`],
+/// independente do estado (Insert/Visual/Sequential) e de qualquer
+/// prefixo/verbo/unidade pendente — a classe sistema é o editor como
+/// *programa*, não uma edição de texto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemAction {
+    Save,
+    Quit,
+    OpenFile,
+    SwitchBuffer,
+    CloseBuffer,
+}
+
 /// O que fazer, em resposta a uma tecla — a máquina nunca executa nada
 /// sozinha, só devolve a lista (possivelmente vazia) de ações.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +222,38 @@ impl Action {
             | Action::DeleteSelection
             | Action::VerbObject(_, _) => return None,
         })
+    }
+
+    /// Se este movimento é um objeto **horizontal** (docs/keys.md
+    /// §5.3) — o objeto correspondente, pra que `d`/`c`/`x` aceitem a
+    /// mesma tecla que já move o cursor assim. `None` para qualquer
+    /// ação que não seja um movimento horizontal (inclusive os
+    /// verticais). Único lugar onde essa classificação existe: o
+    /// `[objects.horizontal]`/`[objects.vertical]` do keymap antigo
+    /// foram removidos a favor de derivar isso direto do `[visual]` —
+    /// mudar a tecla de um movimento no TOML muda o objeto junto, sem
+    /// precisar editar dois lugares.
+    pub(crate) fn as_horizontal_object(&self) -> Option<Object> {
+        match self {
+            Action::MoveLeft => Some(Object::CharLeft),
+            Action::MoveRight => Some(Object::CharRight),
+            Action::MoveLineStart => Some(Object::LineStart),
+            Action::MoveLineEnd => Some(Object::LineEnd),
+            _ => None,
+        }
+    }
+
+    /// O objeto **vertical** correspondente, se este movimento for um
+    /// — mesma ideia de [`Action::as_horizontal_object`], pro eixo
+    /// vertical (movimento por linha).
+    pub(crate) fn as_vertical_object(&self) -> Option<Object> {
+        match self {
+            Action::MoveDown => Some(Object::LineDown),
+            Action::MoveUp => Some(Object::LineUp),
+            Action::MoveBufferEnd => Some(Object::BufferEnd),
+            Action::MoveBufferStart => Some(Object::BufferStart),
+            _ => None,
+        }
     }
 }
 
@@ -318,6 +369,18 @@ impl Machine {
                 entries: self.keymap.hint_for_unit(*unit),
             }),
         }
+    }
+
+    /// Resolve uma tecla da classe sistema (Ctrl + tecla, docs/keys.md
+    /// §5.7) — `None` se a tecla não estiver em `[system]`. Puro: não
+    /// muda estado nem consome nenhum prefixo/verbo/unidade pendente
+    /// — a classe sistema vale em qualquer estado, independente do
+    /// que a máquina modal esteja fazendo. A tecla ainda passa pela
+    /// tradução de layout físico, como qualquer outra (docs/keys.md
+    /// regra 6).
+    pub fn system_action(&self, key: Key) -> Option<SystemAction> {
+        let key = layout::to_qwerty(&self.layout_table, key);
+        self.keymap.system_action(&key)
     }
 
     /// Equivalente a `nas--lighter`: um rótulo curto para a barra de
@@ -1145,6 +1208,54 @@ mod tests {
             qwerty.handle_key(Key::char(';'), false),
             vec![Action::MoveRight]
         );
+    }
+
+    #[test]
+    fn sistema_resolve_em_qualquer_estado() {
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine.system_action(Key::char('s')),
+            Some(SystemAction::Save)
+        );
+
+        // continua resolvendo em Insert...
+        machine.handle_key(Key::enter(), false);
+        assert_eq!(machine.state(), ModalState::Insert);
+        assert_eq!(
+            machine.system_action(Key::char('q')),
+            Some(SystemAction::Quit)
+        );
+
+        // ...e em Sequential, sem ser capturado pela sequência.
+        machine.handle_key(Key::alt_char(' '), false); // volta pro Visual
+        run(&mut machine, "  "); // entra no Sequential
+        assert_eq!(machine.state(), ModalState::Sequential);
+        assert_eq!(
+            machine.system_action(Key::char('k')),
+            Some(SystemAction::CloseBuffer)
+        );
+        // de fato não foi capturado: a sequência continua vazia.
+        assert!(machine.pending_sequence().is_empty());
+    }
+
+    #[test]
+    fn sistema_nao_resolve_tecla_fora_de_system() {
+        let machine = Machine::new();
+        assert_eq!(machine.system_action(Key::char('j')), None);
+    }
+
+    #[test]
+    fn sistema_nao_e_afetado_por_verbo_pendente() {
+        let mut machine = Machine::new();
+        run(&mut machine, "d"); // 'd' pendente, esperando objeto
+        assert!(machine.pending_hint().is_some());
+        assert_eq!(
+            machine.system_action(Key::char('s')),
+            Some(SystemAction::Save)
+        );
+        // o verbo continua pendente — consultar a classe sistema não
+        // interfere no estado da máquina modal.
+        assert!(machine.pending_hint().is_some());
     }
 
     #[test]
