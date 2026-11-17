@@ -11,7 +11,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use crate::key::Key;
-use crate::machine::{Action, Object, Unit, Verb};
+use crate::machine::{Action, Object, SystemAction, Unit, Verb};
 
 /// O keymap embutido no binário — a única fonte de verdade para
 /// atalhos; ver `docs/decisions/0004-especificacao-de-teclas-no-nas.md`.
@@ -70,12 +70,18 @@ pub struct Keymap {
     pub insert: HashMap<Key, Binding>,
     pub visual: HashMap<Key, Binding>,
     pub prefixes: HashMap<String, HashMap<Key, Binding>>,
+    /// Derivados do próprio `visual` (via
+    /// `Action::as_horizontal_object`/`as_vertical_object`), não lidos
+    /// de uma tabela `[objects.horizontal]`/`[objects.vertical]`
+    /// separada — mudar a tecla de um movimento muda o objeto junto,
+    /// sem precisar editar dois lugares. Ver `derive_movement_objects`.
     objects_horizontal: HashMap<Key, Object>,
     objects_vertical: HashMap<Key, Object>,
     objects_word: HashMap<Key, Object>,
     objects_paragraph: HashMap<Key, Object>,
     objects_whole: HashMap<Key, Object>,
     commands: HashMap<String, String>,
+    system: HashMap<Key, SystemAction>,
 }
 
 impl Keymap {
@@ -106,6 +112,12 @@ impl Keymap {
             Unit::Word => &self.objects_word,
             Unit::Paragraph => &self.objects_paragraph,
         }
+    }
+
+    /// O comando da classe sistema (Ctrl + tecla) ligado a `key`, se
+    /// houver um em `[system]`.
+    pub(crate) fn system_action(&self, key: &Key) -> Option<SystemAction> {
+        self.system.get(key).copied()
     }
 
     /// Descrição curta de um nome de comando (ação, verbo, unidade,
@@ -195,14 +207,12 @@ struct RawKeymap {
     objects: RawObjects,
     #[serde(default)]
     commands: HashMap<String, String>,
+    #[serde(default)]
+    system: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RawObjects {
-    #[serde(default)]
-    horizontal: HashMap<String, String>,
-    #[serde(default)]
-    vertical: HashMap<String, String>,
     #[serde(default)]
     word: HashMap<String, String>,
     #[serde(default)]
@@ -213,22 +223,51 @@ struct RawObjects {
 
 impl RawKeymap {
     fn resolve(self) -> Result<Keymap, KeymapError> {
+        let visual = resolve_bindings(self.visual)?;
+        let (objects_horizontal, objects_vertical) = derive_movement_objects(&visual);
         Ok(Keymap {
             insert: resolve_bindings(self.insert)?,
-            visual: resolve_bindings(self.visual)?,
+            visual,
             prefixes: self
                 .prefixes
                 .into_iter()
                 .map(|(name, bindings)| Ok((name, resolve_bindings(bindings)?)))
                 .collect::<Result<_, KeymapError>>()?,
-            objects_horizontal: resolve_objects(self.objects.horizontal)?,
-            objects_vertical: resolve_objects(self.objects.vertical)?,
+            objects_horizontal,
+            objects_vertical,
             objects_word: resolve_objects(self.objects.word)?,
             objects_paragraph: resolve_objects(self.objects.paragraph)?,
             objects_whole: resolve_objects(self.objects.whole)?,
             commands: self.commands,
+            system: resolve_system(self.system)?,
         })
     }
+}
+
+/// Deriva os objetos horizontais e verticais direto das ações já
+/// ligadas em `[visual]`, em vez de ler uma tabela separada: cada
+/// movimento (`Action::as_horizontal_object`/`as_vertical_object`) diz
+/// a que eixo pertence, e a tecla que já move o cursor assim também
+/// vale como objeto de um verbo. Mudar a tecla de um movimento no
+/// `[visual]` do TOML muda o objeto correspondente automaticamente —
+/// não há como os dois ficarem fora de sincronia.
+fn derive_movement_objects(
+    visual: &HashMap<Key, Binding>,
+) -> (HashMap<Key, Object>, HashMap<Key, Object>) {
+    let mut horizontal = HashMap::new();
+    let mut vertical = HashMap::new();
+    for (key, binding) in visual {
+        let Binding::Action(action) = binding else {
+            continue;
+        };
+        if let Some(object) = action.as_horizontal_object() {
+            horizontal.insert(*key, object);
+        }
+        if let Some(object) = action.as_vertical_object() {
+            vertical.insert(*key, object);
+        }
+    }
+    (horizontal, vertical)
 }
 
 fn resolve_bindings(
@@ -264,6 +303,16 @@ fn resolve_objects(raw: HashMap<String, String>) -> Result<HashMap<Key, Object>,
         .collect()
 }
 
+fn resolve_system(raw: HashMap<String, String>) -> Result<HashMap<Key, SystemAction>, KeymapError> {
+    raw.into_iter()
+        .map(|(key_spec, name)| {
+            let key = parse_key(&key_spec)?;
+            let action = parse_system_action(&name)?;
+            Ok((key, action))
+        })
+        .collect()
+}
+
 fn parse_key(spec: &str) -> Result<Key, KeymapError> {
     Key::from_str(spec).map_err(|_| KeymapError::InvalidKey(spec.to_string()))
 }
@@ -273,6 +322,17 @@ fn parse_verb(name: &str) -> Result<Verb, KeymapError> {
         "delete" => Verb::Delete,
         "copy" => Verb::Copy,
         "cut" => Verb::Cut,
+        _ => return Err(KeymapError::UnknownAction(name.to_string())),
+    })
+}
+
+fn parse_system_action(name: &str) -> Result<SystemAction, KeymapError> {
+    Ok(match name {
+        "save" => SystemAction::Save,
+        "quit" => SystemAction::Quit,
+        "open-file" => SystemAction::OpenFile,
+        "switch-buffer" => SystemAction::SwitchBuffer,
+        "close-buffer" => SystemAction::CloseBuffer,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
@@ -401,7 +461,7 @@ j = "voar"
     #[test]
     fn rejeita_objeto_desconhecido() {
         let err = Keymap::from_toml_str(
-            r#"[objects.horizontal]
+            r#"[objects.word]
 j = "voar"
 "#,
         )
@@ -414,5 +474,81 @@ j = "voar"
         let keymap = Keymap::default_keymap();
         assert_eq!(keymap.describe("inexistente"), "inexistente");
         assert_eq!(keymap.describe("delete"), "apagar");
+    }
+
+    #[test]
+    fn objetos_horizontais_e_verticais_sao_derivados_do_visual() {
+        // Nenhuma tabela [objects.horizontal]/[objects.vertical] é
+        // lida — os objetos vêm das próprias ações de movimento já
+        // ligadas em [visual]. Trocar a tecla de um movimento muda o
+        // objeto correspondente automaticamente, sem editar dois
+        // lugares.
+        let keymap = Keymap::from_toml_str(
+            r#"[visual]
+x = "move-right"
+y = "move-down"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            keymap.objects_horizontal().get(&Key::char('x')),
+            Some(&Object::CharRight)
+        );
+        assert_eq!(
+            keymap.objects_vertical().get(&Key::char('y')),
+            Some(&Object::LineDown)
+        );
+        // a tecla de qualquer outro keymap não aparece aqui.
+        assert_eq!(keymap.objects_horizontal().get(&Key::char(';')), None);
+    }
+
+    #[test]
+    fn remapear_um_movimento_no_toml_remapeia_o_objeto_junto() {
+        // O mesmo movimento (mover à direita), ligado a uma tecla
+        // diferente da do default.toml: o objeto segue a tecla nova.
+        let padrao = Keymap::default_keymap();
+        assert_eq!(
+            padrao.objects_horizontal().get(&Key::char('z')),
+            None,
+            "'z' não deveria significar nada no keymap padrão"
+        );
+
+        let remapeado = Keymap::from_toml_str(
+            r#"[visual]
+z = "move-right"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            remapeado.objects_horizontal().get(&Key::char('z')),
+            Some(&Object::CharRight)
+        );
+    }
+
+    #[test]
+    fn classe_sistema_no_keymap_padrao() {
+        let keymap = Keymap::default_keymap();
+        assert_eq!(
+            keymap.system_action(&Key::char('s')),
+            Some(SystemAction::Save)
+        );
+        assert_eq!(
+            keymap.system_action(&Key::char('q')),
+            Some(SystemAction::Quit)
+        );
+        assert_eq!(
+            keymap.system_action(&Key::char('o')),
+            Some(SystemAction::OpenFile)
+        );
+        assert_eq!(
+            keymap.system_action(&Key::char('b')),
+            Some(SystemAction::SwitchBuffer)
+        );
+        assert_eq!(
+            keymap.system_action(&Key::char('k')),
+            Some(SystemAction::CloseBuffer)
+        );
+        assert_eq!(keymap.system_action(&Key::char('z')), None);
     }
 }
