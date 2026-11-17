@@ -1255,13 +1255,28 @@ mod tests {
         app.handle_key(key(KeyCode::Char(';'))); // w ; : próxima palavra
         assert_eq!(app.document().cursor_offset(), 3);
 
-        app.handle_key(key(KeyCode::Char('p')));
-        app.handle_key(key(KeyCode::Char('k'))); // p k: próximo parágrafo
+        app.handle_key(key(KeyCode::Char('W')));
+        app.handle_key(key(KeyCode::Char('k'))); // W k: próximo parágrafo
         assert_eq!(app.document().cursor_position().line, 2);
 
-        app.handle_key(key(KeyCode::Char('p')));
-        app.handle_key(key(KeyCode::Char('l'))); // p l: parágrafo anterior
+        app.handle_key(key(KeyCode::Char('W')));
+        app.handle_key(key(KeyCode::Char('l'))); // W l: parágrafo anterior
         assert_eq!(app.document().cursor_position().line, 0);
+    }
+
+    #[test]
+    fn p_sozinho_nao_faz_nada() {
+        // A unidade parágrafo virou "W" (Shift+w); "p" fica reservado.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        let position_before = app.document().cursor_position();
+
+        app.handle_key(key(KeyCode::Char('p')));
+
+        assert_eq!(app.document().cursor_position(), position_before);
+        assert!(app.status_message.is_none());
     }
 
     #[test]
