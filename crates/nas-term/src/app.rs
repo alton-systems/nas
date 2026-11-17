@@ -226,6 +226,7 @@ impl App {
             Action::DeleteSelection => self.document_mut().delete_selection(),
             Action::Paste => self.pending_paste = true,
             Action::VerbObject(verb, object) => self.apply_verb_object(verb, object),
+            Action::ClearSelection => self.document_mut().clear_selection(),
         }
     }
 
@@ -1057,6 +1058,28 @@ mod tests {
         app.apply_pending_paste();
 
         assert_eq!(text(&app), "oi mundo");
+    }
+
+    #[test]
+    fn esc_desfaz_a_selecao_ativa_no_documento() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('s')));
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char(';')));
+        }
+        assert_eq!(app.document().selection_range(), Some((0, 3)));
+
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.document().selection_range(), None);
+        assert_eq!(
+            text(&app),
+            "ola mundo",
+            "Esc só desfaz a seleção, não apaga nada"
+        );
     }
 
     #[test]
