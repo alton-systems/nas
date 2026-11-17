@@ -267,7 +267,7 @@ enum Pending {
     /// Um verbo esperando o primeiro objeto (docs/keys.md §4.3).
     /// Tecla inválida **persiste**: o verbo continua pendente.
     Verb(Verb),
-    /// Um verbo que viu uma unidade (`w`/`p`) e agora espera a
+    /// Um verbo que viu uma unidade (`w`/`W`) e agora espera a
     /// direção que completa o objeto composto (`d w ;`). Também
     /// persiste em tecla inválida — ainda estamos resolvendo o
     /// objeto do verbo.
@@ -608,7 +608,7 @@ impl Machine {
                 self.remember_if_altering(verb, Object::CurrentLine);
                 vec![Action::VerbObject(verb, Object::CurrentLine)]
             }
-            // Uma unidade (`w`, `p`): o objeto ainda não está completo,
+            // Uma unidade (`w`, `W`): o objeto ainda não está completo,
             // falta a direção.
             Some(Binding::Unit(unit)) => {
                 self.pending = Some(Pending::VerbUnit(verb, unit));
@@ -972,13 +972,13 @@ mod tests {
 
         let mut machine = Machine::new();
         assert_eq!(
-            run(&mut machine, "dpk"),
+            run(&mut machine, "dWk"),
             vec![Action::VerbObject(Verb::Delete, Object::ParagraphForward)]
         );
 
         let mut machine = Machine::new();
         assert_eq!(
-            run(&mut machine, "dpl"),
+            run(&mut machine, "dWl"),
             vec![Action::VerbObject(Verb::Delete, Object::ParagraphBackward)]
         );
     }
@@ -1076,10 +1076,10 @@ mod tests {
         assert_eq!(run(&mut machine, "wj"), vec![Action::MoveWordBackward]);
 
         let mut machine = Machine::new();
-        assert_eq!(run(&mut machine, "pk"), vec![Action::MoveParagraphForward]);
+        assert_eq!(run(&mut machine, "Wk"), vec![Action::MoveParagraphForward]);
 
         let mut machine = Machine::new();
-        assert_eq!(run(&mut machine, "pl"), vec![Action::MoveParagraphBackward]);
+        assert_eq!(run(&mut machine, "Wl"), vec![Action::MoveParagraphBackward]);
     }
 
     #[test]
@@ -1092,6 +1092,25 @@ mod tests {
         assert_eq!(
             machine.handle_key(Key::char('k'), false),
             vec![Action::MoveDown]
+        );
+    }
+
+    #[test]
+    fn p_sozinho_nao_faz_nada() {
+        // A unidade parágrafo é "W" (Shift+w) agora, não "p" — regra 3
+        // (Shift intensifica), que passa a valer pra unidades também:
+        // w = palavra, W = parágrafo, uma escala maior. "p" sozinho
+        // fica reservado, sem binding em [visual].
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "p"), Vec::<Action>::new());
+        assert!(machine.pending_hint().is_none());
+        assert_eq!(machine.state(), ModalState::Visual);
+
+        // nem mesmo entra em espera: a tecla seguinte é um comando
+        // normal, não uma direção de unidade.
+        assert_eq!(
+            machine.handle_key(Key::char(';'), false),
+            vec![Action::MoveRight]
         );
     }
 

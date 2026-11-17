@@ -143,7 +143,7 @@ impl Keymap {
     }
 
     /// As teclas válidas e suas descrições para uma unidade pendente
-    /// (`w`, `p`, sozinha ou depois de um verbo).
+    /// (`w`, `W`, sozinha ou depois de um verbo).
     pub(crate) fn hint_for_unit(&self, unit: Unit) -> Vec<(Key, String)> {
         self.objects_for_unit(unit)
             .iter()
@@ -402,6 +402,15 @@ mod tests {
         assert_eq!(
             keymap.visual.get(&Key::char('w')),
             Some(&Binding::Unit(Unit::Word))
+        );
+        assert_eq!(
+            keymap.visual.get(&Key::char('W')),
+            Some(&Binding::Unit(Unit::Paragraph))
+        );
+        assert_eq!(
+            keymap.visual.get(&Key::char('p')),
+            None,
+            "'p' fica reservado — a unidade parágrafo é 'W' (Shift+w)"
         );
         assert_eq!(
             keymap.visual.get(&Key::char('g')),

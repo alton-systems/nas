@@ -68,12 +68,14 @@ S = "select-all"
 y = "paste"
 
 # Verbos (esperam um objeto — ver [objects.*]) e unidades (esperam uma
-# direção — ver [objects.word]/[objects.paragraph])
+# direção — ver [objects.word]/[objects.paragraph]). Shift intensifica
+# a unidade também (regra 3): w = palavra, W = parágrafo, uma escala
+# maior. "p" fica reservado (ver docs/keys.md §6).
 d = { verb = "delete" }
 c = { verb = "copy" }
 x = { verb = "cut" }
 w = { unit = "word" }
-p = { unit = "paragraph" }
+W = { unit = "paragraph" }
 
 # Repetir o último composto que alterou o texto
 "." = "repeat"
