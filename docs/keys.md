@@ -154,6 +154,14 @@ unidade **sozinha** (sem verbo, §5.1) cancela numa direção inválida,
 como um prefixo — não há verbo em jogo. `Esc` cancela qualquer verbo,
 prefixo ou unidade pendente, em qualquer um dos dois casos.
 
+Os objetos horizontal e vertical não são declarados numa tabela
+separada — são **derivados** das próprias ações de movimento já
+ligadas em `[visual]` (§5.1): cada movimento diz, em `machine.rs`, se
+é horizontal ou vertical, e a mesma tecla que já move o cursor assim
+também serve de objeto. Mudar a tecla de `j`/`;`/`J`/`:`/`k`/`l`/`K`/`L`
+em `[visual]` muda o objeto correspondente automaticamente, sem editar
+dois lugares.
+
 ### 5.4 Estados
 
 | Tecla | Efeito |
@@ -197,6 +205,11 @@ unidades `w` e `p` (§5.1).
 `o` e `b` não são mais comandos do Visual — viraram `Ctrl+o` e
 `Ctrl+b`, porque abrir arquivo e trocar de buffer são o editor agindo
 como *programa*, não uma edição de texto.
+
+Esta tabela é dados: vive em `[system]`, em `default.toml`, com a
+descrição de cada comando em `[commands]`. `nas-term` só sabe
+perguntar `Machine::system_action(tecla)` — nenhum atalho desta classe
+está escrito direto no código do nas-term.
 
 Não use combinações de Ctrl que cheguem iguais a outras teclas no
 terminal: `Ctrl+i` (Tab), `Ctrl+m` e `Ctrl+j` (Enter), `Ctrl+[` (Esc),
@@ -271,7 +284,10 @@ ver §7.
    quebra uma regra da §3, pare e pense de novo — as regras existem
    pra manter o sistema previsível.
 2. **Depois, `crates/nas-keys/keymap/default.toml`** — a tecla, o
-   objeto ou o prefixo novo, e a descrição em `[commands]`.
+   objeto ou o prefixo novo, e a descrição em `[commands]`. Um
+   movimento horizontal ou vertical novo só precisa de uma linha em
+   `[visual]`: o objeto correspondente é derivado dali (§5.3), não se
+   declara separado.
 3. Se a mudança precisar de lógica nova (não só de dados), ela vai em
    `crates/nas-keys/src/machine.rs` — mas só se for genérica (vale pra
    qualquer verbo/unidade/prefixo), nunca uma tecla específica
