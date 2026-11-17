@@ -55,8 +55,8 @@ um significado fixo, e combiná-las forma comandos (ex.: `d` apagar +
 
 | Classe | Como se aciona | Exemplos |
 |---|---|---|
-| Texto | tecla sem modificador | `j`/`k`/`l`/`;` movem; `d`/`c`/`x` apagam/copiam/recortam um objeto |
-| Intensidade | Shift | `J`/`K`/`L`/`:` vão aos extremos (início/fim da linha ou do arquivo) |
+| Texto | tecla sem modificador | `j`/`k`/`l`/`;` movem; `d`/`c`/`x` apagam/copiam/recortam um objeto; `w` é a unidade palavra (`w ;` próxima palavra) |
+| Intensidade | Shift | leva ao extremo: `J`/`K`/`L`/`:` vão ao início/fim da linha ou do arquivo; `W` é a unidade parágrafo, a palavra intensificada (`W k` próximo parágrafo) |
 | Ir para | prefixo `g` | `g g` início do arquivo, `g l` ir para uma linha |
 | Líder | prefixo `Espaço` | `Espaço f` buscar, `Espaço Espaço` modo sequencial |
 | Sistema | Ctrl | `Ctrl+s` salvar, `Ctrl+o` abrir, `Ctrl+b` trocar de buffer, `Ctrl+q` sair |
