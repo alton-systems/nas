@@ -853,6 +853,7 @@ dependencies = [
  "nas-editor",
  "nas-keys",
  "ratatui",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

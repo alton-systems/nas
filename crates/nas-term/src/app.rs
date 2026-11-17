@@ -772,10 +772,8 @@ mod tests {
 
     #[test]
     fn ctrl_o_abre_arquivo_com_alteracoes_nao_salvas_em_buffer_novo() {
-        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("outro.txt");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("outro.txt");
 
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc");
@@ -791,15 +789,12 @@ mod tests {
         assert_eq!(app.buffers.len(), 2);
         assert_eq!(app.active, 1);
         assert_eq!(text(&app), "", "o buffer novo começa vazio");
-
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
     fn ctrl_o_com_arquivo_ja_aberto_troca_pro_buffer_em_vez_de_duplicar() {
-        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("existente.txt");
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("existente.txt");
         std::fs::write(&path, "conteudo").unwrap();
 
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
@@ -820,17 +815,12 @@ mod tests {
 
         assert_eq!(app.buffers.len(), 2, "não deveria duplicar o buffer");
         assert_eq!(app.active, first_open_index);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
     fn ctrl_b_troca_de_buffer_pelo_nome() {
-        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("segundo.txt");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("segundo.txt");
 
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         app.handle_key(ctrl_key(KeyCode::Char('o')));
@@ -848,8 +838,6 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(app.active, 0, "deveria ter voltado pro buffer [sem nome]");
-
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -878,10 +866,8 @@ mod tests {
 
     #[test]
     fn ctrl_q_lista_os_buffers_com_alteracoes_nao_salvas() {
-        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("terceiro.txt");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("terceiro.txt");
 
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc"); // modifica o buffer [sem nome]
@@ -902,8 +888,6 @@ mod tests {
 
         app.handle_key(ctrl_key(KeyCode::Char('q'))); // confirma
         assert!(app.should_quit);
-
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -915,10 +899,8 @@ mod tests {
 
     #[test]
     fn ctrl_k_fecha_buffer_sem_alteracoes_direto() {
-        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("fechar.txt");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("fechar.txt");
 
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         app.handle_key(ctrl_key(KeyCode::Char('o')));
@@ -931,8 +913,6 @@ mod tests {
         app.handle_key(ctrl_key(KeyCode::Char('k')));
         assert_eq!(app.buffers.len(), 1);
         assert_eq!(app.active, 0);
-
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
