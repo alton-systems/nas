@@ -1091,10 +1091,8 @@ mod tests {
 
     #[test]
     fn abrir_arquivo_inexistente_cria_buffer_vazio_com_caminho() {
-        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("novo.txt");
-        let _ = fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("novo.txt");
 
         let mut doc = Document::open(&path).expect("abrir arquivo inexistente não deve falhar");
         assert_eq!(doc_text(&doc), "");
@@ -1105,9 +1103,6 @@ mod tests {
         }
         assert!(doc.save().expect("salvar deve funcionar"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "oi");
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
@@ -1115,9 +1110,8 @@ mod tests {
     fn salvar_e_atomico_e_preserva_permissoes() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("atomic.txt");
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("atomic.txt");
         fs::write(&path, "conteúdo original\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -1131,20 +1125,15 @@ mod tests {
             mode, 0o600,
             "permissões do arquivo original devem ser preservadas"
         );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
     #[cfg(unix)]
     fn salvar_atraves_de_symlink_preserva_o_link() {
-        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let real = dir.join("symlink_real.txt");
-        let link = dir.join("symlink_link.txt");
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let real = dir.path().join("symlink_real.txt");
+        let link = dir.path().join("symlink_link.txt");
         fs::write(&real, "conteúdo original\n").unwrap();
-        let _ = fs::remove_file(&link);
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let mut doc = Document::open(&link).expect("abrir pelo link deve funcionar");
@@ -1162,10 +1151,6 @@ mod tests {
             "Xconteúdo original\n",
             "o conteúdo deve ter mudado no arquivo real"
         );
-
-        let _ = fs::remove_file(&link);
-        let _ = fs::remove_file(&real);
-        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
@@ -1173,19 +1158,17 @@ mod tests {
     fn salvar_arquivo_novo_aplica_o_mesmo_umask_que_file_create() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = tempfile::tempdir().expect("diretório temporário");
 
         // Em vez de fixar um umask (processo inteiro, não por thread — e
         // os testes correm em paralelo), usamos File::create como
         // referência do que o umask atual do processo realmente produz.
-        let reference_path = dir.join("umask_referencia.txt");
+        let reference_path = dir.path().join("umask_referencia.txt");
         fs::File::create(&reference_path).unwrap();
         let expected_mode = fs::metadata(&reference_path).unwrap().permissions().mode() & 0o777;
         let _ = fs::remove_file(&reference_path);
 
-        let path = dir.join("umask_novo.txt");
-        let _ = fs::remove_file(&path);
+        let path = dir.path().join("umask_novo.txt");
         let mut doc = Document::open(&path).expect("abrir arquivo inexistente não deve falhar");
         doc.insert_char('X');
         assert!(doc.save().expect("salvar deve funcionar"));
@@ -1195,16 +1178,12 @@ mod tests {
             mode, expected_mode,
             "deveria aplicar o mesmo umask do processo que File::create aplica"
         );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
     fn preserva_crlf_e_usa_crlf_em_linhas_novas() {
-        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("crlf.txt");
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("crlf.txt");
         fs::write(&path, "linha um\r\nlinha dois\r\n").unwrap();
 
         let mut doc = Document::open(&path).expect("abrir deve funcionar");
@@ -1216,16 +1195,12 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "\r\nXlinha um\r\nlinha dois\r\n"
         );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
     fn preserva_ausencia_de_quebra_de_linha_final() {
-        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("sem_quebra.txt");
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("sem_quebra.txt");
         fs::write(&path, "sem quebra no final").unwrap();
 
         let mut doc = Document::open(&path).expect("abrir deve funcionar");
@@ -1235,16 +1210,12 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert_eq!(saved, "Xsem quebra no final");
         assert!(!saved.ends_with('\n'));
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
     fn recusa_arquivo_que_nao_e_utf8_valido() {
-        let dir = std::env::temp_dir().join(format!("nas-editor-test-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("binario.bin");
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("binario.bin");
         fs::write(&path, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
 
         match Document::open(&path) {
@@ -1252,8 +1223,5 @@ mod tests {
             Ok(_) => panic!("esperava recusa por UTF-8 inválido, mas o arquivo abriu"),
             Err(other) => panic!("esperava OpenError::NotUtf8, obteve outro erro: {other}"),
         }
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&dir);
     }
 }
