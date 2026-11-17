@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use nas_editor::{Document, OpenError, RegionObject};
-use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, Verb};
+use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, SystemAction, Verb};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Um buffer aberto: o documento mais o estado de rolagem que é dele,
@@ -132,32 +132,8 @@ impl App {
             return;
         }
 
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-        if ctrl && key.code == KeyCode::Char('q') {
-            self.handle_quit_request();
-            return;
-        }
-        if ctrl && key.code == KeyCode::Char('k') {
-            self.close_buffer();
-            return;
-        }
-
-        self.quit_confirm_pending = false;
-        self.close_confirm_pending = false;
-        self.status_message = None;
-
-        if ctrl {
-            match key.code {
-                KeyCode::Char('s') => self.save(),
-                KeyCode::Char('o') => self.open_prompt(PromptKind::OpenFile),
-                KeyCode::Char('b') => self.open_prompt(PromptKind::SwitchBuffer),
-                // Outros atalhos com Ctrl não existem ainda; ignorados,
-                // nunca reinterpretados como a tecla sem o Ctrl
-                // (nas-keys não tem vocabulário de Ctrl, então não cai
-                // em nenhuma ação dele).
-                _ => {}
-            }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.handle_system_key(key);
             return;
         }
 
@@ -168,6 +144,41 @@ impl App {
         let has_selection = self.document().selection_range().is_some();
         for action in self.modal.handle_key(nas_key, has_selection) {
             self.apply_action(action);
+        }
+    }
+
+    /// Ctrl + tecla: a classe sistema (docs/keys.md §5.7), resolvida
+    /// pelo keymap (`[system]` em `default.toml`), não mais escrita
+    /// direto aqui. `Quit` e `CloseBuffer` cuidam da própria
+    /// confirmação (gerenciam seus próprios campos de pendência, que
+    /// não devem ser limpos pela repetição da mesma tecla); os demais
+    /// limpam qualquer mensagem/confirmação pendente antes de agir.
+    fn handle_system_key(&mut self, key: KeyEvent) {
+        let Some(nas_key) = translate_key(key) else {
+            return;
+        };
+        let Some(system_action) = self.modal.system_action(nas_key) else {
+            return;
+        };
+
+        if system_action == SystemAction::Quit {
+            self.handle_quit_request();
+            return;
+        }
+        if system_action == SystemAction::CloseBuffer {
+            self.close_buffer();
+            return;
+        }
+
+        self.quit_confirm_pending = false;
+        self.close_confirm_pending = false;
+        self.status_message = None;
+
+        match system_action {
+            SystemAction::Save => self.save(),
+            SystemAction::OpenFile => self.open_prompt(PromptKind::OpenFile),
+            SystemAction::SwitchBuffer => self.open_prompt(PromptKind::SwitchBuffer),
+            SystemAction::Quit | SystemAction::CloseBuffer => unreachable!(),
         }
     }
 
