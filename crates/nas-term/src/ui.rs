@@ -8,6 +8,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use nas_keys::PendingHint;
+
 use crate::app::{App, PromptKind, buffer_name};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -79,6 +81,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     if let Some(message) = &app.status_message {
         frame.render_widget(Paragraph::new(message.clone()).style(style), area);
+        return;
+    }
+
+    if let Some(hint) = app.modal.pending_hint() {
+        frame.render_widget(Paragraph::new(hint_text(hint)).style(style), area);
         return;
     }
 
@@ -199,6 +206,22 @@ fn place_prompt_cursor(frame: &mut Frame, status_area: Rect, app: &App) {
     frame.set_cursor_position((x, status_area.y));
 }
 
+/// Texto da dica mostrada na barra de status enquanto um verbo, prefixo
+/// ou unidade está pendente (docs/keys.md regra 8). As entradas vêm de
+/// um `HashMap` dentro do `nas-keys` — ordenadas aqui pela própria
+/// tecla, pra não depender da ordem de iteração do hash (que mudaria a
+/// cada execução).
+fn hint_text(mut hint: PendingHint) -> String {
+    hint.entries.sort_by_key(|(key, _)| key.to_string());
+    let entries = hint
+        .entries
+        .iter()
+        .map(|(key, description)| format!("{key} {description}"))
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+    format!("{}  »  {entries}", hint.label)
+}
+
 /// Rótulo exibido na barra de status enquanto um prompt está ativo. O
 /// de trocar de buffer lista os buffers abertos, como pedido na etapa
 /// 5c — é a única informação que o usuário precisa pra saber o que
@@ -286,6 +309,22 @@ mod tests {
         }
 
         let rendered = render_to_string(&mut app, 30, 3);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_dica_de_verbo_pendente() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut document = Document::empty();
+        for ch in "ola mundo".chars() {
+            document.insert_char(ch);
+        }
+        let mut app = App::with_layout(document, Layout::Qwerty);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        let rendered = render_to_string(&mut app, 60, 3);
         insta::assert_snapshot!(rendered);
     }
 

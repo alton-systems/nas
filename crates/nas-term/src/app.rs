@@ -1,12 +1,13 @@
 //! Estado da aplicação: liga o teclado (crossterm) à máquina de estados
 //! do nas-keys e suas ações aos documentos abertos. Atalhos com Ctrl
-//! (salvar, sair) não fazem parte do vocabulário do nas-keys — são
-//! tratados aqui, antes de chegar à máquina de estados.
+//! (classe sistema: salvar, sair, abrir arquivo, trocar e fechar
+//! buffer) não fazem parte do vocabulário do nas-keys — são tratados
+//! aqui, antes de chegar à máquina de estados. Ver docs/keys.md.
 
 use std::path::{Path, PathBuf};
 
-use nas_editor::{Document, OpenError};
-use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine};
+use nas_editor::{Document, OpenError, RegionObject};
+use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, Verb};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Um buffer aberto: o documento mais o estado de rolagem que é dele,
@@ -39,11 +40,11 @@ pub enum PromptKind {
 }
 
 /// Uma linha de entrada ativa na barra de status — equivalente ao
-/// minibuffer do Emacs que `o` (find-file), `SPC f` (isearch-forward),
-/// `b` (switch-to-buffer) e `g l` (goto-line) abrem no nas-keys real.
-/// Enquanto ativa, nenhuma tecla chega à máquina modal: o texto
-/// digitado é só o conteúdo do prompt, nunca interpretado como comando
-/// do estado Visual.
+/// minibuffer do Emacs que Ctrl+o (find-file), líder `f`
+/// (isearch-forward), Ctrl+b (switch-to-buffer) e `g l` (goto-line)
+/// abrem no nas-keys real. Enquanto ativa, nenhuma tecla chega à
+/// máquina modal: o texto digitado é só o conteúdo do prompt, nunca
+/// interpretado como comando do estado Visual.
 pub struct Prompt {
     pub kind: PromptKind,
     pub input: String,
@@ -58,13 +59,17 @@ pub struct App {
     pub modal: Machine,
     pub should_quit: bool,
     pub quit_confirm_pending: bool,
-    /// "d a" (apagar o buffer inteiro) foi pressionado uma vez; a
-    /// mesma sequência de novo confirma. Ao contrário de
-    /// `quit_confirm_pending`, não é limpo incondicionalmente a cada
-    /// tecla (isso cancelaria a confirmação no meio do "d a" repetido)
-    /// — só quando uma ação diferente de `EraseBuffer` é aplicada, em
-    /// `apply_action`.
-    erase_confirm_pending: bool,
+    /// Ctrl+k (fechar o buffer atual) foi pressionado uma vez num
+    /// buffer com alterações não salvas; a mesma tecla de novo
+    /// confirma. Como `quit_confirm_pending`, não é limpo
+    /// incondicionalmente — só por outra tecla qualquer, não por
+    /// Ctrl+k de novo.
+    close_confirm_pending: bool,
+    /// Um verbo que apaga ou recorta (`d a`/`x a`) o arquivo inteiro
+    /// pediu confirmação — guarda qual verbo, pra só confirmar se a
+    /// mesma combinação repetir. Limpo por qualquer ação que não seja
+    /// essa mesma repetição.
+    whole_buffer_confirm_pending: Option<Verb>,
     pub status_message: Option<String>,
     pub prompt: Option<Prompt>,
     /// Registro interno da área de transferência — sempre atualizado em
@@ -95,7 +100,8 @@ impl App {
             modal: Machine::with_layout(layout),
             should_quit: false,
             quit_confirm_pending: false,
-            erase_confirm_pending: false,
+            close_confirm_pending: false,
+            whole_buffer_confirm_pending: None,
             status_message: None,
             prompt: None,
             clipboard: String::new(),
@@ -132,17 +138,26 @@ impl App {
             self.handle_quit_request();
             return;
         }
+        if ctrl && key.code == KeyCode::Char('k') {
+            self.close_buffer();
+            return;
+        }
 
         self.quit_confirm_pending = false;
+        self.close_confirm_pending = false;
         self.status_message = None;
 
         if ctrl {
-            if key.code == KeyCode::Char('s') {
-                self.save();
+            match key.code {
+                KeyCode::Char('s') => self.save(),
+                KeyCode::Char('o') => self.open_prompt(PromptKind::OpenFile),
+                KeyCode::Char('b') => self.open_prompt(PromptKind::SwitchBuffer),
+                // Outros atalhos com Ctrl não existem ainda; ignorados,
+                // nunca reinterpretados como a tecla sem o Ctrl
+                // (nas-keys não tem vocabulário de Ctrl, então não cai
+                // em nenhuma ação dele).
+                _ => {}
             }
-            // Outros atalhos com Ctrl não existem ainda; ignorados, nunca
-            // reinterpretados como a tecla sem o Ctrl (nas-keys não tem
-            // vocabulário de Ctrl, então não cai em nenhuma ação dele).
             return;
         }
 
@@ -150,14 +165,20 @@ impl App {
             return;
         };
 
-        for action in self.modal.handle_key(nas_key) {
+        let has_selection = self.document().selection_range().is_some();
+        for action in self.modal.handle_key(nas_key, has_selection) {
             self.apply_action(action);
         }
     }
 
     fn apply_action(&mut self, action: Action) {
-        if !matches!(action, Action::EraseBuffer) {
-            self.erase_confirm_pending = false;
+        let repeats_whole_buffer_confirm = matches!(
+            action,
+            Action::VerbObject(verb, Object::WholeBuffer)
+                if Some(verb) == self.whole_buffer_confirm_pending
+        );
+        if !repeats_whole_buffer_confirm {
+            self.whole_buffer_confirm_pending = None;
         }
 
         match action {
@@ -175,14 +196,9 @@ impl App {
             Action::MoveParagraphBackward => self.document_mut().move_paragraph_backward(),
             Action::DeleteForward => self.document_mut().delete_forward(),
             Action::DeleteBackward => self.document_mut().delete_backward(),
-            Action::DeleteToLineEnd => self.kill(|doc| doc.delete_to_line_end()),
-            Action::DeleteToLineStart => self.kill(|doc| doc.delete_to_line_start()),
-            Action::DeleteWordForward => self.kill(|doc| doc.delete_word_forward()),
-            Action::EraseBuffer => self.erase_buffer_with_confirmation(),
             Action::Undo => self.undo(),
             Action::InsertChar(c) => self.document_mut().insert_char(c),
             Action::InsertNewline => self.document_mut().insert_newline(),
-            Action::PromptOpenFile => self.open_prompt(PromptKind::OpenFile),
             Action::PromptSearch => {
                 let origin = self.document().cursor_offset();
                 self.prompt = Some(Prompt {
@@ -191,13 +207,14 @@ impl App {
                     search_origin: Some(origin),
                 });
             }
-            Action::PromptSwitchBuffer => self.open_prompt(PromptKind::SwitchBuffer),
             Action::PromptGotoLine => self.open_prompt(PromptKind::GotoLine),
             Action::StartSelection => self.document_mut().start_selection(),
             Action::SelectAll => self.document_mut().select_all(),
             Action::Copy => self.copy(),
             Action::Cut => self.cut(),
+            Action::DeleteSelection => self.document_mut().delete_selection(),
             Action::Paste => self.pending_paste = true,
+            Action::VerbObject(verb, object) => self.apply_verb_object(verb, object),
         }
     }
 
@@ -209,23 +226,38 @@ impl App {
         });
     }
 
-    fn erase_buffer_with_confirmation(&mut self) {
-        if self.erase_confirm_pending {
-            self.erase_confirm_pending = false;
-            self.document_mut().clear();
-            self.status_message = None;
-        } else {
-            self.erase_confirm_pending = true;
-            self.status_message =
-                Some("Apagar o buffer inteiro? \"d a\" de novo confirma.".to_string());
+    /// Um verbo agindo sobre um objeto (docs/keys.md §4.3). `d a`/`x a`
+    /// (apagar/recortar o arquivo inteiro) pedem confirmação antes de
+    /// executar — a mesma combinação repetida confirma.
+    fn apply_verb_object(&mut self, verb: Verb, object: Object) {
+        if object == Object::WholeBuffer && matches!(verb, Verb::Delete | Verb::Cut) {
+            if self.whole_buffer_confirm_pending == Some(verb) {
+                self.whole_buffer_confirm_pending = None;
+            } else {
+                self.whole_buffer_confirm_pending = Some(verb);
+                self.status_message = Some(format!(
+                    "{} o arquivo inteiro? repita pra confirmar.",
+                    verb_label(verb)
+                ));
+                return;
+            }
+        }
+
+        let region = to_region_object(object);
+        let (from, to) = self.document().region_for(region);
+        match verb {
+            Verb::Copy => {
+                let text = self.document().text_in(from, to);
+                self.write_clipboard_if_nonempty(text);
+            }
+            Verb::Delete | Verb::Cut => {
+                let text = self.document_mut().delete_region(from, to);
+                self.write_clipboard_if_nonempty(text);
+            }
         }
     }
 
-    /// Apaga com `delete` e, se algo foi apagado, copia pra área de
-    /// transferência — como os `kill-*` do Emacs (ao contrário de
-    /// Backspace/Delete, que só apagam).
-    fn kill(&mut self, delete: impl FnOnce(&mut Document) -> String) {
-        let text = delete(self.document_mut());
+    fn write_clipboard_if_nonempty(&mut self, text: String) {
         if !text.is_empty() {
             self.clipboard = text.clone();
             self.pending_clipboard_write = Some(text);
@@ -237,10 +269,14 @@ impl App {
     /// `clipboard` a partir da área de transferência do sistema — se
     /// essa tentativa falhar (sem display, terminal sem suporte), o
     /// registro interno (o que já estava em `clipboard`) é quem cola.
+    /// Com uma seleção ativa, substitui a seleção (docs/keys.md §4.2).
     /// Não faz nada se não houver um `y` pendente.
     pub fn apply_pending_paste(&mut self) {
         if !std::mem::take(&mut self.pending_paste) {
             return;
+        }
+        if self.document().selection_range().is_some() {
+            self.document_mut().delete_selection();
         }
         let text = self.clipboard.clone();
         self.paste_text(&text);
@@ -248,16 +284,14 @@ impl App {
 
     fn copy(&mut self) {
         if let Some(text) = self.document().selected_text() {
-            self.clipboard = text.clone();
-            self.pending_clipboard_write = Some(text);
+            self.write_clipboard_if_nonempty(text);
         }
         self.document_mut().clear_selection();
     }
 
     fn cut(&mut self) {
         if let Some(text) = self.document().selected_text() {
-            self.clipboard = text.clone();
-            self.pending_clipboard_write = Some(text);
+            self.write_clipboard_if_nonempty(text);
         }
         self.document_mut().delete_selection();
     }
@@ -286,8 +320,9 @@ impl App {
     /// Texto colado pelo terminal via bracketed paste
     /// (`Event::Paste` do crossterm) — nunca passa pela máquina modal,
     /// então nunca é interpretado como comando do estado Visual, só
-    /// como texto. Vai pro prompt ativo, se houver um; senão, direto
-    /// pro documento, independente do estado modal.
+    /// como texto. Vai pro prompt ativo, se houver um; senão, substitui
+    /// uma seleção ativa (como `y`) e insere direto no documento,
+    /// independente do estado modal.
     pub fn handle_paste(&mut self, text: String) {
         if self.prompt.is_some() {
             if let Some(prompt) = &mut self.prompt {
@@ -295,6 +330,9 @@ impl App {
             }
             self.update_incremental_search();
             return;
+        }
+        if self.document().selection_range().is_some() {
+            self.document_mut().delete_selection();
         }
         self.paste_text(&text);
     }
@@ -366,10 +404,8 @@ impl App {
     }
 
     /// Abre `path` num buffer novo — ou troca pro buffer já aberto com
-    /// esse caminho, se houver um. Diferente da etapa anterior (quando
-    /// só existia um buffer), não precisa mais recusar por causa de
-    /// alterações não salvas: o buffer atual continua intacto em
-    /// segundo plano.
+    /// esse caminho, se houver um. Não recusa por causa de alterações
+    /// não salvas: o buffer atual continua intacto em segundo plano.
     fn open_file(&mut self, path: &str) {
         let path = path.trim();
         if path.is_empty() {
@@ -431,6 +467,31 @@ impl App {
         }
     }
 
+    /// Fecha o buffer atual — Ctrl+k. Pede confirmação se ele tiver
+    /// alterações não salvas (a mesma tecla de novo confirma). Fechar
+    /// o último buffer aberto deixa um `[sem nome]` vazio no lugar: o
+    /// nas sempre tem pelo menos um buffer.
+    fn close_buffer(&mut self) {
+        if self.document().is_modified() && !self.close_confirm_pending {
+            self.close_confirm_pending = true;
+            self.status_message = Some(format!(
+                "{} tem alterações não salvas — Ctrl+K de novo fecha sem salvar.",
+                buffer_name(self.document())
+            ));
+            return;
+        }
+        self.close_confirm_pending = false;
+        self.status_message = None;
+
+        self.buffers.remove(self.active);
+        if self.buffers.is_empty() {
+            self.buffers.push(Buffer::new(Document::empty()));
+            self.active = 0;
+        } else if self.active >= self.buffers.len() {
+            self.active = self.buffers.len() - 1;
+        }
+    }
+
     /// Ajusta a rolagem do buffer ativo para que o cursor fique visível
     /// numa área de `width` x `height` células.
     pub fn ensure_cursor_visible(&mut self, width: usize, height: usize) {
@@ -488,9 +549,36 @@ impl App {
     }
 }
 
+fn verb_label(verb: Verb) -> &'static str {
+    match verb {
+        Verb::Delete => "Apagar",
+        Verb::Copy => "Copiar",
+        Verb::Cut => "Recortar",
+    }
+}
+
+fn to_region_object(object: Object) -> RegionObject {
+    match object {
+        Object::CharLeft => RegionObject::CharLeft,
+        Object::CharRight => RegionObject::CharRight,
+        Object::LineStart => RegionObject::LineStart,
+        Object::LineEnd => RegionObject::LineEnd,
+        Object::LineDown => RegionObject::LineDown,
+        Object::LineUp => RegionObject::LineUp,
+        Object::BufferEnd => RegionObject::BufferEnd,
+        Object::BufferStart => RegionObject::BufferStart,
+        Object::WordBackward => RegionObject::WordBackward,
+        Object::WordForward => RegionObject::WordForward,
+        Object::ParagraphForward => RegionObject::ParagraphForward,
+        Object::ParagraphBackward => RegionObject::ParagraphBackward,
+        Object::CurrentLine => RegionObject::CurrentLine,
+        Object::WholeBuffer => RegionObject::WholeBuffer,
+    }
+}
+
 /// Nome de exibição de um buffer: o caminho do arquivo, ou
 /// `[sem nome]` se ainda não tiver um — usado na barra de status, no
-/// prompt de trocar de buffer e na mensagem de confirmação de saída.
+/// prompt de trocar de buffer e nas mensagens de confirmação.
 pub fn buffer_name(document: &Document) -> String {
     document
         .path()
@@ -573,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn despacho_de_apagar_e_desfazer_com_u_pelo_estado_visual() {
+    fn verbo_mais_objeto_e_desfazer_com_u_pelo_estado_visual() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc");
         app.handle_key(key(KeyCode::Char('g')));
@@ -581,8 +669,9 @@ mod tests {
         assert_eq!(text(&app), "abc");
 
         app.handle_key(key(KeyCode::Char('d')));
-        app.handle_key(key(KeyCode::Char('d'))); // d d: apaga o 'a'
+        app.handle_key(key(KeyCode::Char(';'))); // d ; : apaga o 'a'
         assert_eq!(text(&app), "bc");
+        assert_eq!(app.clipboard, "a");
 
         app.handle_key(key(KeyCode::Char('u'))); // u: desfaz
         assert_eq!(text(&app), "abc");
@@ -659,7 +748,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
         let position_before = app.document().cursor_position();
 
-        app.handle_key(key(KeyCode::Char('o'))); // abre o prompt de arquivo
+        app.handle_key(ctrl_key(KeyCode::Char('o'))); // Ctrl+o: abre o prompt de arquivo
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Char('k')));
 
@@ -671,9 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn abrir_arquivo_com_alteracoes_nao_salvas_abre_em_buffer_novo() {
-        // Comportamento mudou na etapa 5c: antes recusava; agora abre
-        // num buffer novo, deixando o atual intocado em segundo plano.
+    fn ctrl_o_abre_arquivo_com_alteracoes_nao_salvas_em_buffer_novo() {
         let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("outro.txt");
@@ -683,7 +770,7 @@ mod tests {
         type_text(&mut app, "abc");
         assert!(app.document().is_modified());
 
-        app.handle_key(key(KeyCode::Char('o')));
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
         for c in path.to_str().unwrap().chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -698,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn abrir_arquivo_ja_aberto_troca_pro_buffer_em_vez_de_duplicar() {
+    fn ctrl_o_com_arquivo_ja_aberto_troca_pro_buffer_em_vez_de_duplicar() {
         let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("existente.txt");
@@ -706,7 +793,7 @@ mod tests {
 
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         let open = |app: &mut App| {
-            app.handle_key(key(KeyCode::Char('o')));
+            app.handle_key(ctrl_key(KeyCode::Char('o')));
             for c in path.to_str().unwrap().chars() {
                 app.handle_key(key(KeyCode::Char(c)));
             }
@@ -728,21 +815,21 @@ mod tests {
     }
 
     #[test]
-    fn trocar_de_buffer_pelo_nome() {
+    fn ctrl_b_troca_de_buffer_pelo_nome() {
         let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("segundo.txt");
         let _ = std::fs::remove_file(&path);
 
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
-        app.handle_key(key(KeyCode::Char('o')));
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
         for c in path.to_str().unwrap().chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.active, 1);
 
-        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(ctrl_key(KeyCode::Char('b')));
         assert_eq!(app.prompt.as_ref().unwrap().kind, PromptKind::SwitchBuffer);
         for c in "sem nome".chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -755,9 +842,9 @@ mod tests {
     }
 
     #[test]
-    fn trocar_de_buffer_sem_match_mostra_mensagem_e_nao_troca() {
+    fn ctrl_b_sem_match_mostra_mensagem_e_nao_troca() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
-        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(ctrl_key(KeyCode::Char('b')));
         for c in "nao existe".chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -765,6 +852,17 @@ mod tests {
 
         assert_eq!(app.active, 0);
         assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn o_e_b_nao_sao_mais_comandos_do_visual() {
+        // o/b saíram do Visual na reforma de teclas — agora só existem
+        // como Ctrl+o/Ctrl+b (classe sistema).
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(key(KeyCode::Char('o')));
+        assert!(app.prompt.is_none());
+        app.handle_key(key(KeyCode::Char('b')));
+        assert!(app.prompt.is_none());
     }
 
     #[test]
@@ -777,7 +875,7 @@ mod tests {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc"); // modifica o buffer [sem nome]
 
-        app.handle_key(key(KeyCode::Char('o')));
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
         for c in path.to_str().unwrap().chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
@@ -802,6 +900,55 @@ mod tests {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         app.handle_key(ctrl_key(KeyCode::Char('q')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_k_fecha_buffer_sem_alteracoes_direto() {
+        let dir = std::env::temp_dir().join(format!("nas-term-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("fechar.txt");
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        for c in path.to_str().unwrap().chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.buffers.len(), 2);
+
+        app.handle_key(ctrl_key(KeyCode::Char('k')));
+        assert_eq!(app.buffers.len(), 1);
+        assert_eq!(app.active, 0);
+
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn ctrl_k_com_alteracoes_pede_confirmacao() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+
+        app.handle_key(ctrl_key(KeyCode::Char('k')));
+        assert_eq!(app.buffers.len(), 1, "não deveria ter fechado ainda");
+        assert!(app.status_message.is_some());
+
+        app.handle_key(ctrl_key(KeyCode::Char('k'))); // confirma
+        assert_eq!(app.buffers.len(), 1);
+        assert_eq!(
+            text(&app),
+            "",
+            "fechar o único buffer deixa um vazio no lugar"
+        );
+    }
+
+    #[test]
+    fn ctrl_k_no_ultimo_buffer_deixa_um_vazio_no_lugar() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(ctrl_key(KeyCode::Char('k')));
+        assert_eq!(app.buffers.len(), 1);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.document().path(), None);
     }
 
     #[test]
@@ -844,7 +991,7 @@ mod tests {
         }
         assert_eq!(app.document().selection_range(), Some((0, 3)));
 
-        app.handle_key(key(KeyCode::Char('c'))); // copia
+        app.handle_key(key(KeyCode::Char('c'))); // copia (com seleção, age na hora)
         assert_eq!(app.clipboard, "ola");
         assert_eq!(app.pending_clipboard_write.take(), Some("ola".to_string()));
         assert_eq!(
@@ -872,13 +1019,53 @@ mod tests {
             app.handle_key(key(KeyCode::Char(';'))); // seleciona "ola "
         }
 
-        app.handle_key(key(KeyCode::Char('x'))); // recorta
+        app.handle_key(key(KeyCode::Char('x'))); // recorta (com seleção)
         assert_eq!(text(&app), "mundo");
         assert_eq!(app.clipboard, "ola ");
 
         app.handle_key(key(KeyCode::Char('y'))); // pede pra colar de volta
         app.apply_pending_paste();
         assert_eq!(text(&app), "ola mundo");
+    }
+
+    #[test]
+    fn apagar_com_selecao_nao_copia_pra_area_de_transferencia() {
+        // Diferente de x (recortar), d com seleção só apaga — não é
+        // kill-style (docs/keys.md §4.2: a célula "com seleção" de d
+        // não menciona área de transferência).
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('s')));
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char(';')));
+        }
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(text(&app), " mundo");
+        assert_eq!(
+            app.clipboard, "",
+            "d com seleção não deveria tocar o clipboard"
+        );
+    }
+
+    #[test]
+    fn colar_com_selecao_ativa_substitui_a_selecao() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('s')));
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char(';'))); // seleciona "ola"
+        }
+
+        app.clipboard = "oi".to_string();
+        app.handle_key(key(KeyCode::Char('y')));
+        app.apply_pending_paste();
+
+        assert_eq!(text(&app), "oi mundo");
     }
 
     #[test]
@@ -928,12 +1115,15 @@ mod tests {
     }
 
     #[test]
-    fn copiar_sem_selecao_nao_faz_nada() {
+    fn copiar_sem_selecao_espera_um_objeto() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc");
-        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('c'))); // sem seleção: vira verbo pendente
         assert_eq!(app.clipboard, "");
-        assert_eq!(app.pending_clipboard_write, None);
+        app.handle_key(key(KeyCode::Char(';'))); // objeto: 1 caractere à frente
+        assert_eq!(app.clipboard, "a");
     }
 
     #[test]
@@ -943,8 +1133,8 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
         app.handle_key(key(KeyCode::Char('g'))); // cursor no início, estado Visual
 
-        // "dd" seria o despacho de apagar se passasse pela máquina modal
-        // (apagaria o "a" duas vezes); colado, deve só inserir o texto.
+        // "dd" seria o verbo repetido se passasse pela máquina modal
+        // (apagaria a linha inteira); colado, deve só inserir o texto.
         app.handle_paste("dd".to_string());
 
         assert_eq!(text(&app), "ddabc");
@@ -955,7 +1145,7 @@ mod tests {
     fn bracketed_paste_vai_pro_prompt_quando_ativo() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "abc");
-        app.handle_key(key(KeyCode::Char('o'))); // abre o prompt de abrir arquivo
+        app.handle_key(ctrl_key(KeyCode::Char('o'))); // abre o prompt de abrir arquivo
 
         app.handle_paste("/tmp/colado.txt".to_string());
 
@@ -964,25 +1154,26 @@ mod tests {
     }
 
     #[test]
-    fn kill_line_e_kill_word_copiam_pra_area_de_transferencia() {
+    fn verbo_mais_objeto_copia_pra_area_de_transferencia() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "ola mundo");
         app.handle_key(key(KeyCode::Char('g')));
         app.handle_key(key(KeyCode::Char('g')));
 
         app.handle_key(key(KeyCode::Char('d')));
-        app.handle_key(key(KeyCode::Char('w'))); // d w: apaga "ola"
+        app.handle_key(key(KeyCode::Char('w'))); // d w ; : apaga "ola"
+        app.handle_key(key(KeyCode::Char(';')));
         assert_eq!(text(&app), " mundo");
         assert_eq!(app.clipboard, "ola");
 
         app.handle_key(key(KeyCode::Char('d')));
-        app.handle_key(key(KeyCode::Char('k'))); // d k: apaga até o fim da linha
+        app.handle_key(key(KeyCode::Char(':'))); // d : apaga até o fim da linha
         assert_eq!(text(&app), "");
         assert_eq!(app.clipboard, " mundo");
     }
 
     #[test]
-    fn erase_buffer_precisa_de_confirmacao() {
+    fn apagar_arquivo_inteiro_precisa_de_confirmacao_e_copia_pro_clipboard() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "ola mundo");
 
@@ -994,25 +1185,56 @@ mod tests {
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Char('a'))); // segundo "d a": confirma
         assert_eq!(text(&app), "");
+        assert_eq!(
+            app.clipboard, "ola mundo",
+            "d a deveria copiar o conteúdo antes de apagar, como qualquer outro objeto"
+        );
     }
 
     #[test]
-    fn erase_buffer_e_cancelado_por_qualquer_outra_acao() {
+    fn apagar_arquivo_inteiro_e_cancelado_por_qualquer_outra_acao() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "ola mundo");
 
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Char('a'))); // primeiro "d a"
 
-        app.handle_key(key(KeyCode::Char('j'))); // qualquer outra ação cancela
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g'))); // qualquer outra ação cancela
 
         app.handle_key(key(KeyCode::Char('d')));
         app.handle_key(key(KeyCode::Char('a'))); // "d a" de novo: é um primeiro pedido, não confirma
         assert_eq!(
             text(&app),
             "ola mundo",
-            "a confirmação deveria ter sido cancelada pelo 'j'"
+            "a confirmação deveria ter sido cancelada pelo 'g g'"
         );
+    }
+
+    #[test]
+    fn recortar_arquivo_inteiro_tambem_pede_confirmacao() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(text(&app), "ola mundo");
+
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(text(&app), "");
+        assert_eq!(app.clipboard, "ola mundo");
+    }
+
+    #[test]
+    fn copiar_arquivo_inteiro_nao_precisa_de_confirmacao() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo");
+
+        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(text(&app), "ola mundo", "copiar nunca apaga nada");
+        assert_eq!(app.clipboard, "ola mundo");
     }
 
     #[test]
@@ -1032,22 +1254,42 @@ mod tests {
     }
 
     #[test]
-    fn word_e_paragraph_motion() {
+    fn unidade_sozinha_move_por_palavra_e_paragrafo() {
         let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
         type_text(&mut app, "ola mundo\n\ndois");
         app.handle_key(key(KeyCode::Char('g')));
         app.handle_key(key(KeyCode::Char('g')));
 
-        app.handle_key(key(KeyCode::Char(' ')));
-        app.handle_key(key(KeyCode::Char(';'))); // líder ; : próxima palavra
+        app.handle_key(key(KeyCode::Char('w')));
+        app.handle_key(key(KeyCode::Char(';'))); // w ; : próxima palavra
         assert_eq!(app.document().cursor_offset(), 3);
 
-        app.handle_key(key(KeyCode::Char(' ')));
-        app.handle_key(key(KeyCode::Char('k'))); // líder k: próximo parágrafo
+        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char('k'))); // p k: próximo parágrafo
         assert_eq!(app.document().cursor_position().line, 2);
 
-        app.handle_key(key(KeyCode::Char(' ')));
-        app.handle_key(key(KeyCode::Char('l'))); // líder l: parágrafo anterior
+        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char('l'))); // p l: parágrafo anterior
         assert_eq!(app.document().cursor_position().line, 0);
+    }
+
+    #[test]
+    fn repetir_o_ultimo_composto_na_posicao_atual_do_cursor() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "ola mundo bom");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('w')));
+        app.handle_key(key(KeyCode::Char(';'))); // d w ; : apaga "ola"
+        assert_eq!(text(&app), " mundo bom");
+
+        // o cursor agora está no espaço antes de "mundo" — repetir "d w
+        // ;" dali apaga esse espaço e "mundo" (o objeto é recalculado
+        // na posição atual, não replica literalmente o que foi apagado
+        // antes).
+        app.handle_key(key(KeyCode::Char('.'))); // repete na posição atual
+        assert_eq!(text(&app), " bom");
     }
 }
