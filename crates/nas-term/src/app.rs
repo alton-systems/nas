@@ -4,11 +4,12 @@
 //! buffer) não fazem parte do vocabulário do nas-keys — são tratados
 //! aqui, antes de chegar à máquina de estados. Ver docs/keys.md.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nas_editor::{Document, OpenError, RegionObject};
-use nas_history::{Author, Journal};
+use nas_history::{Author, CheckpointManifest, ExcludedReason, FileChange, Journal, ProjectId};
 use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, SystemAction, Verb};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -48,6 +49,23 @@ pub enum PromptKind {
     Search,
     SwitchBuffer,
     GotoLine,
+    /// `Ctrl+t n` — nome do novo checkpoint.
+    CheckpointName,
+    /// `Ctrl+t r` — nome (ou trecho do nome/id) do checkpoint a
+    /// restaurar.
+    RestoreCheckpoint,
+    /// `Ctrl+t z` — exige digitar exatamente "apagar".
+    DeleteHistoryConfirm,
+}
+
+/// Uma visualização somente-leitura de texto maior que uma linha —
+/// diff entre checkpoints, lista de checkpoints, autoria de um
+/// arquivo (docs/decisions/0005 §7/§8). Toma a tela inteira enquanto
+/// ativa; `j`/`k` (ou as setas) rolam, qualquer outra tecla fecha.
+pub struct Overlay {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub scroll: u16,
 }
 
 /// Uma linha de entrada ativa na barra de status — equivalente ao
@@ -101,6 +119,25 @@ pub struct App {
     pub pending_paste: bool,
     /// Journal de histórico do projeto — ver [`SharedJournal`].
     history: SharedJournal,
+    /// Projeto identificado e onde fica `$XDG_STATE_HOME` — `None`
+    /// sem histórico ligado (todos os testes deste módulo, a menos
+    /// que chamem `attach_project`). `ProjectId::ensure_history_dir`
+    /// é idempotente, então `history_dir()` pode chamá-lo de novo a
+    /// cada comando de checkpoint sem custo relevante — isso também é
+    /// o que recria a pasta depois de `Ctrl+t z` apagar tudo.
+    project: Option<(ProjectId, PathBuf)>,
+    /// `Ctrl+t` foi pressionado: a próxima tecla (sem Ctrl) resolve
+    /// dentro do prefixo nomeado (hoje só `"tempo"`) — ver
+    /// `Machine::system_prefix`.
+    pending_system_prefix: Option<String>,
+    /// `Ctrl+t r` encontrou um checkpoint cujos arquivos afetados têm
+    /// alterações não salvas — guarda o id do checkpoint, pra só
+    /// confirmar se o mesmo nome for restaurado de novo. Mesma ideia
+    /// de `whole_buffer_confirm_pending`.
+    restore_confirm_pending: Option<String>,
+    /// Uma visualização somente-leitura ativa (diff, lista de
+    /// checkpoints, autoria) — ver [`Overlay`].
+    pub overlay: Option<Overlay>,
 }
 
 impl App {
@@ -121,6 +158,10 @@ impl App {
             pending_clipboard_write: None,
             pending_paste: false,
             history: Arc::new(Mutex::new(None)),
+            project: None,
+            pending_system_prefix: None,
+            restore_confirm_pending: None,
+            overlay: None,
         }
     }
 
@@ -132,6 +173,24 @@ impl App {
     /// histórico.
     pub fn attach_history(&mut self, history: SharedJournal) {
         self.history = history;
+    }
+
+    /// Liga este `App` ao projeto identificado (raiz do Git ou
+    /// diretório atual) e a `$XDG_STATE_HOME` — habilita os comandos
+    /// de checkpoint do prefixo `Ctrl+t` (novo, listar, diff,
+    /// restaurar, autoria, apagar histórico), que precisam da pasta
+    /// de histórico além do journal. Sem chamar isto, esses comandos
+    /// respondem "histórico não disponível" em vez de fazer nada.
+    pub fn attach_project(&mut self, project: ProjectId, state_home: PathBuf) {
+        self.project = Some((project, state_home));
+    }
+
+    /// A pasta de histórico deste projeto, criando-a se preciso
+    /// (`ProjectId::ensure_history_dir` é idempotente) — `None` sem
+    /// `attach_project` ou se a pasta não puder ser criada/lida.
+    fn history_dir(&self) -> Option<PathBuf> {
+        let (project, state_home) = self.project.as_ref()?;
+        project.ensure_history_dir(state_home).ok()
     }
 
     pub fn document(&self) -> &Document {
@@ -150,9 +209,26 @@ impl App {
         self.buffers[self.active].scroll_left
     }
 
+    /// O prefixo de sistema pendente (`Ctrl+t` → `"tempo"`), se
+    /// houver um esperando a próxima tecla — pra `ui.rs` mostrar a
+    /// dica na barra de status.
+    pub fn pending_system_prefix(&self) -> Option<&str> {
+        self.pending_system_prefix.as_deref()
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.overlay.is_some() {
+            self.handle_overlay_key(key);
+            return;
+        }
+
         if self.prompt.is_some() {
             self.handle_prompt_key(key);
+            return;
+        }
+
+        if let Some(prefix) = self.pending_system_prefix.take() {
+            self.handle_system_prefix_key(&prefix, key);
             return;
         }
 
@@ -171,25 +247,68 @@ impl App {
         }
     }
 
+    /// Enquanto um `Overlay` está ativo: `j`/`k` ou as setas rolam,
+    /// qualquer outra tecla (inclusive Esc) fecha.
+    fn handle_overlay_key(&mut self, key: KeyEvent) {
+        let Some(overlay) = &mut self.overlay else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => overlay.scroll = overlay.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => overlay.scroll = overlay.scroll.saturating_sub(1),
+            _ => self.overlay = None,
+        }
+    }
+
     /// Ctrl + tecla: a classe sistema (docs/keys.md §5.7), resolvida
     /// pelo keymap (`[system]` em `default.toml`), não mais escrita
-    /// direto aqui. `Quit` e `CloseBuffer` cuidam da própria
-    /// confirmação (gerenciam seus próprios campos de pendência, que
-    /// não devem ser limpos pela repetição da mesma tecla); os demais
-    /// limpam qualquer mensagem/confirmação pendente antes de agir.
+    /// direto aqui. Uma tecla pode resolver direto pra uma ação, ou
+    /// abrir um prefixo nomeado (`Ctrl+t`, "tempo") que espera mais
+    /// uma tecla — `handle_system_prefix_key` resolve essa.
     fn handle_system_key(&mut self, key: KeyEvent) {
         let Some(nas_key) = translate_key(key) else {
             return;
         };
+
+        if let Some(prefix) = self.modal.system_prefix(nas_key) {
+            self.pending_system_prefix = Some(prefix);
+            self.quit_confirm_pending = false;
+            self.close_confirm_pending = false;
+            self.status_message = None;
+            return;
+        }
+
         let Some(system_action) = self.modal.system_action(nas_key) else {
             return;
         };
+        self.dispatch_system_action(system_action);
+    }
 
-        if system_action == SystemAction::Quit {
+    /// A segunda tecla de um prefixo de sistema pendente (ex.: o `n`
+    /// de `Ctrl+t n`) — tecla fora da tabela do prefixo não faz nada,
+    /// como qualquer outro prefixo inválido (docs/keys.md §3, regra
+    /// 4). `pending_system_prefix` já foi consumido por quem chama
+    /// (`handle_key`) antes desta função ser chamada.
+    fn handle_system_prefix_key(&mut self, prefix: &str, key: KeyEvent) {
+        let Some(nas_key) = translate_key(key) else {
+            return;
+        };
+        let Some(action) = self.modal.system_prefix_action(prefix, nas_key) else {
+            return;
+        };
+        self.dispatch_system_action(action);
+    }
+
+    /// `Quit` e `CloseBuffer` cuidam da própria confirmação (campos
+    /// de pendência que não devem ser limpos pela repetição da mesma
+    /// tecla); os demais limpam qualquer mensagem/confirmação
+    /// pendente antes de agir.
+    fn dispatch_system_action(&mut self, action: SystemAction) {
+        if action == SystemAction::Quit {
             self.handle_quit_request();
             return;
         }
-        if system_action == SystemAction::CloseBuffer {
+        if action == SystemAction::CloseBuffer {
             self.close_buffer();
             return;
         }
@@ -198,10 +317,16 @@ impl App {
         self.close_confirm_pending = false;
         self.status_message = None;
 
-        match system_action {
+        match action {
             SystemAction::Save => self.save(),
             SystemAction::OpenFile => self.open_prompt(PromptKind::OpenFile),
             SystemAction::SwitchBuffer => self.open_prompt(PromptKind::SwitchBuffer),
+            SystemAction::CheckpointNew => self.open_prompt(PromptKind::CheckpointName),
+            SystemAction::CheckpointList => self.checkpoint_list(),
+            SystemAction::CheckpointDiff => self.checkpoint_diff(),
+            SystemAction::CheckpointRestore => self.open_prompt(PromptKind::RestoreCheckpoint),
+            SystemAction::CheckpointBlame => self.checkpoint_blame(),
+            SystemAction::HistoryDelete => self.open_prompt(PromptKind::DeleteHistoryConfirm),
             SystemAction::Quit | SystemAction::CloseBuffer => unreachable!(),
         }
     }
@@ -327,10 +452,26 @@ impl App {
         removed: String,
         inserted: String,
     ) {
+        let file = buffer_name(self.document());
+        self.journal_record_for(file, command, from, to, removed, inserted);
+    }
+
+    /// Como `journal_record`, mas pro arquivo `file` em vez do buffer
+    /// ativo — usado por `restore_file`, que pode afetar um arquivo
+    /// que não é o buffer atual (e, pros arquivos restaurados que não
+    /// estão abertos, nem é um buffer de verdade).
+    fn journal_record_for(
+        &mut self,
+        file: String,
+        command: &str,
+        from: usize,
+        to: usize,
+        removed: String,
+        inserted: String,
+    ) {
         if from == to && removed.is_empty() && inserted.is_empty() {
             return;
         }
-        let file = buffer_name(self.document());
         let Ok(mut guard) = self.history.lock() else {
             return;
         };
@@ -520,6 +661,9 @@ impl App {
             PromptKind::Search => {}
             PromptKind::SwitchBuffer => self.switch_buffer(&prompt.input),
             PromptKind::GotoLine => self.goto_line(&prompt.input),
+            PromptKind::CheckpointName => self.checkpoint_new(&prompt.input),
+            PromptKind::RestoreCheckpoint => self.restore_checkpoint(&prompt.input),
+            PromptKind::DeleteHistoryConfirm => self.confirm_delete_history(&prompt.input),
         }
     }
 
@@ -686,6 +830,441 @@ impl App {
             None => self.status_message = Some("Nada para desfazer.".to_string()),
         }
     }
+
+    /// `Ctrl+t n`: cria um checkpoint nomeado com o conteúdo atual dos
+    /// buffers abertos que têm um caminho (buffers `[sem nome]` não
+    /// entram — não há arquivo pra identificá-los entre checkpoints)
+    /// e que mudaram desde o checkpoint anterior (docs/decisions/0005
+    /// §4). Faz flush do journal antes, pra que
+    /// `changed_files_since_last_checkpoint` veja as edições mais
+    /// recentes.
+    fn checkpoint_new(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status_message = Some("Nenhum nome informado.".to_string());
+            return;
+        }
+        let Some(history_dir) = self.history_dir() else {
+            self.status_message = Some("Histórico não disponível.".to_string());
+            return;
+        };
+        self.flush_history();
+
+        let changed: HashSet<String> =
+            nas_history::changed_files_since_last_checkpoint(&history_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        let files: Vec<(String, Vec<u8>)> = self
+            .buffers
+            .iter()
+            .filter(|b| b.document.path().is_some())
+            .map(|b| {
+                (
+                    buffer_name(&b.document),
+                    b.document.full_text().into_bytes(),
+                )
+            })
+            .filter(|(path, _)| changed.contains(path))
+            .collect();
+
+        if files.is_empty() {
+            self.status_message = Some("Nada mudou desde o último checkpoint.".to_string());
+            return;
+        }
+
+        match nas_history::create_checkpoint(
+            &history_dir,
+            name,
+            Author::User,
+            nas_history::now_unix(),
+            false,
+            &files,
+        ) {
+            Ok(created) => self.status_message = Some(checkpoint_created_message(&created)),
+            Err(err) => self.status_message = Some(format!("Erro ao criar checkpoint: {err}")),
+        }
+    }
+
+    /// `Ctrl+t l`: lista os checkpoints do projeto, mais recente
+    /// primeiro, num `Overlay`.
+    fn checkpoint_list(&mut self) {
+        let Some(history_dir) = self.history_dir() else {
+            self.status_message = Some("Histórico não disponível.".to_string());
+            return;
+        };
+        match nas_history::list_checkpoints(&history_dir) {
+            Ok(checkpoints) if checkpoints.is_empty() => {
+                self.status_message = Some("Nenhum checkpoint ainda.".to_string());
+            }
+            Ok(checkpoints) => {
+                let lines = checkpoints
+                    .iter()
+                    .rev()
+                    .map(|c| {
+                        let kind = if c.automatic {
+                            "automático"
+                        } else {
+                            "nomeado"
+                        };
+                        format!(
+                            "{}  {} ({}, {} arquivo(s))",
+                            format_timestamp(c.created_at),
+                            c.name,
+                            kind,
+                            c.files.len()
+                        )
+                    })
+                    .collect();
+                self.overlay = Some(Overlay {
+                    title: "Checkpoints (mais recente primeiro) — qualquer tecla fecha".to_string(),
+                    lines,
+                    scroll: 0,
+                });
+            }
+            Err(err) => self.status_message = Some(format!("Erro ao listar checkpoints: {err}")),
+        }
+    }
+
+    /// `Ctrl+t e`: diff entre os dois checkpoints mais recentes, num
+    /// `Overlay`. Comparar dois checkpoints quaisquer (escolhidos pelo
+    /// usuário) fica pra quando houver uma lista navegável — por ora,
+    /// os dois últimos já cobrem o caso comum de revisar a última
+    /// tarefa.
+    fn checkpoint_diff(&mut self) {
+        let Some(history_dir) = self.history_dir() else {
+            self.status_message = Some("Histórico não disponível.".to_string());
+            return;
+        };
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap_or_default();
+        if checkpoints.len() < 2 {
+            self.status_message =
+                Some("É preciso pelo menos dois checkpoints pra comparar.".to_string());
+            return;
+        }
+        let from = &checkpoints[checkpoints.len() - 2];
+        let to = &checkpoints[checkpoints.len() - 1];
+        match nas_history::diff(&history_dir, &from.id, &to.id) {
+            Ok(diffs) => {
+                let mut lines = Vec::new();
+                for d in diffs.iter().filter(|d| d.change != FileChange::Unchanged) {
+                    lines.push(format!("=== {} ({:?}) ===", d.path, d.change));
+                    lines.extend(d.unified.lines().map(str::to_string));
+                    lines.push(String::new());
+                }
+                if lines.is_empty() {
+                    lines.push("Nenhuma diferença.".to_string());
+                }
+                self.overlay = Some(Overlay {
+                    title: format!("Diff: {} → {} — qualquer tecla fecha", from.name, to.name),
+                    lines,
+                    scroll: 0,
+                });
+            }
+            Err(err) => self.status_message = Some(format!("Erro ao gerar diff: {err}")),
+        }
+    }
+
+    /// `Ctrl+t a`: autoria (histórico de edições) do arquivo do
+    /// buffer ativo, num `Overlay` — ver `nas_history::file_history`.
+    fn checkpoint_blame(&mut self) {
+        let Some(history_dir) = self.history_dir() else {
+            self.status_message = Some("Histórico não disponível.".to_string());
+            return;
+        };
+        let file = buffer_name(self.document());
+        self.flush_history();
+        match nas_history::file_history(&history_dir, &file) {
+            Ok(entries) if entries.is_empty() => {
+                self.status_message = Some(format!("Nenhuma edição registrada para {file}."));
+            }
+            Ok(entries) => {
+                let lines = entries
+                    .iter()
+                    .rev()
+                    .map(|e| {
+                        format!(
+                            "{}  {}  {}  [{}, {})",
+                            format_timestamp(e.ts_start),
+                            format_author(&e.author),
+                            e.command,
+                            e.from,
+                            e.to
+                        )
+                    })
+                    .collect();
+                self.overlay = Some(Overlay {
+                    title: format!("Autoria: {file} — qualquer tecla fecha"),
+                    lines,
+                    scroll: 0,
+                });
+            }
+            Err(err) => self.status_message = Some(format!("Erro ao ler histórico: {err}")),
+        }
+    }
+
+    /// `Ctrl+t r`: restaura o checkpoint cujo nome (ou id) contém
+    /// `query` — o mais recente, se mais de um bater. Pede
+    /// confirmação (repetir com o mesmo `query`) se algum arquivo
+    /// afetado tiver um buffer aberto com alterações não salvas.
+    fn restore_checkpoint(&mut self, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            self.status_message = Some("Nenhum checkpoint informado.".to_string());
+            return;
+        }
+        let Some(history_dir) = self.history_dir() else {
+            self.status_message = Some("Histórico não disponível.".to_string());
+            return;
+        };
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap_or_default();
+        let Some(checkpoint) = checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.name.contains(query) || c.id.contains(query))
+        else {
+            self.status_message = Some(format!("Nenhum checkpoint encontrado para {query:?}."));
+            return;
+        };
+        let checkpoint = checkpoint.clone();
+
+        let unsaved: Vec<String> = self
+            .buffers
+            .iter()
+            .filter(|b| {
+                let name = buffer_name(&b.document);
+                b.document.is_modified() && checkpoint.files.iter().any(|f| f.path == name)
+            })
+            .map(|b| buffer_name(&b.document))
+            .collect();
+
+        if !unsaved.is_empty() && self.restore_confirm_pending.as_deref() != Some(&checkpoint.id) {
+            self.restore_confirm_pending = Some(checkpoint.id.clone());
+            self.status_message = Some(format!(
+                "{} têm alterações não salvas — Ctrl+t r de novo com o mesmo nome confirma.",
+                unsaved.join(", ")
+            ));
+            return;
+        }
+        self.restore_confirm_pending = None;
+
+        self.perform_restore(&history_dir, &checkpoint);
+    }
+
+    /// A restauração de verdade, depois de resolvida qualquer
+    /// confirmação: cria primeiro um checkpoint automático "antes de
+    /// restaurar" com o conteúdo atual dos mesmos arquivos (o que
+    /// torna a própria restauração desfazível — restaurar esse
+    /// checkpoint automático desfaz a restauração, sem nenhum código
+    /// separado), depois escreve o conteúdo de cada arquivo do
+    /// checkpoint — docs/decisions/0005 §7.
+    fn perform_restore(&mut self, history_dir: &Path, checkpoint: &CheckpointManifest) {
+        let pre_restore_files: Vec<(String, Vec<u8>)> = checkpoint
+            .files
+            .iter()
+            .filter_map(|f| {
+                let content = self.current_content_for(&f.path)?;
+                Some((f.path.clone(), content))
+            })
+            .collect();
+        if !pre_restore_files.is_empty() {
+            let name = format!("antes de restaurar {}", checkpoint.name);
+            let _ = nas_history::create_checkpoint(
+                history_dir,
+                &name,
+                Author::User,
+                nas_history::now_unix(),
+                true,
+                &pre_restore_files,
+            );
+        }
+
+        let mut restored = 0;
+        let mut skipped = Vec::new();
+        for file in &checkpoint.files {
+            let Some(hash) = &file.content_hash else {
+                skipped.push(file.path.clone());
+                continue;
+            };
+            let Ok(bytes) = nas_history::read_object(history_dir, hash) else {
+                skipped.push(file.path.clone());
+                continue;
+            };
+            let Ok(content) = String::from_utf8(bytes) else {
+                skipped.push(file.path.clone());
+                continue;
+            };
+            self.restore_file(&file.path, &content);
+            restored += 1;
+        }
+
+        self.flush_history();
+        self.status_message = Some(if skipped.is_empty() {
+            format!(
+                "Restaurado o checkpoint \"{}\" ({restored} arquivo(s)).",
+                checkpoint.name
+            )
+        } else {
+            format!(
+                "Restaurado o checkpoint \"{}\" ({restored} arquivo(s)); ficaram de fora (sem conteúdo guardado): {}.",
+                checkpoint.name,
+                skipped.join(", ")
+            )
+        });
+    }
+
+    /// O conteúdo atual de `path` — do buffer aberto, se houver um; senão,
+    /// do próprio arquivo em disco. `None` se não há buffer aberto e o
+    /// arquivo não existe (ou não pode ser lido) em disco.
+    fn current_content_for(&self, path: &str) -> Option<Vec<u8>> {
+        if let Some(buffer) = self
+            .buffers
+            .iter()
+            .find(|b| buffer_name(&b.document) == path)
+        {
+            return Some(buffer.document.full_text().into_bytes());
+        }
+        std::fs::read(path).ok()
+    }
+
+    /// Escreve `content` em `path`: se há um buffer aberto com esse
+    /// caminho, substitui o conteúdo dele (via `replace_all`, que
+    /// entra no desfazer por tecla do buffer) e salva; senão, abre o
+    /// arquivo como um `Document` descartável só pra escrever —
+    /// restaurar afeta o arquivo, não só um buffer que porventura
+    /// esteja aberto. Em ambos os casos, salvar também grava o
+    /// arquivo em disco de uma vez, sem deixar o resultado "só na
+    /// memória". Journala como `"restore-checkpoint"`.
+    fn restore_file(&mut self, path: &str, content: &str) {
+        if let Some(index) = self
+            .buffers
+            .iter()
+            .position(|b| buffer_name(&b.document) == path)
+        {
+            let change = self.buffers[index].document.replace_all(content);
+            let _ = self.buffers[index].document.save();
+            self.journal_record_for(
+                path.to_string(),
+                "restore-checkpoint",
+                change.from,
+                change.to,
+                change.removed,
+                change.inserted,
+            );
+            return;
+        }
+        if let Ok(mut doc) = Document::open(path) {
+            let change = doc.replace_all(content);
+            let _ = doc.save();
+            self.journal_record_for(
+                path.to_string(),
+                "restore-checkpoint",
+                change.from,
+                change.to,
+                change.removed,
+                change.inserted,
+            );
+        }
+    }
+
+    /// `Ctrl+t z`: apaga o histórico do projeto inteiro — só se
+    /// `input` for exatamente "apagar" (docs/decisions/0005 §5). Reabre
+    /// um journal novo na pasta recriada, pra que edições seguintes
+    /// continuem sendo registradas.
+    fn confirm_delete_history(&mut self, input: &str) {
+        let Some(history_dir) = self.history_dir() else {
+            self.status_message = Some("Histórico não disponível.".to_string());
+            return;
+        };
+        match nas_history::delete_project_history(&history_dir, input.trim()) {
+            Ok(()) => {
+                self.status_message = Some("Histórico apagado.".to_string());
+                // `delete_project_history` removeu a pasta inteira —
+                // `history_dir()` de novo a recria (ensure_history_dir
+                // é idempotente) antes de abrir o journal nela.
+                if let Some(recreated) = self.history_dir()
+                    && let Ok(journal) = Journal::open(&recreated)
+                    && let Ok(mut guard) = self.history.lock()
+                {
+                    *guard = Some(journal);
+                }
+            }
+            Err(_) => {
+                self.status_message =
+                    Some("Confirmação incorreta — histórico não foi apagado.".to_string());
+            }
+        }
+    }
+}
+
+/// Mensagem de status pra um checkpoint recém-criado — avisa quais
+/// arquivos ficaram de fora de `objects/` (grandes demais ou
+/// não-UTF8), se algum (docs/decisions/0005 §5: "nunca falha
+/// silenciosamente nem finge que o checkpoint capturou tudo").
+fn checkpoint_created_message(created: &nas_history::CreatedCheckpoint) -> String {
+    if created.excluded.is_empty() {
+        return format!(
+            "Checkpoint \"{}\" criado com {} arquivo(s).",
+            created.manifest.name,
+            created.manifest.files.len()
+        );
+    }
+    let excluded: Vec<String> = created
+        .excluded
+        .iter()
+        .map(|e| {
+            let reason = match e.reason {
+                ExcludedReason::TooLarge => "grande demais",
+                ExcludedReason::NotUtf8 => "não-UTF8",
+            };
+            format!("{} ({reason})", e.path)
+        })
+        .collect();
+    format!(
+        "Checkpoint \"{}\" criado; ficaram de fora do conteúdo: {}.",
+        created.manifest.name,
+        excluded.join(", ")
+    )
+}
+
+/// Nome de exibição de um autor, pra autoria legível no terminal.
+fn format_author(author: &Author) -> String {
+    match author {
+        Author::User => "você".to_string(),
+        Author::Ai { agent, .. } => format!("IA ({agent})"),
+        Author::Extension { name } => format!("extensão ({name})"),
+        Author::External => "externo".to_string(),
+    }
+}
+
+/// `secs` (desde a época Unix, UTC) como `AAAA-MM-DD HH:MM:SS` —
+/// implementado sem nenhuma dependência de data (a única nova que
+/// docs/decisions/0005 autoriza é `similar`, em `nas-history`, pro
+/// diff de linhas). O algoritmo (`civil_from_days`) é o de Howard
+/// Hinnant pra converter dias desde a época em ano/mês/dia
+/// proléptico-gregoriano, amplamente reproduzido e verificado.
+fn format_timestamp(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let secs_of_day = secs % 86400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
 }
 
 fn verb_label(verb: Verb) -> &'static str {
@@ -771,6 +1350,7 @@ mod tests {
     use super::*;
     use nas_editor::Document;
     use ratatui::crossterm::event::KeyEvent;
+    use std::fs;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1454,6 +2034,39 @@ mod tests {
         app.attach_history(Arc::new(Mutex::new(Some(journal))));
     }
 
+    /// Como `attached_history`, mas também liga o projeto (necessário
+    /// pros comandos de checkpoint, que precisam de `history_dir()` —
+    /// não só do journal) — devolve a pasta de histórico de verdade,
+    /// pra quem testa ler os checkpoints direto por `nas_history`.
+    fn attached_full_history(
+        app: &mut App,
+        project_dir: &std::path::Path,
+        state_home_dir: &std::path::Path,
+    ) -> PathBuf {
+        let project = ProjectId::discover(project_dir).expect("descobrir projeto");
+        let history_dir = project
+            .ensure_history_dir(state_home_dir)
+            .expect("criar pasta de histórico");
+        let journal = Journal::open(&history_dir).expect("abrir journal");
+        app.attach_history(Arc::new(Mutex::new(Some(journal))));
+        app.attach_project(project, state_home_dir.to_path_buf());
+        history_dir
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn format_timestamp_bate_com_datas_conhecidas() {
+        // conferido com `date -u -d @<segundos>`.
+        assert_eq!(format_timestamp(0), "1970-01-01 00:00:00");
+        assert_eq!(format_timestamp(1_609_459_200), "2021-01-01 00:00:00");
+        assert_eq!(format_timestamp(1_732_000_000), "2024-11-19 07:06:40");
+    }
+
     fn journal_entries(dir: &std::path::Path) -> Vec<nas_history::JournalEntry> {
         nas_history::read_entries(&nas_history::journal_path(dir)).expect("ler journal")
     }
@@ -1520,5 +2133,288 @@ mod tests {
             entries.iter().any(|e| e.command == "delete:word-forward"),
             "entradas: {entries:?}"
         );
+    }
+
+    #[test]
+    fn ctrl_t_n_cria_checkpoint_com_buffers_abertos_que_mudaram() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("arquivo.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "ola mundo");
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(
+            app.prompt.as_ref().unwrap().kind,
+            PromptKind::CheckpointName
+        );
+        type_str(&mut app, "meu-checkpoint");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            app.status_message.as_ref().unwrap().contains("criado"),
+            "{:?}",
+            app.status_message
+        );
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].files.len(), 1);
+        assert_eq!(checkpoints[0].files[0].path, file_path.to_str().unwrap());
+    }
+
+    #[test]
+    fn ctrl_t_n_sem_nada_mudado_nao_cria_checkpoint() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        // o único buffer é "[sem nome]" (sem caminho) — não entra em
+        // nenhum checkpoint.
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "cp");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            nas_history::list_checkpoints(&history_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ctrl_t_l_mostra_overlay_com_checkpoints_e_qualquer_tecla_fecha() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("arquivo.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "ola");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "primeiro");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('l')));
+        let overlay = app.overlay.as_ref().expect("deveria ter aberto o overlay");
+        assert!(overlay.lines.iter().any(|l| l.contains("primeiro")));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn ctrl_t_e_mostra_diff_entre_os_dois_ultimos_checkpoints() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("arquivo.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "versao um");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "cp1");
+        app.handle_key(key(KeyCode::Enter));
+
+        type_text(&mut app, " e dois");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "cp2");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('e')));
+        let overlay = app.overlay.as_ref().expect("deveria ter aberto o overlay");
+        assert!(overlay.lines.iter().any(|l| l.contains("dois")));
+    }
+
+    #[test]
+    fn ctrl_t_a_mostra_autoria_do_arquivo_atual() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("arquivo.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "ola");
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('a')));
+        let overlay = app.overlay.as_ref().expect("deveria ter aberto o overlay");
+        assert!(overlay.lines.iter().any(|l| l.contains("você")));
+        assert!(overlay.lines.iter().any(|l| l.contains("insert")));
+    }
+
+    #[test]
+    fn ctrl_t_r_com_alteracoes_nao_salvas_pede_confirmacao_e_repetir_restaura() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("arquivo.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "versao um");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "estavel");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('a'))); // d a: primeiro apaga tudo (pede confirmação própria)
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('a'))); // confirma
+        type_text(&mut app, "quebrado"); // buffer agora tem alterações não salvas
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, "estavel");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            text(&app),
+            "quebrado",
+            "a primeira tentativa deveria só avisar, sem restaurar ainda"
+        );
+        assert!(app.status_message.as_ref().unwrap().contains("Ctrl+t r"));
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, "estavel");
+        app.handle_key(key(KeyCode::Enter)); // repete com o mesmo nome: confirma
+
+        assert_eq!(text(&app), "versao um");
+        assert!(!app.document().is_modified(), "restaurar também salva");
+
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap();
+        assert!(
+            checkpoints
+                .iter()
+                .any(|c| c.automatic && c.name.contains("antes de restaurar")),
+            "deveria ter criado um checkpoint automático antes de restaurar: {checkpoints:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "versao um",
+            "restaurar também escreve o arquivo em disco"
+        );
+    }
+
+    #[test]
+    fn restaurar_tambem_afeta_arquivo_que_nao_esta_aberto_como_buffer() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("fechado.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "conteudo original");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "cp");
+        app.handle_key(key(KeyCode::Enter));
+
+        // salva (criar o checkpoint não limpa "alterações não
+        // salvas") e fecha o buffer, depois muda o arquivo em disco
+        // por fora do nas.
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+        app.handle_key(ctrl_key(KeyCode::Char('k')));
+        assert_eq!(app.buffers.len(), 1);
+        fs::write(&file_path, "mudou por fora").unwrap();
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, "cp");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "conteudo original");
+    }
+
+    #[test]
+    fn ctrl_t_z_exige_a_confirmacao_exata_antes_de_apagar() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("arquivo.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "ola");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "cp");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            nas_history::list_checkpoints(&history_dir).unwrap().len(),
+            1
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(
+            app.prompt.as_ref().unwrap().kind,
+            PromptKind::DeleteHistoryConfirm
+        );
+        type_str(&mut app, "sim, apagar");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            nas_history::list_checkpoints(&history_dir).unwrap().len(),
+            1,
+            "confirmação errada não deveria ter apagado nada"
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('z')));
+        type_str(&mut app, "apagar");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            nas_history::list_checkpoints(&history_dir)
+                .unwrap()
+                .is_empty()
+        );
+
+        // o histórico continua funcionando depois de apagado — o
+        // journal foi reaberto numa pasta recriada.
+        type_text(&mut app, "mais texto");
+        app.flush_history();
+        let entries = journal_entries(&history_dir);
+        assert!(!entries.is_empty(), "o journal deveria ter sido reaberto");
     }
 }

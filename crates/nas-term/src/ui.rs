@@ -10,10 +10,16 @@ use ratatui::widgets::Paragraph;
 
 use nas_keys::PendingHint;
 
-use crate::app::{App, PromptKind, buffer_name};
+use crate::app::{App, Overlay, PromptKind, buffer_name};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = frame.area();
+
+    if let Some(overlay) = &app.overlay {
+        draw_overlay(frame, root, overlay);
+        return;
+    }
+
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(root);
     let text_area = rows[0];
     let status_area = rows[1];
@@ -34,6 +40,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         place_cursor(frame, content_area, app);
     }
+}
+
+/// Uma visualização somente-leitura (diff, lista de checkpoints,
+/// autoria) ocupa a tela inteira, com o título em destaque — ver
+/// `App::overlay`, `Overlay`. `scroll` rola o texto verticalmente.
+fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
+    let mut lines = vec![Line::from(Span::styled(
+        overlay.title.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(overlay.lines.iter().map(|line| Line::from(line.clone())));
+    frame.render_widget(Paragraph::new(lines).scroll((overlay.scroll, 0)), area);
 }
 
 fn visible_line_range(app: &App, height: usize) -> std::ops::Range<usize> {
@@ -81,6 +99,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     if let Some(message) = &app.status_message {
         frame.render_widget(Paragraph::new(message.clone()).style(style), area);
+        return;
+    }
+
+    if let Some(prefix) = app.pending_system_prefix() {
+        let hint = app.modal.system_prefix_hint(prefix);
+        frame.render_widget(Paragraph::new(hint_text(hint)).style(style), area);
         return;
     }
 
@@ -238,6 +262,11 @@ fn prompt_label(app: &App, kind: PromptKind) -> String {
                 .map(|buffer| buffer_name(&buffer.document))
                 .collect();
             format!("Trocar buffer ({})", names.join(", "))
+        }
+        PromptKind::CheckpointName => "Nome do checkpoint".to_string(),
+        PromptKind::RestoreCheckpoint => "Restaurar checkpoint (nome ou id)".to_string(),
+        PromptKind::DeleteHistoryConfirm => {
+            "Apagar todo o histórico do projeto — digite \"apagar\" para confirmar".to_string()
         }
     }
 }
