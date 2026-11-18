@@ -6,15 +6,15 @@
 //! caracteres). `nas-term` é quem chama esta crate, do mesmo jeito
 //! que já chama as outras duas (ADR 0005 §9).
 //!
-//! ## Escopo desta etapa (2b)
+//! ## Escopo desta etapa (2c)
 //!
-//! Autoria (`Author`) e o journal vêm da etapa 2a, já ligados ao
-//! `nas-editor`/`nas-term`. Esta etapa acrescenta checkpoints do
-//! projeto: armazenamento por conteúdo (`objects/`, deduplicado),
-//! limite de tamanho por arquivo com aviso dos excluídos, poda (por
-//! quantidade e por tamanho total, nunca removendo um nomeado) e
-//! apagar o histórico do projeto, com confirmação. Diff e restauração
-//! (e as teclas `Ctrl+t`) ainda não existem — vêm na etapa 2c.
+//! Autoria, journal (2a) e checkpoints com poda (2b) já existem.
+//! Esta etapa acrescenta diff entre checkpoints (via a crate
+//! `similar`) e uma listagem de autoria por arquivo
+//! (`file_history`) — ligados ao `nas-term` pelas teclas `Ctrl+t`
+//! (prefixo "tempo") e pela restauração de um checkpoint, via
+//! `nas_editor::Document::replace_all`. Detecção de mudança externa
+//! (`Author::External`) fica pra etapa 2d.
 
 mod author;
 mod checkpoint;
@@ -24,9 +24,9 @@ mod project;
 pub use author::Author;
 pub use checkpoint::{
     CheckpointFile, CheckpointManifest, CreatedCheckpoint, ExcludedFile, ExcludedReason,
-    MAX_AUTOMATIC_CHECKPOINTS, MAX_FILE_SIZE, MAX_TOTAL_SIZE_BYTES, PruneReport,
-    changed_files_since_last_checkpoint, create as create_checkpoint, list as list_checkpoints,
-    prune, prune_with_limits,
+    FileChange, FileDiff, MAX_AUTOMATIC_CHECKPOINTS, MAX_FILE_SIZE, MAX_TOTAL_SIZE_BYTES,
+    PruneReport, changed_files_since_last_checkpoint, create as create_checkpoint, diff,
+    list as list_checkpoints, prune, prune_with_limits, read_object,
 };
-pub use journal::{Journal, JournalEntry, journal_path, now_unix, read_entries};
+pub use journal::{Journal, JournalEntry, file_history, journal_path, now_unix, read_entries};
 pub use project::{ProjectId, delete_project_history, state_home};

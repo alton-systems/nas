@@ -227,6 +227,139 @@ pub fn changed_files_since_last_checkpoint(history_dir: &Path) -> io::Result<Vec
     Ok(files)
 }
 
+/// Lê o conteúdo de um objeto pelo hash — o mesmo conteúdo gravado
+/// por [`create`], endereçado em `objects/<hash>`.
+pub fn read_object(history_dir: &Path, hash: &str) -> io::Result<Vec<u8>> {
+    fs::read(objects_dir(history_dir).join(hash))
+}
+
+/// Como um arquivo mudou entre dois checkpoints — docs/decisions/0005
+/// §7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    Added,
+    Removed,
+    Modified,
+    Unchanged,
+}
+
+/// O diff de um arquivo entre dois checkpoints. `unified` é o diff de
+/// linhas no formato unificado comum (via a crate `similar`); vazio
+/// quando `change` é `Unchanged`, ou quando o conteúdo de um dos lados
+/// não está disponível (arquivo excluído de `objects/` por ser grande
+/// demais ou não-UTF8 — docs/decisions/0005 §5).
+#[derive(Debug, Clone)]
+pub struct FileDiff {
+    pub path: String,
+    pub change: FileChange,
+    pub unified: String,
+}
+
+/// Diff entre dois checkpoints (`from_id`, `to_id`, como em
+/// [`CheckpointManifest::id`]): para cada caminho presente em
+/// qualquer um dos dois, compara o conteúdo guardado em `objects/` —
+/// ou a ausência, se o arquivo só existe num dos dois. Erro se
+/// `from_id` ou `to_id` não existir entre os checkpoints do projeto.
+pub fn diff(history_dir: &Path, from_id: &str, to_id: &str) -> io::Result<Vec<FileDiff>> {
+    let manifests = list(history_dir)?;
+    let find = |id: &str| -> io::Result<CheckpointManifest> {
+        manifests
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("checkpoint não encontrado: {id}"),
+                )
+            })
+    };
+    let from = find(from_id)?;
+    let to = find(to_id)?;
+
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for f in from.files.iter().chain(to.files.iter()) {
+        if seen.insert(f.path.clone()) {
+            paths.push(f.path.clone());
+        }
+    }
+    paths.sort();
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let from_file = from.files.iter().find(|f| f.path == path);
+            let to_file = to.files.iter().find(|f| f.path == path);
+            diff_file(history_dir, &path, from_file, to_file)
+        })
+        .collect()
+}
+
+fn diff_file(
+    history_dir: &Path,
+    path: &str,
+    from: Option<&CheckpointFile>,
+    to: Option<&CheckpointFile>,
+) -> io::Result<FileDiff> {
+    match (from, to) {
+        (None, Some(t)) => {
+            let content = read_file_text(history_dir, t)?;
+            Ok(FileDiff {
+                path: path.to_string(),
+                change: FileChange::Added,
+                unified: unified_text(path, "", &content),
+            })
+        }
+        (Some(f), None) => {
+            let content = read_file_text(history_dir, f)?;
+            Ok(FileDiff {
+                path: path.to_string(),
+                change: FileChange::Removed,
+                unified: unified_text(path, &content, ""),
+            })
+        }
+        (Some(f), Some(t)) => {
+            if f.content_hash == t.content_hash {
+                return Ok(FileDiff {
+                    path: path.to_string(),
+                    change: FileChange::Unchanged,
+                    unified: String::new(),
+                });
+            }
+            let old = read_file_text(history_dir, f)?;
+            let new = read_file_text(history_dir, t)?;
+            Ok(FileDiff {
+                path: path.to_string(),
+                change: FileChange::Modified,
+                unified: unified_text(path, &old, &new),
+            })
+        }
+        (None, None) => unreachable!("todo caminho vem de um dos dois manifestos"),
+    }
+}
+
+/// O conteúdo de um `CheckpointFile` como texto — vazio se ele não
+/// tem `content_hash` (excluído de `objects/`, grande demais ou
+/// não-UTF8): não há o que comparar nesse caso, então o diff mostra o
+/// arquivo como tendo mudado, sem linhas de conteúdo.
+fn read_file_text(history_dir: &Path, file: &CheckpointFile) -> io::Result<String> {
+    match &file.content_hash {
+        Some(hash) => {
+            let bytes = read_object(history_dir, hash)?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        None => Ok(String::new()),
+    }
+}
+
+fn unified_text(path: &str, old: &str, new: &str) -> String {
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
+}
+
 /// Poda com os limites padrão (`MAX_AUTOMATIC_CHECKPOINTS`,
 /// `MAX_TOTAL_SIZE_BYTES`) — ver [`prune_with_limits`].
 pub fn prune(history_dir: &Path) -> io::Result<PruneReport> {
@@ -471,6 +604,65 @@ mod tests {
     fn list_sem_nenhum_checkpoint_e_vazia() {
         let dir = tempfile::tempdir().unwrap();
         assert!(list(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_detecta_adicionado_removido_modificado_e_inalterado() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = [
+            file("modificado.txt", "linha um\nlinha dois\n"),
+            file("removido.txt", "vai sair\n"),
+            file("igual.txt", "nunca muda\n"),
+        ];
+        let after = [
+            file("modificado.txt", "linha um\nlinha dois mudou\n"),
+            file("adicionado.txt", "chegou agora\n"),
+            file("igual.txt", "nunca muda\n"),
+        ];
+        let from = create(dir.path(), "antes", Author::User, 100, false, &before).unwrap();
+        let to = create(dir.path(), "depois", Author::User, 200, false, &after).unwrap();
+
+        let diffs = diff(dir.path(), &from.manifest.id, &to.manifest.id).unwrap();
+        let find = |path: &str| diffs.iter().find(|d| d.path == path).unwrap();
+
+        assert_eq!(find("adicionado.txt").change, FileChange::Added);
+        assert!(find("adicionado.txt").unified.contains("chegou agora"));
+
+        assert_eq!(find("removido.txt").change, FileChange::Removed);
+        assert!(find("removido.txt").unified.contains("vai sair"));
+
+        assert_eq!(find("modificado.txt").change, FileChange::Modified);
+        assert!(find("modificado.txt").unified.contains("linha dois mudou"));
+
+        assert_eq!(find("igual.txt").change, FileChange::Unchanged);
+        assert!(find("igual.txt").unified.is_empty());
+    }
+
+    #[test]
+    fn diff_com_checkpoint_inexistente_e_erro() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = create(dir.path(), "cp", Author::User, 100, false, &[]).unwrap();
+
+        let err = diff(dir.path(), &cp.manifest.id, "999-fantasma").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_object_le_o_conteudo_gravado_por_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = create(
+            dir.path(),
+            "cp",
+            Author::User,
+            100,
+            false,
+            &[file("a.txt", "conteudo")],
+        )
+        .unwrap();
+        let hash = created.manifest.files[0].content_hash.as_ref().unwrap();
+
+        let bytes = read_object(dir.path(), hash).unwrap();
+        assert_eq!(bytes, b"conteudo");
     }
 
     fn record(journal: &mut Journal, now: u64, file: &str, pos: usize) {
