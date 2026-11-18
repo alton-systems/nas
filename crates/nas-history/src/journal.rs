@@ -225,6 +225,20 @@ pub fn journal_path(history_dir: &Path) -> PathBuf {
     history_dir.join("journal.jsonl")
 }
 
+/// As entradas do journal de `file`, em ordem cronológica (a mais
+/// antiga primeiro) — a "autoria" de `Ctrl+t a`
+/// (docs/decisions/0005 §8): quem tocou aquele arquivo, quando e por
+/// qual comando. Uma listagem cronológica, não uma reconstrução de
+/// autoria por linha — como o journal guarda posições em caracteres
+/// (não linhas) num dado momento, dizer com certeza "quem é o autor
+/// da linha N de hoje" exigiria reconstruir o texto inteiro replicando
+/// toda edição desde o início; a listagem já responde à pergunta que
+/// importa ("quem editou isto, e quando") sem esse custo.
+pub fn file_history(history_dir: &Path, file: &str) -> io::Result<Vec<JournalEntry>> {
+    let entries = read_entries(&journal_path(history_dir))?;
+    Ok(entries.into_iter().filter(|e| e.file == file).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +495,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entries = read_entries(&journal_path(dir.path())).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn file_history_so_traz_entradas_do_arquivo_pedido_em_ordem_cronologica() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path()).unwrap();
+        user_entry(&mut journal, 100, "insert", 0, 0, "", "a");
+        journal
+            .record(200, Author::User, "insert", "outro.txt", 0, 0, "", "x")
+            .unwrap();
+        user_entry(&mut journal, 300, "insert", 1, 1, "", "b");
+        journal.flush(300).unwrap();
+
+        let entries = file_history(dir.path(), "arquivo.txt").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].ts_start, 100);
+        assert_eq!(entries[1].ts_start, 300);
+        assert!(entries.iter().all(|e| e.file == "arquivo.txt"));
+    }
+
+    #[test]
+    fn file_history_sem_nenhuma_entrada_e_vazia() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path()).unwrap();
+        user_entry(&mut journal, 100, "insert", 0, 0, "", "a");
+        journal.flush(100).unwrap();
+
+        assert!(
+            file_history(dir.path(), "nunca-tocado.txt")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
