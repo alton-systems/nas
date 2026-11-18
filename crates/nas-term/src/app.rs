@@ -5,10 +5,21 @@
 //! aqui, antes de chegar à máquina de estados. Ver docs/keys.md.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use nas_editor::{Document, OpenError, RegionObject};
+use nas_history::{Author, Journal};
 use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, SystemAction, Verb};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// O journal de histórico, compartilhado com o panic hook de
+/// `main.rs` (ver `install_panic_hook`) — pra que um pânico também
+/// force o flush do que ainda estiver pendente, não só os caminhos
+/// normais (Ctrl+Q, Ctrl+K, Ctrl+S). `None` enquanto não há projeto
+/// identificado ou o journal não pôde ser aberto; todos os testes
+/// deste módulo usam esse caso, então editam normalmente sem
+/// journalar nada.
+pub type SharedJournal = Arc<Mutex<Option<Journal>>>;
 
 /// Um buffer aberto: o documento mais o estado de rolagem que é dele,
 /// não da aplicação como um todo (voltar a um buffer deveria mostrar
@@ -88,6 +99,8 @@ pub struct App {
     /// a área de transferência do sistema é E/S de verdade, que `App`
     /// não faz sozinho.
     pub pending_paste: bool,
+    /// Journal de histórico do projeto — ver [`SharedJournal`].
+    history: SharedJournal,
 }
 
 impl App {
@@ -107,7 +120,18 @@ impl App {
             clipboard: String::new(),
             pending_clipboard_write: None,
             pending_paste: false,
+            history: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Liga este `App` a um journal de histórico compartilhado — o
+    /// mesmo `Arc` que `main.rs` guarda pro panic hook, pra que um
+    /// pânico também force o flush do que ainda estiver pendente.
+    /// Sem chamar isto (como em todos os testes deste módulo), a
+    /// edição segue funcionando normalmente, só sem registrar nada no
+    /// histórico.
+    pub fn attach_history(&mut self, history: SharedJournal) {
+        self.history = history;
     }
 
     pub fn document(&self) -> &Document {
@@ -205,11 +229,29 @@ impl App {
             Action::MoveWordBackward => self.document_mut().move_word_backward(),
             Action::MoveParagraphForward => self.document_mut().move_paragraph_forward(),
             Action::MoveParagraphBackward => self.document_mut().move_paragraph_backward(),
-            Action::DeleteForward => self.document_mut().delete_forward(),
-            Action::DeleteBackward => self.document_mut().delete_backward(),
+            Action::DeleteForward => {
+                let (from, to) = self.document().region_for(RegionObject::CharRight);
+                let removed = self.document().text_in(from, to);
+                self.document_mut().delete_forward();
+                self.journal_record("delete-forward", from, to, removed, String::new());
+            }
+            Action::DeleteBackward => {
+                let (from, to) = self.document().region_for(RegionObject::CharLeft);
+                let removed = self.document().text_in(from, to);
+                self.document_mut().delete_backward();
+                self.journal_record("delete-backward", from, to, removed, String::new());
+            }
             Action::Undo => self.undo(),
-            Action::InsertChar(c) => self.document_mut().insert_char(c),
-            Action::InsertNewline => self.document_mut().insert_newline(),
+            Action::InsertChar(c) => {
+                let from = self.document().cursor_offset();
+                self.document_mut().insert_char(c);
+                self.journal_record("insert", from, from, String::new(), c.to_string());
+            }
+            Action::InsertNewline => {
+                let from = self.document().cursor_offset();
+                self.document_mut().insert_newline();
+                self.journal_record("insert", from, from, String::new(), "\n".to_string());
+            }
             Action::PromptSearch => {
                 let origin = self.document().cursor_offset();
                 self.prompt = Some(Prompt {
@@ -223,7 +265,7 @@ impl App {
             Action::SelectAll => self.document_mut().select_all(),
             Action::Copy => self.copy(),
             Action::Cut => self.cut(),
-            Action::DeleteSelection => self.document_mut().delete_selection(),
+            Action::DeleteSelection => self.delete_selection_action(),
             Action::Paste => self.pending_paste = true,
             Action::VerbObject(verb, object) => self.apply_verb_object(verb, object),
             Action::ClearSelection => self.document_mut().clear_selection(),
@@ -264,8 +306,60 @@ impl App {
             }
             Verb::Delete | Verb::Cut => {
                 let text = self.document_mut().delete_region(from, to);
+                let command = format!("{}:{}", verb.command_name(), object.command_name());
+                self.journal_record(&command, from, to, text.clone(), String::new());
                 self.write_clipboard_if_nonempty(text);
             }
+        }
+    }
+
+    /// Registra uma mudança no journal de histórico do projeto, com
+    /// `Author::User` — toda transação que o `nas-editor` aplica passa
+    /// por aqui, incluindo o desfazer (docs/decisions/0005 §1). Não
+    /// faz nada se não houver journal ligado (`attach_history` nunca
+    /// chamado, como em todos os testes deste módulo) ou se a mudança
+    /// não alterou nada (`from == to` e nada removido/inserido).
+    fn journal_record(
+        &mut self,
+        command: &str,
+        from: usize,
+        to: usize,
+        removed: String,
+        inserted: String,
+    ) {
+        if from == to && removed.is_empty() && inserted.is_empty() {
+            return;
+        }
+        let file = buffer_name(self.document());
+        let Ok(mut guard) = self.history.lock() else {
+            return;
+        };
+        let Some(journal) = guard.as_mut() else {
+            return;
+        };
+        let now = nas_history::now_unix();
+        let _ = journal.record(
+            now,
+            Author::User,
+            command.to_string(),
+            file,
+            from,
+            to,
+            removed,
+            inserted,
+        );
+    }
+
+    /// Força o flush do journal de histórico — chamado nos pontos em
+    /// que o nas pode terminar ou perder o buffer em memória: sair
+    /// (Ctrl+Q), fechar um buffer (Ctrl+K) e salvar (Ctrl+S). Um
+    /// pânico também força o flush, via o mesmo `Arc` compartilhado
+    /// com o panic hook de `main.rs`.
+    fn flush_history(&mut self) {
+        if let Ok(mut guard) = self.history.lock()
+            && let Some(journal) = guard.as_mut()
+        {
+            let _ = journal.flush(nas_history::now_unix());
         }
     }
 
@@ -302,10 +396,24 @@ impl App {
     }
 
     fn cut(&mut self) {
-        if let Some(text) = self.document().selected_text() {
-            self.write_clipboard_if_nonempty(text);
-        }
+        let Some((from, to)) = self.document().selection_range() else {
+            return;
+        };
+        let text = self.document().selected_text().unwrap_or_default();
         self.document_mut().delete_selection();
+        self.journal_record("cut", from, to, text.clone(), String::new());
+        self.write_clipboard_if_nonempty(text);
+    }
+
+    /// Apaga a seleção agora, sem tocar na área de transferência — `d`
+    /// com uma seleção ativa (docs/keys.md §4.2).
+    fn delete_selection_action(&mut self) {
+        let Some((from, to)) = self.document().selection_range() else {
+            return;
+        };
+        let removed = self.document().selected_text().unwrap_or_default();
+        self.document_mut().delete_selection();
+        self.journal_record("delete", from, to, removed, String::new());
     }
 
     /// Insere `text` no documento, caractere a caractere — exceto
@@ -316,16 +424,25 @@ impl App {
     fn paste_text(&mut self, text: &str) {
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
-            match c {
-                '\n' => self.document_mut().insert_newline(),
+            let from = self.document().cursor_offset();
+            let inserted = match c {
+                '\n' => {
+                    self.document_mut().insert_newline();
+                    "\n".to_string()
+                }
                 '\r' => {
                     if chars.peek() == Some(&'\n') {
                         chars.next();
                     }
                     self.document_mut().insert_newline();
+                    "\n".to_string()
                 }
-                _ => self.document_mut().insert_char(c),
-            }
+                _ => {
+                    self.document_mut().insert_char(c);
+                    c.to_string()
+                }
+            };
+            self.journal_record("paste", from, from, String::new(), inserted);
         }
     }
 
@@ -502,6 +619,7 @@ impl App {
         } else if self.active >= self.buffers.len() {
             self.active = self.buffers.len() - 1;
         }
+        self.flush_history();
     }
 
     /// Ajusta a rolagem do buffer ativo para que o cursor fique visível
@@ -537,6 +655,7 @@ impl App {
 
         if modified.is_empty() || self.quit_confirm_pending {
             self.should_quit = true;
+            self.flush_history();
             return;
         }
         self.quit_confirm_pending = true;
@@ -552,11 +671,19 @@ impl App {
             Ok(false) => "Sem nome de arquivo; nada para salvar.".to_string(),
             Err(err) => format!("Erro ao salvar: {err}"),
         });
+        self.flush_history();
     }
 
     fn undo(&mut self) {
-        if !self.document_mut().undo() {
-            self.status_message = Some("Nada para desfazer.".to_string());
+        match self.document_mut().undo() {
+            Some(change) => self.journal_record(
+                "undo",
+                change.from,
+                change.to,
+                change.removed,
+                change.inserted,
+            ),
+            None => self.status_message = Some("Nada para desfazer.".to_string()),
         }
     }
 }
@@ -1320,5 +1447,78 @@ mod tests {
         // antes).
         app.handle_key(key(KeyCode::Char('.'))); // repete na posição atual
         assert_eq!(text(&app), " bom");
+    }
+
+    fn attached_history(app: &mut App, dir: &std::path::Path) {
+        let journal = Journal::open(dir).expect("abrir journal");
+        app.attach_history(Arc::new(Mutex::new(Some(journal))));
+    }
+
+    fn journal_entries(dir: &std::path::Path) -> Vec<nas_history::JournalEntry> {
+        nas_history::read_entries(&nas_history::journal_path(dir)).expect("ler journal")
+    }
+
+    #[test]
+    fn editar_e_sair_grava_no_journal_com_autor_e_comando() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_history(&mut app, dir.path());
+
+        type_text(&mut app, "ola");
+
+        app.handle_key(ctrl_key(KeyCode::Char('q'))); // alterações pendentes: só avisa
+        assert!(!app.should_quit);
+        app.handle_key(ctrl_key(KeyCode::Char('q'))); // confirma: sai e força o flush
+
+        assert!(app.should_quit);
+        let entries = journal_entries(dir.path());
+        assert!(
+            !entries.is_empty(),
+            "a edição deveria ter chegado ao journal ao sair"
+        );
+        assert!(entries.iter().all(|e| e.author == Author::User));
+        assert!(
+            entries.iter().any(|e| e.inserted.contains('o')),
+            "entradas: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn desfazer_tambem_e_journalado_como_autor_user() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_history(&mut app, dir.path());
+
+        type_text(&mut app, "ab");
+        app.handle_key(key(KeyCode::Char('u'))); // desfaz a digitação de 'ab'
+        app.flush_history();
+
+        let entries = journal_entries(dir.path());
+        let undo_entry = entries
+            .iter()
+            .find(|e| e.command == "undo")
+            .expect("deveria haver uma entrada 'undo'");
+        assert_eq!(undo_entry.author, Author::User);
+    }
+
+    #[test]
+    fn verbo_mais_objeto_e_journalado_com_o_comando_canonico() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_history(&mut app, dir.path());
+
+        type_text(&mut app, "ola mundo");
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('w'))); // d w ; : apaga "ola"
+        app.handle_key(key(KeyCode::Char(';')));
+        app.flush_history();
+
+        let entries = journal_entries(dir.path());
+        assert!(
+            entries.iter().any(|e| e.command == "delete:word-forward"),
+            "entradas: {entries:?}"
+        );
     }
 }

@@ -910,6 +910,7 @@ dependencies = [
  "base64",
  "insta",
  "nas-editor",
+ "nas-history",
  "nas-keys",
  "ratatui",
  "tempfile",
