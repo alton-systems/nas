@@ -115,6 +115,15 @@ q = "quit"
 o = "open-file"
 b = "switch-buffer"
 k = "close-buffer"
+t = { prefix = "tempo" }
+
+[system_prefixes.tempo]
+n = "checkpoint-new"
+l = "checkpoint-list"
+e = "checkpoint-diff"
+r = "checkpoint-restore"
+a = "checkpoint-blame"
+z = "history-delete"
 
 [commands]
 move-left = "caractere anterior"
@@ -163,3 +172,10 @@ quit = "sair do editor"
 open-file = "abrir arquivo"
 switch-buffer = "trocar de buffer"
 close-buffer = "fechar o buffer atual"
+tempo = "tempo (checkpoints e histórico)"
+checkpoint-new = "novo checkpoint"
+checkpoint-list = "listar checkpoints"
+checkpoint-diff = "diff entre checkpoints"
+checkpoint-restore = "restaurar checkpoint"
+checkpoint-blame = "autoria (histórico do arquivo)"
+history-delete = "apagar histórico do projeto"

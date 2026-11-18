@@ -132,10 +132,13 @@ impl Object {
 
 /// Um comando da classe sistema (docs/keys.md §5.7): Ctrl + tecla, em
 /// qualquer estado — abrir/salvar/fechar arquivo, trocar de buffer,
-/// sair do editor. Resolvido por [`Machine::system_action`],
+/// sair do editor, ou um comando de histórico/checkpoint sob o
+/// prefixo `Ctrl+t` ("tempo"). Resolvido por [`Machine::system_action`]
+/// (direto) ou [`Machine::system_prefix_action`] (depois de
+/// [`Machine::system_prefix`] indicar um prefixo pendente),
 /// independente do estado (Insert/Visual/Sequential) e de qualquer
-/// prefixo/verbo/unidade pendente — a classe sistema é o editor como
-/// *programa*, não uma edição de texto.
+/// prefixo/verbo/unidade pendente da máquina modal — a classe sistema
+/// é o editor como *programa*, não uma edição de texto.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemAction {
     Save,
@@ -143,6 +146,37 @@ pub enum SystemAction {
     OpenFile,
     SwitchBuffer,
     CloseBuffer,
+    /// `Ctrl+t n` — cria um checkpoint nomeado do projeto.
+    CheckpointNew,
+    /// `Ctrl+t l` — lista os checkpoints do projeto.
+    CheckpointList,
+    /// `Ctrl+t e` — diff entre os dois checkpoints mais recentes.
+    CheckpointDiff,
+    /// `Ctrl+t r` — restaura um checkpoint.
+    CheckpointRestore,
+    /// `Ctrl+t a` — autoria (histórico de edições) do arquivo atual.
+    CheckpointBlame,
+    /// `Ctrl+t z` — apaga o histórico do projeto, com confirmação.
+    HistoryDelete,
+}
+
+impl SystemAction {
+    /// O nome usado em `[commands]` do keymap.
+    pub(crate) fn command_name(&self) -> &'static str {
+        match self {
+            SystemAction::Save => "save",
+            SystemAction::Quit => "quit",
+            SystemAction::OpenFile => "open-file",
+            SystemAction::SwitchBuffer => "switch-buffer",
+            SystemAction::CloseBuffer => "close-buffer",
+            SystemAction::CheckpointNew => "checkpoint-new",
+            SystemAction::CheckpointList => "checkpoint-list",
+            SystemAction::CheckpointDiff => "checkpoint-diff",
+            SystemAction::CheckpointRestore => "checkpoint-restore",
+            SystemAction::CheckpointBlame => "checkpoint-blame",
+            SystemAction::HistoryDelete => "history-delete",
+        }
+    }
 }
 
 /// O que fazer, em resposta a uma tecla — a máquina nunca executa nada
@@ -392,6 +426,36 @@ impl Machine {
     pub fn system_action(&self, key: Key) -> Option<SystemAction> {
         let key = layout::to_qwerty(&self.layout_table, key);
         self.keymap.system_action(&key)
+    }
+
+    /// O nome do prefixo de sistema que `key` abre (`Ctrl+t` →
+    /// `"tempo"`, docs/keys.md §5.7), se houver um — `None` se `key`
+    /// resolve direto por [`Machine::system_action`] ou não existe em
+    /// `[system]`. Tão puro/estável quanto `system_action`: só
+    /// consulta o keymap, não muda estado. Quem chama (`nas-term`) é
+    /// responsável por guardar que um prefixo está pendente e
+    /// resolver a tecla seguinte com [`Machine::system_prefix_action`]
+    /// — a máquina modal em si não sabe de prefixos de sistema.
+    pub fn system_prefix(&self, key: Key) -> Option<String> {
+        let key = layout::to_qwerty(&self.layout_table, key);
+        self.keymap.system_prefix_key(&key).map(str::to_string)
+    }
+
+    /// O comando ligado a `key` dentro do prefixo de sistema `name`
+    /// (ex.: depois de `Ctrl+t`, `n` → `CheckpointNew`).
+    pub fn system_prefix_action(&self, name: &str, key: Key) -> Option<SystemAction> {
+        let key = layout::to_qwerty(&self.layout_table, key);
+        self.keymap.system_prefix_action(name, &key)
+    }
+
+    /// Rótulo e teclas válidas pra um prefixo de sistema pendente —
+    /// mesma ideia de [`Machine::pending_hint`], mas pro `Ctrl+t` da
+    /// classe sistema, que a máquina modal não controla.
+    pub fn system_prefix_hint(&self, name: &str) -> PendingHint {
+        PendingHint {
+            label: self.keymap.describe(name),
+            entries: self.keymap.hint_for_system_prefix(name),
+        }
     }
 
     /// Equivalente a `nas--lighter`: um rótulo curto para a barra de
@@ -1315,6 +1379,44 @@ mod tests {
         );
         // de fato não foi capturado: a sequência continua vazia.
         assert!(machine.pending_sequence().is_empty());
+    }
+
+    #[test]
+    fn prefixo_de_sistema_ctrl_t_resolve_as_sub_teclas_de_tempo() {
+        let machine = Machine::new();
+
+        assert_eq!(machine.system_action(Key::char('t')), None);
+        assert_eq!(
+            machine.system_prefix(Key::char('t')),
+            Some("tempo".to_string())
+        );
+        assert_eq!(machine.system_prefix(Key::char('s')), None);
+
+        assert_eq!(
+            machine.system_prefix_action("tempo", Key::char('n')),
+            Some(SystemAction::CheckpointNew)
+        );
+        assert_eq!(
+            machine.system_prefix_action("tempo", Key::char('z')),
+            Some(SystemAction::HistoryDelete)
+        );
+        assert_eq!(machine.system_prefix_action("tempo", Key::char('x')), None);
+    }
+
+    #[test]
+    fn prefixo_de_sistema_tambem_resolve_em_qualquer_estado() {
+        let mut machine = Machine::new();
+        machine.handle_key(Key::enter(), false); // Visual -> Insert
+        assert_eq!(machine.state(), ModalState::Insert);
+
+        assert_eq!(
+            machine.system_prefix(Key::char('t')),
+            Some("tempo".to_string())
+        );
+        assert_eq!(
+            machine.system_prefix_action("tempo", Key::char('l')),
+            Some(SystemAction::CheckpointList)
+        );
     }
 
     #[test]
