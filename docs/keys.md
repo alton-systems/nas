@@ -222,6 +222,7 @@ unidade `w`/`W` (§5.1).
 | `Ctrl+o` | abrir arquivo (num buffer novo, ou troca pro já aberto) |
 | `Ctrl+b` | trocar de buffer |
 | `Ctrl+k` | fechar o buffer atual (pergunta se tiver alterações não salvas; fechar o único buffer aberto deixa um vazio no lugar) |
+| `Ctrl+t` | prefixo "tempo" — histórico e checkpoints (tabela abaixo) |
 
 `o` e `b` não são mais comandos do Visual — viraram `Ctrl+o` e
 `Ctrl+b`, porque abrir arquivo e trocar de buffer são o editor agindo
@@ -231,6 +232,24 @@ Esta tabela é dados: vive em `[system]`, em `default.toml`, com a
 descrição de cada comando em `[commands]`. `nas-term` só sabe
 perguntar `Machine::system_action(tecla)` — nenhum atalho desta classe
 está escrito direto no código do nas-term.
+
+**Prefixo `Ctrl+t` ("tempo"):** histórico com autoria e checkpoints
+do projeto (docs/decisions/0005-historico-com-autoria.md). A tecla
+seguinte, **sem** Ctrl, escolhe o comando — mesma ideia do líder
+(§5.6), só que dentro da classe sistema, em `[system_prefixes.tempo]`:
+
+| Atalho | Ação | Por quê esta letra |
+|---|---|---|
+| `Ctrl+t n` | novo checkpoint nomeado do projeto | `n`ovo, livre |
+| `Ctrl+t l` | listar checkpoints | `l`istar, livre |
+| `Ctrl+t e` | diff entre os dois checkpoints mais recentes | `d` já é apagar (verbo); `e`ntre as duas versões |
+| `Ctrl+t r` | restaurar um checkpoint | `r`estaurar, livre |
+| `Ctrl+t a` | autoria — histórico de edições do arquivo atual | `b` já é `Ctrl+b` (buffer); `a`utoria |
+| `Ctrl+t z` | apagar o histórico do projeto (exige digitar "apagar") | sem uso melhor por perto; ação rara e destrutiva, letra "longe" das outras |
+
+`Ctrl+t` por si só não faz nada além de abrir o prefixo — uma tecla
+que não esteja na tabela cancela, como qualquer outro prefixo (§3,
+regra 4) e volta a resolver normalmente.
 
 Não use combinações de Ctrl que cheguem iguais a outras teclas no
 terminal: `Ctrl+i` (Tab), `Ctrl+m` e `Ctrl+j` (Enter), `Ctrl+[` (Esc),

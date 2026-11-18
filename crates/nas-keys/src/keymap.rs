@@ -82,6 +82,15 @@ pub struct Keymap {
     objects_whole: HashMap<Key, Object>,
     commands: HashMap<String, String>,
     system: HashMap<Key, SystemAction>,
+    /// Teclas de `[system]` que entram num prefixo nomeado (`Ctrl+t`
+    /// → `"tempo"`) em vez de resolver direto pra uma `SystemAction` —
+    /// a tecla seguinte (sem Ctrl) é quem resolve, em
+    /// `system_prefixes`.
+    system_prefix_keys: HashMap<Key, String>,
+    /// `[system-prefixes.<nome>]`: a tecla (sem Ctrl) que completa um
+    /// prefixo de sistema pendente — hoje só `"tempo"`
+    /// (docs/keys.md §5.7, prefixo `Ctrl+t`).
+    system_prefixes: HashMap<String, HashMap<Key, SystemAction>>,
 }
 
 impl Keymap {
@@ -115,9 +124,34 @@ impl Keymap {
     }
 
     /// O comando da classe sistema (Ctrl + tecla) ligado a `key`, se
-    /// houver um em `[system]`.
+    /// houver um em `[system]` que resolva direto (não um prefixo).
     pub(crate) fn system_action(&self, key: &Key) -> Option<SystemAction> {
         self.system.get(key).copied()
+    }
+
+    /// O nome do prefixo de sistema que `key` abre (`Ctrl+t` →
+    /// `"tempo"`), se houver um.
+    pub(crate) fn system_prefix_key(&self, key: &Key) -> Option<&str> {
+        self.system_prefix_keys.get(key).map(String::as_str)
+    }
+
+    /// O comando ligado a `key` dentro do prefixo de sistema `name`
+    /// (ex.: `"tempo"`, `n` → `checkpoint-new`).
+    pub(crate) fn system_prefix_action(&self, name: &str, key: &Key) -> Option<SystemAction> {
+        self.system_prefixes.get(name)?.get(key).copied()
+    }
+
+    /// As teclas válidas e suas descrições para um prefixo de sistema
+    /// pendente (`Ctrl+t`) — mesma ideia de `hint_for_prefix`, mas
+    /// para `[system-prefixes.*]`.
+    pub(crate) fn hint_for_system_prefix(&self, name: &str) -> Vec<(Key, String)> {
+        let Some(bindings) = self.system_prefixes.get(name) else {
+            return Vec::new();
+        };
+        bindings
+            .iter()
+            .map(|(key, action)| (*key, self.describe(action.command_name())))
+            .collect()
     }
 
     /// Descrição curta de um nome de comando (ação, verbo, unidade,
@@ -195,6 +229,16 @@ enum RawBinding {
     Unit { unit: String },
 }
 
+/// Uma entrada de `[system]`: ou resolve direto pra um comando
+/// (`"save"`), ou entra num prefixo nomeado (`{ prefix = "tempo" }`)
+/// que espera mais uma tecla, resolvida em `[system-prefixes.<nome>]`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawSystemBinding {
+    Named(String),
+    Prefix { prefix: String },
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawKeymap {
     #[serde(default)]
@@ -208,7 +252,9 @@ struct RawKeymap {
     #[serde(default)]
     commands: HashMap<String, String>,
     #[serde(default)]
-    system: HashMap<String, String>,
+    system: HashMap<String, RawSystemBinding>,
+    #[serde(default)]
+    system_prefixes: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +271,7 @@ impl RawKeymap {
     fn resolve(self) -> Result<Keymap, KeymapError> {
         let visual = resolve_bindings(self.visual)?;
         let (objects_horizontal, objects_vertical) = derive_movement_objects(&visual);
+        let (system, system_prefix_keys) = resolve_system(self.system)?;
         Ok(Keymap {
             insert: resolve_bindings(self.insert)?,
             visual,
@@ -239,7 +286,9 @@ impl RawKeymap {
             objects_paragraph: resolve_objects(self.objects.paragraph)?,
             objects_whole: resolve_objects(self.objects.whole)?,
             commands: self.commands,
-            system: resolve_system(self.system)?,
+            system,
+            system_prefix_keys,
+            system_prefixes: resolve_system_prefixes(self.system_prefixes)?,
         })
     }
 }
@@ -303,12 +352,43 @@ fn resolve_objects(raw: HashMap<String, String>) -> Result<HashMap<Key, Object>,
         .collect()
 }
 
-fn resolve_system(raw: HashMap<String, String>) -> Result<HashMap<Key, SystemAction>, KeymapError> {
+/// Separa `[system]` em ações diretas e teclas que entram num
+/// prefixo nomeado (`{ prefix = "tempo" }`) — ver [`RawSystemBinding`].
+/// Resultado de separar `[system]` em ações diretas e teclas que
+/// entram num prefixo nomeado — ver [`resolve_system`].
+type ResolvedSystem = (HashMap<Key, SystemAction>, HashMap<Key, String>);
+
+fn resolve_system(raw: HashMap<String, RawSystemBinding>) -> Result<ResolvedSystem, KeymapError> {
+    let mut actions = HashMap::new();
+    let mut prefix_keys = HashMap::new();
+    for (key_spec, binding) in raw {
+        let key = parse_key(&key_spec)?;
+        match binding {
+            RawSystemBinding::Named(name) => {
+                actions.insert(key, parse_system_action(&name)?);
+            }
+            RawSystemBinding::Prefix { prefix } => {
+                prefix_keys.insert(key, prefix);
+            }
+        }
+    }
+    Ok((actions, prefix_keys))
+}
+
+fn resolve_system_prefixes(
+    raw: HashMap<String, HashMap<String, String>>,
+) -> Result<HashMap<String, HashMap<Key, SystemAction>>, KeymapError> {
     raw.into_iter()
-        .map(|(key_spec, name)| {
-            let key = parse_key(&key_spec)?;
-            let action = parse_system_action(&name)?;
-            Ok((key, action))
+        .map(|(name, bindings)| {
+            let resolved = bindings
+                .into_iter()
+                .map(|(key_spec, action_name)| {
+                    let key = parse_key(&key_spec)?;
+                    let action = parse_system_action(&action_name)?;
+                    Ok((key, action))
+                })
+                .collect::<Result<_, KeymapError>>()?;
+            Ok((name, resolved))
         })
         .collect()
 }
@@ -333,6 +413,12 @@ fn parse_system_action(name: &str) -> Result<SystemAction, KeymapError> {
         "open-file" => SystemAction::OpenFile,
         "switch-buffer" => SystemAction::SwitchBuffer,
         "close-buffer" => SystemAction::CloseBuffer,
+        "checkpoint-new" => SystemAction::CheckpointNew,
+        "checkpoint-list" => SystemAction::CheckpointList,
+        "checkpoint-diff" => SystemAction::CheckpointDiff,
+        "checkpoint-restore" => SystemAction::CheckpointRestore,
+        "checkpoint-blame" => SystemAction::CheckpointBlame,
+        "history-delete" => SystemAction::HistoryDelete,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
@@ -559,5 +645,44 @@ z = "move-right"
             Some(SystemAction::CloseBuffer)
         );
         assert_eq!(keymap.system_action(&Key::char('z')), None);
+    }
+
+    #[test]
+    fn prefixo_de_sistema_tempo_no_keymap_padrao() {
+        let keymap = Keymap::default_keymap();
+
+        // 't' não resolve direto — abre o prefixo "tempo".
+        assert_eq!(keymap.system_action(&Key::char('t')), None);
+        assert_eq!(keymap.system_prefix_key(&Key::char('t')), Some("tempo"));
+
+        assert_eq!(
+            keymap.system_prefix_action("tempo", &Key::char('n')),
+            Some(SystemAction::CheckpointNew)
+        );
+        assert_eq!(
+            keymap.system_prefix_action("tempo", &Key::char('l')),
+            Some(SystemAction::CheckpointList)
+        );
+        assert_eq!(
+            keymap.system_prefix_action("tempo", &Key::char('e')),
+            Some(SystemAction::CheckpointDiff)
+        );
+        assert_eq!(
+            keymap.system_prefix_action("tempo", &Key::char('r')),
+            Some(SystemAction::CheckpointRestore)
+        );
+        assert_eq!(
+            keymap.system_prefix_action("tempo", &Key::char('a')),
+            Some(SystemAction::CheckpointBlame)
+        );
+        assert_eq!(
+            keymap.system_prefix_action("tempo", &Key::char('z')),
+            Some(SystemAction::HistoryDelete)
+        );
+        assert_eq!(keymap.system_prefix_action("tempo", &Key::char('x')), None);
+        assert_eq!(
+            keymap.system_prefix_action("outro-prefixo", &Key::char('n')),
+            None
+        );
     }
 }
