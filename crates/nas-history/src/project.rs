@@ -71,6 +71,26 @@ struct ProjectManifest {
     path: String,
 }
 
+/// Remove o histórico inteiro de um projeto — `journal.jsonl` e todos
+/// os checkpoints, nomeados ou não (`<hash-do-projeto>/` por
+/// completo). Não há checkpoint de segurança pra esta ação (apagar o
+/// próprio histórico); a confirmação explícita é a única rede —
+/// `confirmation` precisa ser exatamente `"apagar"`, senão nada é
+/// removido. docs/decisions/0005 §5.
+pub fn delete_project_history(history_dir: &Path, confirmation: &str) -> io::Result<()> {
+    if confirmation != "apagar" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confirmação incorreta: digite exatamente \"apagar\"",
+        ));
+    }
+    match fs::remove_dir_all(history_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 /// `$XDG_STATE_HOME`, ou `~/.local/state` se a variável não estiver
 /// definida (ou estiver vazia) — mesmo padrão de fallback manual que
 /// `NAS_KEYBOARD_LAYOUT` já usa pra variável de ambiente, sem
@@ -203,6 +223,39 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn apagar_historico_exige_a_confirmacao_exata() {
+        let state_home = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = ProjectId::discover(project_dir.path()).unwrap();
+        let history_dir = project.ensure_history_dir(state_home.path()).unwrap();
+
+        let err = delete_project_history(&history_dir, "sim, apagar").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(history_dir.exists(), "não deveria ter apagado nada");
+    }
+
+    #[test]
+    fn apagar_historico_remove_a_pasta_inteira_com_a_confirmacao_certa() {
+        let state_home = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let project = ProjectId::discover(project_dir.path()).unwrap();
+        let history_dir = project.ensure_history_dir(state_home.path()).unwrap();
+        fs::write(history_dir.join("journal.jsonl"), "").unwrap();
+
+        delete_project_history(&history_dir, "apagar").unwrap();
+
+        assert!(!history_dir.exists());
+    }
+
+    #[test]
+    fn apagar_historico_inexistente_nao_e_erro() {
+        let dir = tempfile::tempdir().unwrap();
+        let nunca_criado = dir.path().join("nunca-existiu");
+
+        delete_project_history(&nunca_criado, "apagar").expect("não deveria falhar");
     }
 
     #[test]
