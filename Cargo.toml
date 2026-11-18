@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nas-term", "crates/nas-editor", "crates/nas-keys"]
+members = ["crates/nas-term", "crates/nas-editor", "crates/nas-keys", "crates/nas-history"]
 
 [workspace.package]
 edition = "2024"
