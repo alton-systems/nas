@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use helix_core::chars::{CharCategory, categorize_char};
 use helix_core::line_ending::LineEnding;
-use helix_core::{Rope, Selection, Tendril, Transaction, graphemes, history, line_ending};
+use helix_core::{
+    Operation, Rope, Selection, Tendril, Transaction, graphemes, history, line_ending,
+};
 
 /// Erro ao abrir um arquivo: além de erros de E/S comuns, um arquivo que
 /// não é UTF-8 válido é recusado — nunca chega a existir um `Document` com
@@ -79,6 +81,62 @@ pub enum RegionObject {
     ParagraphBackward,
     CurrentLine,
     WholeBuffer,
+}
+
+/// O que uma mutação no documento mudou — posições em caracteres (no
+/// documento *antes* da mudança), o texto que saiu e o que entrou.
+/// Existe pra quem chama (hoje, `nas-term`, pra journalar no
+/// `nas-history`) saber o que uma edição fez sem conhecer
+/// `helix_core::Transaction` — ver docs/decisions/0001 e
+/// docs/decisions/0005-historico-com-autoria.md §3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextChange {
+    pub from: usize,
+    pub to: usize,
+    pub removed: String,
+    pub inserted: String,
+}
+
+/// Calcula o [`TextChange`] que `transaction` provoca, lendo o texto
+/// apagado em `before` (o rope *antes* da transação ser aplicada) —
+/// único jeito de saber o conteúdo removido, já que
+/// `Operation::Delete` só guarda uma contagem de caracteres, não o
+/// texto. Caminha pelas operações (`Retain`/`Delete`/`Insert`) uma vez,
+/// acumulando a região afetada; as transações que o `Document` cria
+/// são sempre uma única região contígua (uma inserção, uma remoção, ou
+/// a inversão de uma das duas no desfazer), então isto nunca precisa
+/// lidar com múltiplas regiões separadas.
+fn describe_transaction(before: &Rope, transaction: &Transaction) -> TextChange {
+    let mut old_pos = 0usize;
+    let mut from: Option<usize> = None;
+    let mut to = 0usize;
+    let mut removed = String::new();
+    let mut inserted = String::new();
+
+    for op in transaction.changes().changes() {
+        match op {
+            Operation::Retain(n) => old_pos += n,
+            Operation::Delete(n) => {
+                from.get_or_insert(old_pos);
+                removed.push_str(&before.slice(old_pos..old_pos + n).to_string());
+                old_pos += n;
+                to = old_pos;
+            }
+            Operation::Insert(text) => {
+                from.get_or_insert(old_pos);
+                inserted.push_str(text);
+                to = to.max(old_pos);
+            }
+        }
+    }
+
+    let from = from.unwrap_or(old_pos);
+    TextChange {
+        from,
+        to: to.max(from),
+        removed,
+        inserted,
+    }
 }
 
 /// Um buffer de texto editável, com desfazer.
@@ -590,16 +648,16 @@ impl Document {
         self.selection_anchor = None;
     }
 
-    /// Desfaz a última edição. Retorna `false` se não havia nada a desfazer.
-    pub fn undo(&mut self) -> bool {
-        let Some(inversion) = self.history.undo() else {
-            return false;
-        };
+    /// Desfaz a última edição, devolvendo o que mudou (pra journalar) —
+    /// `None` se não havia nada a desfazer.
+    pub fn undo(&mut self) -> Option<TextChange> {
+        let inversion = self.history.undo()?;
+        let change = describe_transaction(&self.rope, inversion);
         inversion.apply(&mut self.rope);
         self.cursor = self.cursor.min(self.rope.len_chars());
         self.modified = true;
         self.selection_anchor = None;
-        true
+        Some(change)
     }
 }
 
@@ -710,16 +768,44 @@ mod tests {
 
         // desfaz as 5 remoções, uma por revisão
         for _ in 0.."mundo".chars().count() {
-            assert!(doc.undo());
+            assert!(doc.undo().is_some());
         }
         assert_eq!(doc_text(&doc), "ola mundo");
 
         // desfaz também as 9 inserções, até a raiz do histórico
         for _ in 0.."ola mundo".chars().count() {
-            assert!(doc.undo());
+            assert!(doc.undo().is_some());
         }
         assert_eq!(doc_text(&doc), "");
-        assert!(!doc.undo(), "não há mais nada para desfazer na raiz");
+        assert!(
+            doc.undo().is_none(),
+            "não há mais nada para desfazer na raiz"
+        );
+    }
+
+    #[test]
+    fn undo_devolve_o_text_change_da_edicao_desfeita() {
+        let mut doc = Document::empty();
+        for ch in "ab".chars() {
+            doc.insert_char(ch);
+        }
+        // desfaz a inserção de 'b' (a segunda revisão)
+        let change = doc.undo().expect("deveria ter algo pra desfazer");
+        assert_eq!(change.from, 1);
+        assert_eq!(change.to, 2);
+        assert_eq!(change.removed, "b");
+        assert_eq!(change.inserted, "");
+        assert_eq!(doc_text(&doc), "a");
+
+        doc.insert_char('b');
+        doc.move_to_buffer_start();
+        doc.delete_forward(); // apaga 'a', documento agora é "b"
+        let change = doc.undo().expect("deveria ter algo pra desfazer");
+        assert_eq!(change.from, 0);
+        assert_eq!(change.to, 0);
+        assert_eq!(change.removed, "");
+        assert_eq!(change.inserted, "a");
+        assert_eq!(doc_text(&doc), "ab");
     }
 
     #[test]
