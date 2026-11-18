@@ -228,17 +228,46 @@ fn restore_terminal() {
 /// Garante que, mesmo num pânico, o terminal do usuário volte ao normal
 /// antes da mensagem de erro ser impressa — sem isso, um pânico em modo
 /// raw/tela alternada deixa o terminal num estado ilegível. Também
-/// força o flush do journal de histórico (`history`, o mesmo `Arc` que
+/// tenta o flush do journal de histórico (`history`, o mesmo `Arc` que
 /// `app` usa), pra não perder edições feitas pouco antes do pânico.
 fn install_panic_hook(history: SharedJournal) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
-        if let Ok(mut guard) = history.lock()
-            && let Some(journal) = guard.as_mut()
-        {
-            let _ = journal.flush(nas_history::now_unix());
-        }
+        try_flush_history(&history);
         default_hook(info);
     }));
+}
+
+/// Flush de melhor esforço no journal compartilhado — **nunca
+/// bloqueia**. Usa `try_lock` em vez de `lock`: se o lock estiver
+/// ocupado (por exemplo, o pânico aconteceu no meio de uma gravação,
+/// com o lock preso no fio que entrou em pânico), desiste do flush e
+/// segue adiante — um panic hook travado deixaria o terminal do
+/// usuário sem ser restaurado, o que é pior que perder o flush.
+fn try_flush_history(history: &SharedJournal) {
+    if let Ok(mut guard) = history.try_lock()
+        && let Some(journal) = guard.as_mut()
+    {
+        let _ = journal.flush(nas_history::now_unix());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_flush_history_desiste_sem_travar_se_o_lock_estiver_ocupado() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let journal = nas_history::Journal::open(dir.path()).expect("abrir journal");
+        let history: SharedJournal = Arc::new(Mutex::new(Some(journal)));
+
+        // Simula o pânico acontecendo no meio de uma gravação: o lock
+        // já está preso neste mesmo fio. Se `try_flush_history` usasse
+        // `lock()` em vez de `try_lock()`, esta chamada travaria pra
+        // sempre (deadlock no mesmo fio) e o teste nunca terminaria.
+        let _guard = history.lock().unwrap();
+        try_flush_history(&history);
+    }
 }
