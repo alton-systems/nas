@@ -52,7 +52,10 @@ pub enum Verb {
 }
 
 impl Verb {
-    pub(crate) fn command_name(&self) -> &'static str {
+    /// O nome usado em `[commands]` do keymap — também o nome canônico
+    /// que o journal de histórico usa pra registrar o comando de um
+    /// verbo+objeto (`"delete:word-forward"`), docs/decisions/0005 §1.
+    pub fn command_name(&self) -> &'static str {
         match self {
             Verb::Delete => "delete",
             Verb::Copy => "copy",
@@ -104,7 +107,10 @@ pub enum Object {
 }
 
 impl Object {
-    pub(crate) fn command_name(&self) -> &'static str {
+    /// O nome usado em `[commands]` do keymap — também o nome canônico
+    /// que o journal de histórico usa como a parte "objeto" do comando
+    /// de um verbo+objeto, docs/decisions/0005 §1.
+    pub fn command_name(&self) -> &'static str {
         match self {
             Object::CharLeft => "char-left",
             Object::CharRight => "char-right",
