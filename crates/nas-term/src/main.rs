@@ -40,10 +40,16 @@ async fn main() -> io::Result<()> {
     let log_path = logging::init()?;
     tracing::info!(path = %log_path.display(), "nas iniciado");
 
-    *history.lock().unwrap() = open_project_journal();
+    let project = discover_project();
+    if let Some((project, state_home)) = &project {
+        *history.lock().unwrap() = open_project_journal(project, state_home);
+    }
 
     let mut app = App::with_layout(open_document_from_args()?, keyboard_layout());
     app.attach_history(history);
+    if let Some((project, state_home)) = project {
+        app.attach_project(project, state_home);
+    }
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app).await;
@@ -72,17 +78,26 @@ fn open_document_from_args() -> io::Result<Document> {
     }
 }
 
-/// Abre o journal de histórico do projeto (diretório atual) — ver
-/// docs/decisions/0005-historico-com-autoria.md. `None` se o projeto
-/// não puder ser identificado ou o journal não puder ser aberto (sem
-/// `HOME`, sem permissão de escrita, etc.): o nas continua funcionando
-/// normalmente, só sem registrar histórico — nunca um motivo para
-/// recusar abrir.
-fn open_project_journal() -> Option<nas_history::Journal> {
+/// Identifica o projeto (raiz do Git ou diretório atual) e onde fica
+/// `$XDG_STATE_HOME` — ver docs/decisions/0005-historico-com-autoria.md
+/// §5/§6. `None` se não for possível (sem `HOME`, por exemplo): o nas
+/// continua funcionando normalmente, só sem histórico nem checkpoints
+/// — nunca um motivo para recusar abrir.
+fn discover_project() -> Option<(nas_history::ProjectId, std::path::PathBuf)> {
     let cwd = std::env::current_dir().ok()?;
     let project = nas_history::ProjectId::discover(&cwd).ok()?;
     let state_home = nas_history::state_home().ok()?;
-    let history_dir = project.ensure_history_dir(&state_home).ok()?;
+    Some((project, state_home))
+}
+
+/// Abre o journal de histórico do projeto já identificado por
+/// [`discover_project`]. `None` se a pasta de histórico ou o journal
+/// não puderem ser criados/abertos (sem permissão de escrita, etc.).
+fn open_project_journal(
+    project: &nas_history::ProjectId,
+    state_home: &std::path::Path,
+) -> Option<nas_history::Journal> {
+    let history_dir = project.ensure_history_dir(state_home).ok()?;
     match nas_history::Journal::open(&history_dir) {
         Ok(journal) => Some(journal),
         Err(err) => {
