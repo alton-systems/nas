@@ -225,6 +225,13 @@ impl Document {
         self.rope.len_lines()
     }
 
+    /// O conteúdo inteiro do buffer — para capturar um checkpoint
+    /// (docs/decisions/0005 §4: "conteúdo atual dos buffers em
+    /// memória, salvos ou não").
+    pub fn full_text(&self) -> String {
+        self.rope.to_string()
+    }
+
     /// Texto da linha `idx` (0-indexada), sem o terminador de linha.
     pub fn line(&self, idx: usize) -> Cow<'_, str> {
         let start = self.rope.line_to_char(idx);
@@ -648,6 +655,36 @@ impl Document {
         self.selection_anchor = None;
     }
 
+    /// Substitui o conteúdo inteiro do buffer por `new_text` — como
+    /// restaurar um checkpoint (docs/decisions/0005 §7): passa pelo
+    /// `apply()` normal, então entra no desfazer por tecla (`u`) e
+    /// devolve o `TextChange` pra journalar com o comando
+    /// `"restore-checkpoint"`. O cursor é mantido se ainda cabe no
+    /// novo texto, senão vai pro fim.
+    pub fn replace_all(&mut self, new_text: &str) -> TextChange {
+        let old_text = self.rope.to_string();
+        let from = 0;
+        let to = self.rope.len_chars();
+
+        let selection = Selection::point(self.cursor);
+        let original = history::State {
+            doc: self.rope.clone(),
+            selection: selection.clone(),
+        };
+        let tendril: Tendril = new_text.into();
+        let transaction =
+            Transaction::change(&self.rope, std::iter::once((from, to, Some(tendril))));
+        self.apply(transaction, original);
+        self.cursor = self.cursor.min(self.rope.len_chars());
+
+        TextChange {
+            from,
+            to,
+            removed: old_text,
+            inserted: new_text.to_string(),
+        }
+    }
+
     /// Desfaz a última edição, devolvendo o que mudou (pra journalar) —
     /// `None` se não havia nada a desfazer.
     pub fn undo(&mut self) -> Option<TextChange> {
@@ -780,6 +817,58 @@ mod tests {
         assert!(
             doc.undo().is_none(),
             "não há mais nada para desfazer na raiz"
+        );
+    }
+
+    #[test]
+    fn full_text_devolve_o_conteudo_inteiro() {
+        let mut doc = Document::empty();
+        for ch in "ola\nmundo".chars() {
+            doc.insert_char(ch);
+        }
+        assert_eq!(doc.full_text(), "ola\nmundo");
+    }
+
+    #[test]
+    fn replace_all_troca_o_conteudo_e_e_desfazivel() {
+        let mut doc = Document::empty();
+        for ch in "velho".chars() {
+            doc.insert_char(ch);
+        }
+
+        let change = doc.replace_all("novo conteudo");
+        assert_eq!(change.from, 0);
+        assert_eq!(change.to, 5); // "velho" tinha 5 caracteres
+        assert_eq!(change.removed, "velho");
+        assert_eq!(change.inserted, "novo conteudo");
+        assert_eq!(doc_text(&doc), "novo conteudo");
+        assert!(doc.is_modified());
+
+        assert!(doc.undo().is_some());
+        assert_eq!(doc_text(&doc), "velho");
+    }
+
+    #[test]
+    fn replace_all_mantem_o_cursor_se_ainda_cabe_senao_vai_pro_fim() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.set_cursor(4);
+
+        doc.replace_all("abc"); // mais curto que a posição 4
+        assert_eq!(
+            doc.cursor_offset(),
+            3,
+            "cursor deveria ter sido ajustado pro fim do novo texto"
+        );
+
+        doc.set_cursor(1);
+        doc.replace_all("um texto bem mais longo");
+        assert_eq!(
+            doc.cursor_offset(),
+            1,
+            "cursor que ainda cabe não deveria mudar"
         );
     }
 
