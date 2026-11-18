@@ -2,10 +2,11 @@
 
 ## Status
 
-Aceita. Implementação ainda não começou — segue em quatro etapas
-(2a: crate `nas-history` com autoria e journal; 2b: checkpoints,
-armazenamento e poda; 2c: diff, restauração e as teclas; 2d: detecção
-de mudança externa), cada uma na sua própria branch e PR.
+Aceita. Implementação em quatro etapas, cada uma na sua própria
+branch e PR: 2a (crate `nas-history` com autoria e journal, ligado ao
+`nas-editor`/`nas-term`) e 2b (checkpoints, armazenamento por hash e
+poda) e 2c (diff entre checkpoints, restauração e as teclas `Ctrl+t`)
+feitas. Falta 2d: detecção de mudança externa (`Author::External`).
 
 ## Contexto
 
