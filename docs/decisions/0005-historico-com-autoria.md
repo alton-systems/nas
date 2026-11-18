@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposta — aguardando aprovação. Nada deste documento está implementado.
+Aceita. Implementação ainda não começou — segue em quatro etapas
+(2a: crate `nas-history` com autoria e journal; 2b: checkpoints,
+armazenamento e poda; 2c: diff, restauração e as teclas; 2d: detecção
+de mudança externa), cada uma na sua própria branch e PR.
 
 ## Contexto
 
@@ -57,13 +60,25 @@ pub enum Author {
   proposta não monitora arquivos continuamente (nada de `inotify`/
   `notify` ainda — fica pra depois, se precisar). Em vez disso, o nas
   compara mtime e tamanho do arquivo no disco contra o que ele mesmo
-  leu ou escreveu por último, nos dois momentos em que isso importa:
-  **ao trocar pra um buffer** (`Ctrl+b`, ou reabrir) e **imediatamente
-  antes de salvar** (`Ctrl+s`). Se mudou, lê o conteúdo novo, calcula
-  a diferença contra o que o nas tinha, e journala isso como
-  `Author::External` antes de aplicar a próxima edição — assim a
-  autoria da mudança externa não fica perdida nem atribuída por
-  engano a quem editar depois.
+  leu ou escreveu por último, em quatro momentos: **ao trocar pra um
+  buffer** (`Ctrl+b`, ou reabrir); **imediatamente antes de salvar**
+  (`Ctrl+s`); **quando o terminal recupera o foco** (eventos
+  `FocusGained`/`FocusLost` do crossterm — o caso mais comum de um
+  editor externo ou um `git checkout` acontecerem enquanto o usuário
+  estava noutra janela); e **de forma leve, a cada poucos segundos**
+  (um `stat` por buffer aberto, não uma releitura de conteúdo — barato
+  mesmo com vários buffers abertos).
+
+  Ao detectar: **avisa na barra de status e oferece recarregar** — não
+  recarrega sozinho, porque o usuário pode ter uma edição em andamento
+  que não quer perder. **Nunca salva por cima de uma mudança externa
+  sem perguntar**: se `Ctrl+s` detecta que o arquivo mudou no disco
+  desde a última leitura/escrita do nas, pergunta antes de sobrescrever
+  — mesmo padrão de confirmação que `Ctrl+q`/`Ctrl+k` já usam. Só
+  depois de resolvido (recarregar, ou confirmar a sobrescrita) é que a
+  próxima edição local journala normalmente; a mudança externa em si
+  já entrou no journal como `Author::External` no momento em que foi
+  detectada, calculando a diferença contra o que o nas tinha.
 
 Só **transações que de fato mudam o texto** entram no histórico — o
 mesmo conjunto de operações que já passa por `Document::apply()` hoje
@@ -200,6 +215,15 @@ projeto é identificado):
   `helix_core::Transaction` direto; a API do helix não é estável
   (decisão 1), e este journal precisa continuar legível entre versões
   do nas que atualizem a tag do helix.
+- **Leitura tolerante a linha incompleta**: se o processo for
+  encerrado abruptamente no meio de um append (§2), a **última** linha
+  do `journal.jsonl` pode ficar truncada — um objeto JSON incompleto.
+  Ao ler, o nas tenta parsear cada linha; se **só a última** falhar,
+  ela é ignorada, como se nunca tivesse sido escrita — o resto do
+  arquivo continua válido. Uma falha em qualquer linha que não seja a
+  última é um erro de verdade (não deveria acontecer, já que todo
+  append anterior já tinha sido concluído por inteiro antes do
+  próximo começar) e não é tolerada do mesmo jeito.
 - **`objects/`**: um **armazenamento endereçado por conteúdo**. Cada
   arquivo snapshot (de um checkpoint) é guardado uma vez só, nomeado
   pelo hash do seu próprio conteúdo (SHA-256); se o mesmo conteúdo
@@ -215,7 +239,10 @@ projeto é identificado):
   pra detectar se mudou depois), só não guarda o conteúdo. Diff e
   restauração pra esses arquivos ficam fora do que esta proposta
   cobre — binários grandes não são o caso de uso do histórico de
-  texto.
+  texto. **Quando um checkpoint deixa algum arquivo de fora por isso,
+  o nas avisa quais ficaram de fora** (nome e o motivo — grande demais
+  ou não-UTF8) — nunca falha silenciosamente nem finge que o
+  checkpoint capturou tudo.
 - **`checkpoints/<id>/manifest.toml`**: nome, quando foi criado,
   quem criou, se é **automático** (ver poda, abaixo) e a lista de
   arquivos com o hash do conteúdo de cada um em `objects/`. `<id>` é
@@ -342,7 +369,15 @@ implementa essa extensão, só assume que ela existe.
 | `Ctrl+t e` | diff **e**ntre dois checkpoints (ou um checkpoint e agora) | evitei `d` **de propósito** — `d` já é o verbo "apagar", carregado o bastante pra que `Ctrl+t d` fosse lido por reflexo como algo destrutivo, quando diff não apaga nada |
 | `Ctrl+t r` | restaurar um checkpoint escolhido | "restaurar" — livre, sem colisão |
 | `Ctrl+t a` | **a**utoria (blame) da linha/região atual | evitei `b` **de propósito** — `b` já é `Ctrl+b` (trocar de buffer), e as duas teclas compartilham o mesmo modificador (Ctrl), então a chance de confundir uma com a outra é maior do que entre classes diferentes, como no caso de `l` acima |
-| `Ctrl+t z` | apagar o histórico deste projeto (§5) | sem mnemônico de propósito — é uma ação rara e destrutiva; uma letra sem associação prévia reduz a chance de ser apertada por hábito. Pede confirmação (a mesma tecla duas vezes, como `d a`) |
+| `Ctrl+t z` | apagar o histórico deste projeto (§5) | sem mnemônico de propósito — é uma ação rara e destrutiva; uma letra sem associação prévia reduz a chance de ser apertada por hábito |
+
+`Ctrl+t z` pede uma confirmação **mais forte** que a tecla repetida
+(`d a`, `x a`): um prompt pedindo pra **digitar "apagar"** antes de
+executar. A tecla repetida já é suficiente pra ações que o próprio
+histórico protege (apagar o arquivo inteiro ainda fica recuperável
+via checkpoint); apagar o histórico em si remove essa rede de
+segurança — não há nenhum checkpoint "antes de apagar o histórico"
+pra desfazer isso depois. Uma barreira maior pra uma ação sem rede.
 
 `Ctrl+c` fica de fora de propósito — é universalmente SIGINT no
 terminal; mesmo em modo raw, onde o nas poderia interceptar, seria uma
@@ -395,6 +430,10 @@ crate) — por isso está aqui, não direto em código, seguindo a regra do
 4. `Ctrl+t a` numa linha qualquer, depois do passo 1, mostra
    corretamente quem fez aquela mudança (usuário ou o autor simulado),
    com qual comando e quando — mesmo depois do fechar/abrir do passo 1.
+5. Um `journal.jsonl` com a última linha truncada (simulando um
+   encerramento abrupto no meio de um append) ainda carrega todas as
+   entradas anteriores corretamente ao abrir o projeto de novo — só a
+   última linha é ignorada.
 
 ## Consequências
 
@@ -413,7 +452,19 @@ crate) — por isso está aqui, não direto em código, seguindo a regra do
 - Detectar `Author::External` (§1) significa que trocar de buffer e
   salvar ganham uma checagem de mtime/tamanho a mais — barata (um
   `stat`), mas é um comportamento novo que não existe hoje em
-  `handle_system_key`/`save`.
+  `handle_system_key`/`save`. Os outros dois momentos de checagem
+  (foco do terminal, verificação periódica) exigem mudanças no loop
+  de eventos de `main.rs`: habilitar eventos de foco do crossterm
+  (`EnableFocusChange`, ao lado do bracketed paste que já é
+  habilitado) e trocar a leitura hoje bloqueante (`event::read()`) por
+  uma com tempo limite (`event::poll`) ou um tick do `tokio`, pra ter
+  uma chance de checar periodicamente mesmo sem nenhuma tecla chegar.
+- Apagar o histórico (`Ctrl+t z`) com confirmação digitada é um tipo
+  de prompt novo pra `nas-term` — os prompts de hoje (`PromptKind`)
+  só pedem um valor (caminho, consulta, número de linha); este
+  precisa comparar o que foi digitado contra um valor fixo
+  (`"apagar"`) antes de agir, em vez de usar o valor digitado
+  diretamente.
 - `nas-keys` precisa de uma extensão pequena e genérica (prefixo
   dentro da classe sistema, §8) antes desta proposta poder ser
   implementada de verdade — não é parte desta ADR, mas é um
