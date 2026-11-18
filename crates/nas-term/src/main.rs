@@ -5,6 +5,7 @@ mod logging;
 mod ui;
 
 use std::io::{self, Write as _};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use nas_editor::{Document, OpenError};
@@ -22,18 +23,27 @@ use ratatui::crossterm::terminal::{
     supports_keyboard_enhancement,
 };
 
-use app::App;
+use app::{App, SharedJournal};
 
 type Backend = CrosstermBackend<io::Stdout>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
-    install_panic_hook();
+    // Criado antes de qualquer outra coisa (até do log) pra que o
+    // panic hook, instalado logo abaixo, já tenha o mesmo `Arc` que
+    // `app` vai usar — um pânico em qualquer ponto depois daqui força
+    // o flush do journal, mesmo que o fio normal (Ctrl+Q, Ctrl+K,
+    // Ctrl+S) nunca seja alcançado.
+    let history: SharedJournal = Arc::new(Mutex::new(None));
+    install_panic_hook(history.clone());
 
     let log_path = logging::init()?;
     tracing::info!(path = %log_path.display(), "nas iniciado");
 
+    *history.lock().unwrap() = open_project_journal();
+
     let mut app = App::with_layout(open_document_from_args()?, keyboard_layout());
+    app.attach_history(history);
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app).await;
@@ -59,6 +69,26 @@ fn open_document_from_args() -> io::Result<Document> {
             Ok(Document::empty())
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Abre o journal de histórico do projeto (diretório atual) — ver
+/// docs/decisions/0005-historico-com-autoria.md. `None` se o projeto
+/// não puder ser identificado ou o journal não puder ser aberto (sem
+/// `HOME`, sem permissão de escrita, etc.): o nas continua funcionando
+/// normalmente, só sem registrar histórico — nunca um motivo para
+/// recusar abrir.
+fn open_project_journal() -> Option<nas_history::Journal> {
+    let cwd = std::env::current_dir().ok()?;
+    let project = nas_history::ProjectId::discover(&cwd).ok()?;
+    let state_home = nas_history::state_home().ok()?;
+    let history_dir = project.ensure_history_dir(&state_home).ok()?;
+    match nas_history::Journal::open(&history_dir) {
+        Ok(journal) => Some(journal),
+        Err(err) => {
+            tracing::warn!(error = %err, "não foi possível abrir o journal de histórico");
+            None
+        }
     }
 }
 
@@ -197,11 +227,18 @@ fn restore_terminal() {
 
 /// Garante que, mesmo num pânico, o terminal do usuário volte ao normal
 /// antes da mensagem de erro ser impressa — sem isso, um pânico em modo
-/// raw/tela alternada deixa o terminal num estado ilegível.
-fn install_panic_hook() {
+/// raw/tela alternada deixa o terminal num estado ilegível. Também
+/// força o flush do journal de histórico (`history`, o mesmo `Arc` que
+/// `app` usa), pra não perder edições feitas pouco antes do pânico.
+fn install_panic_hook(history: SharedJournal) {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore_terminal();
+        if let Ok(mut guard) = history.lock()
+            && let Some(journal) = guard.as_mut()
+        {
+            let _ = journal.flush(nas_history::now_unix());
+        }
         default_hook(info);
     }));
 }
