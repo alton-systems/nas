@@ -176,6 +176,18 @@ impl Journal {
     }
 }
 
+impl Drop for Journal {
+    /// Flush de melhor esforço: se o processo terminar (ou o journal
+    /// for descartado) sem que ninguém tenha chamado [`Journal::flush`]
+    /// explicitamente, a entrada aberta e a fila ainda não escritas não
+    /// se perdem. Melhor esforço porque `Drop` não tem como propagar um
+    /// `io::Result` — um erro aqui (disco cheio, etc.) é descartado em
+    /// silêncio, não há mais ninguém a quem reportar.
+    fn drop(&mut self) {
+        let _ = self.flush(now_unix());
+    }
+}
+
 /// Lê todas as entradas de um `journal.jsonl`. Tolerante a uma última
 /// linha truncada (um encerramento abrupto no meio de um append): se
 /// só a última linha falhar ao interpretar, ela é ignorada, como se
@@ -437,6 +449,30 @@ mod tests {
         // ter sido escrita, porque passou muito mais que 1 segundo.
         let entries = read_entries(&journal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].inserted, "a");
+    }
+
+    #[test]
+    fn drop_grava_de_melhor_esforco_o_que_ainda_nao_foi_escrito() {
+        // Edições feitas menos de 1s antes de descartar o journal (sem
+        // chamar flush() explicitamente) ainda precisam chegar ao
+        // disco — nem o tamanho (1 entrada, bem abaixo de BATCH_SIZE)
+        // nem o tempo disparariam o flush automático sozinhos aqui.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut journal = Journal::open(dir.path()).unwrap();
+            let now = now_unix();
+            journal
+                .record(now, Author::User, "insert", "arquivo.txt", 0, 0, "", "a")
+                .unwrap();
+        }
+
+        let entries = read_entries(&journal_path(dir.path())).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "o Drop deveria ter feito flush de melhor esforço"
+        );
         assert_eq!(entries[0].inserted, "a");
     }
 
