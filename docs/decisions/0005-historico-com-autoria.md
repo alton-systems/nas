@@ -3,10 +3,11 @@
 ## Status
 
 Aceita. Implementação em quatro etapas, cada uma na sua própria
-branch e PR: 2a (crate `nas-history` com autoria e journal, ligado ao
-`nas-editor`/`nas-term`) e 2b (checkpoints, armazenamento por hash e
-poda) e 2c (diff entre checkpoints, restauração e as teclas `Ctrl+t`)
-feitas. Falta 2d: detecção de mudança externa (`Author::External`).
+branch e PR, todas feitas: 2a (crate `nas-history` com autoria e
+journal, ligado ao `nas-editor`/`nas-term`), 2b (checkpoints,
+armazenamento por hash e poda), 2c (diff entre checkpoints,
+restauração e as teclas `Ctrl+t`) e 2d (detecção de mudança externa,
+`Author::External`, `Ctrl+r`).
 
 ## Contexto
 
