@@ -20,9 +20,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(root);
+    app.expire_status_message_if_needed();
+
+    let echo_lines = echo_area_lines(app, root.width as usize);
+    let echo_height = (echo_lines.len() as u16).max(1);
+
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(echo_height),
+    ])
+    .split(root);
     let text_area = rows[0];
     let status_area = rows[1];
+    let echo_area = rows[2];
 
     let gutter_width = number_width(app.document().len_lines().max(1)) + 1;
     let cols = Layout::horizontal([Constraint::Length(gutter_width as u16), Constraint::Min(1)])
@@ -35,8 +46,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_gutter(frame, gutter_area, app, gutter_width);
     draw_content(frame, content_area, app);
     draw_status(frame, status_area, app);
+    draw_echo_area(frame, echo_area, &echo_lines);
+
     if app.prompt.is_some() {
-        place_prompt_cursor(frame, status_area, app);
+        place_prompt_cursor(frame, echo_area, app);
     } else {
         place_cursor(frame, content_area, app);
     }
@@ -87,31 +100,12 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Só o estado **persistente** do buffer ativo — nome, `[+]` se
+/// modificado, posição do cursor. Nunca substituída por mensagem,
+/// prompt ou dica — essas são passageiras, e vivem na echo area,
+/// abaixo (docs/keys.md regra 8).
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let style = Style::default().add_modifier(Modifier::REVERSED);
-
-    if let Some(prompt) = &app.prompt {
-        let label = prompt_label(app, prompt.kind);
-        let text = format!("{label}: {}", prompt.input);
-        frame.render_widget(Paragraph::new(text).style(style), area);
-        return;
-    }
-
-    if let Some(message) = &app.status_message {
-        frame.render_widget(Paragraph::new(message.clone()).style(style), area);
-        return;
-    }
-
-    if let Some(prefix) = app.pending_system_prefix() {
-        let hint = app.modal.system_prefix_hint(prefix);
-        frame.render_widget(Paragraph::new(hint_text(hint)).style(style), area);
-        return;
-    }
-
-    if let Some(hint) = app.modal.pending_hint() {
-        frame.render_widget(Paragraph::new(hint_text(hint)).style(style), area);
-        return;
-    }
 
     let name = buffer_name(app.document());
     let modified = if app.document().is_modified() {
@@ -136,6 +130,103 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(truncated_name).style(style), name_area);
     frame.render_widget(Paragraph::new(position_text).style(style), position_area);
+}
+
+/// O que a echo area mostra agora — prompt, mensagem ou dica de
+/// verbo/prefixo/unidade pendente, nessa ordem de prioridade; vazia
+/// (nenhuma linha) se não há nada a dizer, o que `draw` interpreta
+/// como uma linha em branco (docs/keys.md regra 8). `width` é o que
+/// `which_key_lines` usa pra decidir se cabe numa linha só ou precisa
+/// crescer em colunas.
+fn echo_area_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    if let Some(prompt) = &app.prompt {
+        let label = prompt_label(app, prompt.kind);
+        return vec![Line::from(format!("{label}: {}", prompt.input))];
+    }
+
+    if let Some(message) = app.status_message() {
+        return vec![Line::from(truncate_right(message, width))];
+    }
+
+    if let Some(prefix) = app.pending_system_prefix() {
+        return which_key_lines(app.modal.system_prefix_hint(prefix), width);
+    }
+
+    if let Some(hint) = app.modal.pending_hint() {
+        return which_key_lines(hint, width);
+    }
+
+    Vec::new()
+}
+
+/// Desenha a echo area já computada por `echo_area_lines` — nunca
+/// decide o conteúdo, só a apresenta; `area.height` já reflete
+/// `lines.len()` (calculado por `draw` antes de montar o layout).
+fn draw_echo_area(frame: &mut Frame, area: Rect, lines: &[Line<'static>]) {
+    let style = Style::default().add_modifier(Modifier::REVERSED);
+    frame.render_widget(Paragraph::new(lines.to_vec()).style(style), area);
+}
+
+/// Uma dica de verbo/prefixo/unidade pendente (docs/keys.md regra 8),
+/// no estilo which-key: numa linha só (`rótulo  »  tecla descrição  ·
+/// ...`) se couber em `width`; senão, o rótulo isolado na primeira
+/// linha e as opções em colunas nas seguintes, sem cortar nenhuma —
+/// a echo area cresce temporariamente pra caber. As entradas vêm de
+/// um `HashMap` dentro do `nas-keys` — ordenadas aqui pela própria
+/// tecla, pra não depender da ordem de iteração do hash.
+fn which_key_lines(mut hint: PendingHint, width: usize) -> Vec<Line<'static>> {
+    hint.entries.sort_by_key(|(key, _)| key.to_string());
+    let formatted: Vec<String> = hint
+        .entries
+        .iter()
+        .map(|(key, description)| format!("{key} {description}"))
+        .collect();
+
+    let single_line = format!("{}  »  {}", hint.label, formatted.join("  ·  "));
+    if single_line.chars().count() <= width {
+        return vec![Line::from(single_line)];
+    }
+
+    let col_width = formatted
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let columns = (width / col_width.max(1)).max(1);
+
+    let mut lines = vec![Line::from(Span::styled(
+        hint.label,
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    for row in formatted.chunks(columns) {
+        let text: String = row
+            .iter()
+            .map(|entry| format!("{entry:<col_width$}"))
+            .collect();
+        lines.push(Line::from(text.trim_end().to_string()));
+    }
+    lines
+}
+
+/// Corta `s` pela direita para caber em `max_width` caracteres,
+/// marcando o corte com "…" — ao contrário de `truncate_left` (usada
+/// no nome do buffer, onde o fim do caminho é o que importa manter
+/// visível), numa mensagem é o começo que importa. A versão inteira
+/// continua em `App::message_history`.
+fn truncate_right(s: &str, max_width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let keep = max_width - 1;
+    chars[..keep].iter().collect::<String>() + "…"
 }
 
 /// Monta a linha destacando a parte que cai dentro da seleção ativa
@@ -220,33 +311,19 @@ fn number_width(n: usize) -> usize {
 }
 
 /// Posiciona o cursor do terminal no fim do texto digitado na linha de
-/// entrada, não no documento (que fica em segundo plano enquanto o
-/// prompt está ativo).
-fn place_prompt_cursor(frame: &mut Frame, status_area: Rect, app: &App) {
+/// entrada, na echo area — não no documento, que fica em segundo
+/// plano enquanto o prompt está ativo. Um prompt sempre ocupa só a
+/// primeira linha da echo area (nunca cresce como a dica which-key),
+/// então `echo_area.y` é sempre a linha certa.
+fn place_prompt_cursor(frame: &mut Frame, echo_area: Rect, app: &App) {
     let Some(prompt) = &app.prompt else { return };
     let label = prompt_label(app, prompt.kind);
     let text_len = label.chars().count() + 2 + prompt.input.chars().count(); // "label: input"
-    let x = status_area.x + (text_len as u16).min(status_area.width.saturating_sub(1));
-    frame.set_cursor_position((x, status_area.y));
+    let x = echo_area.x + (text_len as u16).min(echo_area.width.saturating_sub(1));
+    frame.set_cursor_position((x, echo_area.y));
 }
 
-/// Texto da dica mostrada na barra de status enquanto um verbo, prefixo
-/// ou unidade está pendente (docs/keys.md regra 8). As entradas vêm de
-/// um `HashMap` dentro do `nas-keys` — ordenadas aqui pela própria
-/// tecla, pra não depender da ordem de iteração do hash (que mudaria a
-/// cada execução).
-fn hint_text(mut hint: PendingHint) -> String {
-    hint.entries.sort_by_key(|(key, _)| key.to_string());
-    let entries = hint
-        .entries
-        .iter()
-        .map(|(key, description)| format!("{key} {description}"))
-        .collect::<Vec<_>>()
-        .join("  ·  ");
-    format!("{}  »  {entries}", hint.label)
-}
-
-/// Rótulo exibido na barra de status enquanto um prompt está ativo. O
+/// Rótulo exibido na echo area enquanto um prompt está ativo. O
 /// de trocar de buffer lista os buffers abertos, como pedido na etapa
 /// 5c — é a única informação que o usuário precisa pra saber o que
 /// digitar.
@@ -304,7 +381,7 @@ mod tests {
         }
         let mut app = App::with_layout(document, Layout::Qwerty);
 
-        let rendered = render_to_string(&mut app, 30, 5);
+        let rendered = render_to_string(&mut app, 30, 6);
         insta::assert_snapshot!(rendered);
     }
 
@@ -315,7 +392,7 @@ mod tests {
         let document = Document::open(long_path).expect("abrir caminho inexistente não falha");
         let mut app = App::with_layout(document, Layout::Qwerty);
 
-        let rendered = render_to_string(&mut app, 40, 3);
+        let rendered = render_to_string(&mut app, 40, 4);
         insta::assert_snapshot!(rendered);
     }
 
@@ -337,7 +414,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
 
-        let rendered = render_to_string(&mut app, 30, 3);
+        let rendered = render_to_string(&mut app, 30, 4);
         insta::assert_snapshot!(rendered);
     }
 
@@ -353,8 +430,62 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
 
-        let rendered = render_to_string(&mut app, 60, 3);
+        let rendered = render_to_string(&mut app, 60, 14);
         insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_dica_which_key_do_ctrl_t_todas_as_seis_opcoes_visiveis() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut document = Document::empty();
+        for ch in "ola mundo".chars() {
+            document.insert_char(ch);
+        }
+        let mut app = App::with_layout(document, Layout::Qwerty);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+
+        let rendered = render_to_string(&mut app, 80, 12);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_mensagem_longa_cortada() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut document = Document::empty();
+        for ch in "ola mundo".chars() {
+            document.insert_char(ch);
+        }
+        let mut app = App::with_layout(document, Layout::Qwerty);
+
+        // Ctrl+b com uma consulta bem longa: "nenhum buffer encontrado
+        // para <consulta>" fica maior que qualquer terminal razoável.
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        let long_query = "x".repeat(80);
+        for c in long_query.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let full_message = app
+            .status_message()
+            .expect("deveria ter uma mensagem")
+            .to_string();
+        assert!(
+            full_message.len() > 40,
+            "a mensagem precisa ser mais longa que a largura do terminal do teste"
+        );
+
+        let rendered = render_to_string(&mut app, 40, 4);
+        insta::assert_snapshot!(rendered);
+
+        assert_eq!(
+            app.message_history().last(),
+            Some(&full_message),
+            "a mensagem inteira (não cortada) deveria estar no histórico"
+        );
     }
 
     #[test]
@@ -377,7 +508,7 @@ mod tests {
         // o texto é o mesmo com ou sem seleção — o destaque (estilo
         // reverso) não aparece no dump de caracteres; ver o teste
         // seguinte, que confere o estilo de cada célula.
-        let rendered = render_to_string(&mut app, 30, 3);
+        let rendered = render_to_string(&mut app, 30, 4);
         insta::assert_snapshot!(rendered);
     }
 

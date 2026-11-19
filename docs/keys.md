@@ -92,7 +92,26 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
    `[commands]` em `default.toml`.
 8. **Descobrível.** Depois de um verbo, de um prefixo ou de uma
    unidade, o editor mostra quais teclas podem vir em seguida e o que
-   cada uma faz, na barra de status.
+   cada uma faz — na **echo area**, uma linha separada logo abaixo da
+   barra de status, nunca na própria barra.
+
+   A barra de status mostra só o estado **persistente** (estado
+   modal, nome do buffer, `[+]`, posição do cursor) e nunca é
+   substituída por nada — mensagens, prompts (buscar, abrir arquivo,
+   trocar de buffer, ir para linha, nome do checkpoint, restaurar,
+   confirmações) e a dica de tecla pendente são todos **passageiros**,
+   e vivem só na echo area, por baixo. A echo area fica vazia (uma
+   linha em branco) quando não há nada a dizer; uma mensagem some por
+   conta própria depois de alguns segundos, ou na tecla seguinte,
+   qualquer uma — nunca espera um Enter. Uma mensagem maior que a
+   largura da tela é cortada com "…"; a versão inteira fica num
+   histórico de mensagens consultável (como o `*Messages*` do Emacs).
+
+   A dica em si segue o estilo *which-key*: cabendo numa linha só
+   (`rótulo  »  tecla descrição  ·  tecla descrição  ...`), é só isso;
+   quando não cabe, a echo area **cresce temporariamente** — o rótulo
+   isolado na primeira linha, as opções em colunas nas seguintes, sem
+   cortar nenhuma — e volta a uma linha só na tecla seguinte (ou Esc).
 
 ## 4. As classes
 
@@ -232,7 +251,7 @@ como *programa*, não uma edição de texto.
 `Ctrl+r` também resolve uma mudança externa detectada (o arquivo
 mudou no disco desde a última leitura/escrita do nas — `git
 checkout`, um formatador rodando fora do nas, outro programa editando
-o mesmo arquivo): o nas avisa na barra de status, sem recarregar
+o mesmo arquivo): o nas avisa na echo area (regra 8), sem recarregar
 sozinho, e `Ctrl+r` é quem recarrega de propósito. `Ctrl+s` nunca
 sobrescreve uma mudança externa sem perguntar — pede a mesma
 confirmação (repetir a tecla) de `Ctrl+q`/`Ctrl+k`. Ver

@@ -1,0 +1,9 @@
+---
+source: crates/nas-term/src/ui.rs
+assertion_line: 474
+expression: rendered
+---
+1 ola mundo                             
+                                        
+[V] [sem nome] [+]                  1:10
+Nenhum buffer encontrado para "xxxxxxxx…
