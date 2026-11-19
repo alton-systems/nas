@@ -222,11 +222,21 @@ unidade `w`/`W` (§5.1).
 | `Ctrl+o` | abrir arquivo (num buffer novo, ou troca pro já aberto) |
 | `Ctrl+b` | trocar de buffer |
 | `Ctrl+k` | fechar o buffer atual (pergunta se tiver alterações não salvas; fechar o único buffer aberto deixa um vazio no lugar) |
+| `Ctrl+r` | recarregar o buffer atual a partir do disco (pergunta se tiver alterações não salvas) |
 | `Ctrl+t` | prefixo "tempo" — histórico e checkpoints (tabela abaixo) |
 
 `o` e `b` não são mais comandos do Visual — viraram `Ctrl+o` e
 `Ctrl+b`, porque abrir arquivo e trocar de buffer são o editor agindo
 como *programa*, não uma edição de texto.
+
+`Ctrl+r` também resolve uma mudança externa detectada (o arquivo
+mudou no disco desde a última leitura/escrita do nas — `git
+checkout`, um formatador rodando fora do nas, outro programa editando
+o mesmo arquivo): o nas avisa na barra de status, sem recarregar
+sozinho, e `Ctrl+r` é quem recarrega de propósito. `Ctrl+s` nunca
+sobrescreve uma mudança externa sem perguntar — pede a mesma
+confirmação (repetir a tecla) de `Ctrl+q`/`Ctrl+k`. Ver
+docs/decisions/0005-historico-com-autoria.md §1.
 
 Esta tabela é dados: vive em `[system]`, em `default.toml`, com a
 descrição de cada comando em `[commands]`. `nas-term` só sabe

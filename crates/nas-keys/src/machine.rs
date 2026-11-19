@@ -146,6 +146,10 @@ pub enum SystemAction {
     OpenFile,
     SwitchBuffer,
     CloseBuffer,
+    /// `Ctrl+r` — recarrega o buffer atual a partir do disco,
+    /// descartando qualquer edição local não salva (pede confirmação
+    /// se houver uma) — docs/decisions/0005 §1.
+    ReloadBuffer,
     /// `Ctrl+t n` — cria um checkpoint nomeado do projeto.
     CheckpointNew,
     /// `Ctrl+t l` — lista os checkpoints do projeto.
@@ -169,6 +173,7 @@ impl SystemAction {
             SystemAction::OpenFile => "open-file",
             SystemAction::SwitchBuffer => "switch-buffer",
             SystemAction::CloseBuffer => "close-buffer",
+            SystemAction::ReloadBuffer => "reload-buffer",
             SystemAction::CheckpointNew => "checkpoint-new",
             SystemAction::CheckpointList => "checkpoint-list",
             SystemAction::CheckpointDiff => "checkpoint-diff",

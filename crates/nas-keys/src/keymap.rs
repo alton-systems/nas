@@ -413,6 +413,7 @@ fn parse_system_action(name: &str) -> Result<SystemAction, KeymapError> {
         "open-file" => SystemAction::OpenFile,
         "switch-buffer" => SystemAction::SwitchBuffer,
         "close-buffer" => SystemAction::CloseBuffer,
+        "reload-buffer" => SystemAction::ReloadBuffer,
         "checkpoint-new" => SystemAction::CheckpointNew,
         "checkpoint-list" => SystemAction::CheckpointList,
         "checkpoint-diff" => SystemAction::CheckpointDiff,
@@ -643,6 +644,10 @@ z = "move-right"
         assert_eq!(
             keymap.system_action(&Key::char('k')),
             Some(SystemAction::CloseBuffer)
+        );
+        assert_eq!(
+            keymap.system_action(&Key::char('r')),
+            Some(SystemAction::ReloadBuffer)
         );
         assert_eq!(keymap.system_action(&Key::char('z')), None);
     }

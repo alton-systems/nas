@@ -115,6 +115,7 @@ q = "quit"
 o = "open-file"
 b = "switch-buffer"
 k = "close-buffer"
+r = "reload-buffer"
 t = { prefix = "tempo" }
 
 [system_prefixes.tempo]
@@ -172,6 +173,7 @@ quit = "sair do editor"
 open-file = "abrir arquivo"
 switch-buffer = "trocar de buffer"
 close-buffer = "fechar o buffer atual"
+reload-buffer = "recarregar o buffer a partir do disco"
 tempo = "tempo (checkpoints e histórico)"
 checkpoint-new = "novo checkpoint"
 checkpoint-list = "listar checkpoints"
