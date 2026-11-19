@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use nas_editor::{Document, OpenError, RegionObject};
 use nas_history::{
@@ -24,6 +25,15 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// deste módulo usam esse caso, então editam normalmente sem
 /// journalar nada.
 pub type SharedJournal = Arc<Mutex<Option<Journal>>>;
+
+/// Quanto tempo uma mensagem fica na echo area antes de sumir por
+/// conta própria — docs/keys.md regra 8. A outra forma de sumir é a
+/// tecla seguinte, qualquer uma (ver `App::handle_key`).
+const STATUS_MESSAGE_LIFETIME: Duration = Duration::from_secs(4);
+
+/// Quantas mensagens o histórico consultável guarda, mais antiga
+/// primeiro — além disso, a mais antiga é descartada.
+const MESSAGE_HISTORY_LIMIT: usize = 200;
 
 /// Um buffer aberto: o documento mais o estado de rolagem que é dele,
 /// não da aplicação como um todo (voltar a um buffer deveria mostrar
@@ -102,7 +112,16 @@ pub struct App {
     /// mesma combinação repetir. Limpo por qualquer ação que não seja
     /// essa mesma repetição.
     whole_buffer_confirm_pending: Option<Verb>,
-    pub status_message: Option<String>,
+    status_message: Option<String>,
+    /// Quando `status_message` foi definida — pra `ui::draw` saber
+    /// quando ela expirou (docs/keys.md regra 8: "somem depois de
+    /// alguns segundos"). `None` junto com `status_message == None`.
+    status_message_set_at: Option<Instant>,
+    /// Histórico de mensagens, mais antiga primeiro — como o
+    /// `*Messages*` do Emacs, pra reler o que já sumiu da echo area.
+    /// Guarda a mensagem inteira, mesmo que a echo area só mostre uma
+    /// versão cortada; limitado a `MESSAGE_HISTORY_LIMIT` entradas.
+    message_history: Vec<String>,
     pub prompt: Option<Prompt>,
     /// Registro interno da área de transferência — sempre atualizado em
     /// copiar/recortar. É o que `y` cola quando a área de transferência
@@ -164,6 +183,8 @@ impl App {
             close_confirm_pending: false,
             whole_buffer_confirm_pending: None,
             status_message: None,
+            status_message_set_at: None,
+            message_history: Vec::new(),
             prompt: None,
             clipboard: String::new(),
             pending_clipboard_write: None,
@@ -229,7 +250,69 @@ impl App {
         self.pending_system_prefix.as_deref()
     }
 
+    /// A mensagem ativa na echo area, se houver uma — `None` depois
+    /// de expirar (ver `expire_status_message_if_needed`) ou de uma
+    /// tecla qualquer tê-la descartado.
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    /// O histórico de mensagens, mais antiga primeiro — como o
+    /// `*Messages*` do Emacs (docs/keys.md regra 8): a mensagem
+    /// inteira, mesmo que a echo area só mostre uma versão cortada.
+    /// Ainda sem nenhuma tecla pra abrir uma visualização dele (fica
+    /// pra quando houver um jeito de navegar listas no terminal, como
+    /// a lista de checkpoints) — por ora só os testes chamam isto,
+    /// provando que o histórico já acumula corretamente.
+    #[allow(dead_code)]
+    pub fn message_history(&self) -> &[String] {
+        &self.message_history
+    }
+
+    /// Define a mensagem da echo area, com a marca de tempo pra ela
+    /// expirar por conta própria, e acrescenta ao histórico
+    /// consultável (guardando a mensagem inteira, mesmo que a echo
+    /// area mostre uma versão cortada).
+    fn set_status_message(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.message_history.push(message.clone());
+        if self.message_history.len() > MESSAGE_HISTORY_LIMIT {
+            self.message_history.remove(0);
+        }
+        self.status_message = Some(message);
+        self.status_message_set_at = Some(Instant::now());
+    }
+
+    /// Limpa a mensagem da echo area se já se passou
+    /// `STATUS_MESSAGE_LIFETIME` desde que foi definida — chamado a
+    /// cada desenho da tela (`ui::draw`), então a mensagem some sozinha
+    /// mesmo sem nenhuma tecla ser apertada nesse intervalo (docs/keys.md
+    /// regra 8: "somem depois de alguns segundos").
+    pub fn expire_status_message_if_needed(&mut self) {
+        self.expire_status_message_at(Instant::now());
+    }
+
+    /// A lógica de verdade de `expire_status_message_if_needed`,
+    /// recebendo "agora" explicitamente — pra testar sem precisar
+    /// dormir de verdade pelos `STATUS_MESSAGE_LIFETIME` inteiros
+    /// (mesma ideia do `now: u64` explícito do `nas_history::Journal`).
+    fn expire_status_message_at(&mut self, now: Instant) {
+        if let Some(set_at) = self.status_message_set_at
+            && now.duration_since(set_at) >= STATUS_MESSAGE_LIFETIME
+        {
+            self.status_message = None;
+            self.status_message_set_at = None;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Qualquer tecla descarta uma mensagem pendente da echo area
+        // (docs/keys.md regra 8: "ou na tecla seguinte") — se quem
+        // tratar esta mesma tecla quiser mostrar uma mensagem nova,
+        // define de novo durante este mesmo tratamento.
+        self.status_message = None;
+        self.status_message_set_at = None;
+
         if self.overlay.is_some() {
             self.handle_overlay_key(key);
             return;
@@ -439,7 +522,7 @@ impl App {
                 self.whole_buffer_confirm_pending = None;
             } else {
                 self.whole_buffer_confirm_pending = Some(verb);
-                self.status_message = Some(format!(
+                self.set_status_message(format!(
                     "{} o arquivo inteiro? repita pra confirmar.",
                     verb_label(verb)
                 ));
@@ -721,7 +804,7 @@ impl App {
     fn open_file(&mut self, path: &str) {
         let path = path.trim();
         if path.is_empty() {
-            self.status_message = Some("Nenhum arquivo informado.".to_string());
+            self.set_status_message("Nenhum arquivo informado.".to_string());
             return;
         }
         let resolved = expand_path(path);
@@ -738,10 +821,10 @@ impl App {
                 self.active = self.buffers.len() - 1;
             }
             Err(OpenError::NotUtf8) => {
-                self.status_message = Some(format!("'{path}' não é UTF-8 válido."));
+                self.set_status_message(format!("'{path}' não é UTF-8 válido."));
             }
             Err(err) => {
-                self.status_message = Some(format!("Erro ao abrir '{path}': {err}"));
+                self.set_status_message(format!("Erro ao abrir '{path}': {err}"));
             }
         }
     }
@@ -758,7 +841,7 @@ impl App {
     fn switch_buffer(&mut self, query: &str) {
         let query = query.trim();
         if query.is_empty() {
-            self.status_message = Some("Nenhum buffer informado.".to_string());
+            self.set_status_message("Nenhum buffer informado.".to_string());
             return;
         }
         match self
@@ -771,7 +854,7 @@ impl App {
                 self.check_external_change_active();
             }
             None => {
-                self.status_message = Some(format!("Nenhum buffer encontrado para {query:?}."));
+                self.set_status_message(format!("Nenhum buffer encontrado para {query:?}."));
             }
         }
     }
@@ -779,7 +862,7 @@ impl App {
     fn goto_line(&mut self, input: &str) {
         match input.trim().parse::<usize>() {
             Ok(line) if line >= 1 => self.document_mut().goto_line(line),
-            _ => self.status_message = Some("Número de linha inválido.".to_string()),
+            _ => self.set_status_message("Número de linha inválido.".to_string()),
         }
     }
 
@@ -790,7 +873,7 @@ impl App {
     fn close_buffer(&mut self) {
         if self.document().is_modified() && !self.close_confirm_pending {
             self.close_confirm_pending = true;
-            self.status_message = Some(format!(
+            self.set_status_message(format!(
                 "{} tem alterações não salvas — Ctrl+K de novo fecha sem salvar.",
                 buffer_name(self.document())
             ));
@@ -847,7 +930,7 @@ impl App {
             return;
         }
         self.quit_confirm_pending = true;
-        self.status_message = Some(format!(
+        self.set_status_message(format!(
             "Alterações não salvas em: {} — Ctrl+Q de novo sai sem salvar, Ctrl+S salva o buffer atual",
             modified.join(", ")
         ));
@@ -866,7 +949,7 @@ impl App {
         self.check_external_change_active();
         if self.document().external_change_pending() && !self.external_overwrite_confirm_pending {
             self.external_overwrite_confirm_pending = true;
-            self.status_message = Some(format!(
+            self.set_status_message(format!(
                 "{} mudou no disco desde a última leitura — Ctrl+S de novo sobrescreve, Ctrl+R recarrega.",
                 buffer_name(self.document())
             ));
@@ -874,11 +957,12 @@ impl App {
         }
         self.external_overwrite_confirm_pending = false;
 
-        self.status_message = Some(match self.document_mut().save() {
+        let message = match self.document_mut().save() {
             Ok(true) => "Salvo.".to_string(),
             Ok(false) => "Sem nome de arquivo; nada para salvar.".to_string(),
             Err(err) => format!("Erro ao salvar: {err}"),
-        });
+        };
+        self.set_status_message(message);
         self.flush_history();
     }
 
@@ -893,7 +977,7 @@ impl App {
 
         if self.document().is_modified() && !self.reload_confirm_pending {
             self.reload_confirm_pending = true;
-            self.status_message = Some(format!(
+            self.set_status_message(format!(
                 "{} tem alterações não salvas — Ctrl+R de novo descarta e recarrega.",
                 buffer_name(self.document())
             ));
@@ -913,12 +997,10 @@ impl App {
                     change.removed,
                     change.inserted,
                 );
-                self.status_message = Some("Recarregado.".to_string());
+                self.set_status_message("Recarregado.".to_string());
             }
-            Ok(None) => {
-                self.status_message = Some("Já estava sincronizado com o disco.".to_string())
-            }
-            Err(err) => self.status_message = Some(format!("Erro ao recarregar: {err}")),
+            Ok(None) => self.set_status_message("Já estava sincronizado com o disco.".to_string()),
+            Err(err) => self.set_status_message(format!("Erro ao recarregar: {err}")),
         }
     }
 
@@ -927,7 +1009,7 @@ impl App {
     /// da conferência geral de `check_external_changes`.
     fn check_external_change_active(&mut self) {
         if let Some(message) = self.check_external_change_at(self.active) {
-            self.status_message = Some(message);
+            self.set_status_message(message);
         }
     }
 
@@ -941,7 +1023,7 @@ impl App {
             .filter_map(|index| self.check_external_change_at(index))
             .collect();
         if !messages.is_empty() {
-            self.status_message = Some(messages.join("; "));
+            self.set_status_message(messages.join("; "));
         }
     }
 
@@ -1008,7 +1090,7 @@ impl App {
                 change.removed,
                 change.inserted,
             ),
-            None => self.status_message = Some("Nada para desfazer.".to_string()),
+            None => self.set_status_message("Nada para desfazer.".to_string()),
         }
     }
 
@@ -1025,11 +1107,11 @@ impl App {
     fn checkpoint_new(&mut self, name: &str) {
         let name = name.trim();
         if name.is_empty() {
-            self.status_message = Some("Nenhum nome informado.".to_string());
+            self.set_status_message("Nenhum nome informado.".to_string());
             return;
         }
         let Some(history_dir) = self.history_dir() else {
-            self.status_message = Some("Histórico não disponível.".to_string());
+            self.set_status_message("Histórico não disponível.".to_string());
             return;
         };
         self.flush_history();
@@ -1044,7 +1126,7 @@ impl App {
             .collect();
 
         if files.is_empty() {
-            self.status_message = Some("Nenhum arquivo rastreado ainda.".to_string());
+            self.set_status_message("Nenhum arquivo rastreado ainda.".to_string());
             return;
         }
 
@@ -1056,8 +1138,8 @@ impl App {
             false,
             &files,
         ) {
-            Ok(created) => self.status_message = Some(checkpoint_created_message(&created)),
-            Err(err) => self.status_message = Some(format!("Erro ao criar checkpoint: {err}")),
+            Ok(created) => self.set_status_message(checkpoint_created_message(&created)),
+            Err(err) => self.set_status_message(format!("Erro ao criar checkpoint: {err}")),
         }
     }
 
@@ -1065,12 +1147,12 @@ impl App {
     /// primeiro, num `Overlay`.
     fn checkpoint_list(&mut self) {
         let Some(history_dir) = self.history_dir() else {
-            self.status_message = Some("Histórico não disponível.".to_string());
+            self.set_status_message("Histórico não disponível.".to_string());
             return;
         };
         match nas_history::list_checkpoints(&history_dir) {
             Ok(checkpoints) if checkpoints.is_empty() => {
-                self.status_message = Some("Nenhum checkpoint ainda.".to_string());
+                self.set_status_message("Nenhum checkpoint ainda.".to_string());
             }
             Ok(checkpoints) => {
                 let lines = checkpoints
@@ -1097,7 +1179,7 @@ impl App {
                     scroll: 0,
                 });
             }
-            Err(err) => self.status_message = Some(format!("Erro ao listar checkpoints: {err}")),
+            Err(err) => self.set_status_message(format!("Erro ao listar checkpoints: {err}")),
         }
     }
 
@@ -1108,7 +1190,7 @@ impl App {
     /// tarefa.
     fn checkpoint_diff(&mut self) {
         let Some(history_dir) = self.history_dir() else {
-            self.status_message = Some("Histórico não disponível.".to_string());
+            self.set_status_message("Histórico não disponível.".to_string());
             return;
         };
         let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap_or_default();
@@ -1136,7 +1218,7 @@ impl App {
                     scroll: 0,
                 });
             }
-            Err(err) => self.status_message = Some(format!("Erro ao gerar diff: {err}")),
+            Err(err) => self.set_status_message(format!("Erro ao gerar diff: {err}")),
         }
     }
 
@@ -1144,14 +1226,14 @@ impl App {
     /// buffer ativo, num `Overlay` — ver `nas_history::file_history`.
     fn checkpoint_blame(&mut self) {
         let Some(history_dir) = self.history_dir() else {
-            self.status_message = Some("Histórico não disponível.".to_string());
+            self.set_status_message("Histórico não disponível.".to_string());
             return;
         };
         let file = buffer_name(self.document());
         self.flush_history();
         match nas_history::file_history(&history_dir, &file) {
             Ok(entries) if entries.is_empty() => {
-                self.status_message = Some(format!("Nenhuma edição registrada para {file}."));
+                self.set_status_message(format!("Nenhuma edição registrada para {file}."));
             }
             Ok(entries) => {
                 let lines = entries
@@ -1174,7 +1256,7 @@ impl App {
                     scroll: 0,
                 });
             }
-            Err(err) => self.status_message = Some(format!("Erro ao ler histórico: {err}")),
+            Err(err) => self.set_status_message(format!("Erro ao ler histórico: {err}")),
         }
     }
 
@@ -1185,11 +1267,11 @@ impl App {
     fn restore_checkpoint(&mut self, query: &str) {
         let query = query.trim();
         if query.is_empty() {
-            self.status_message = Some("Nenhum checkpoint informado.".to_string());
+            self.set_status_message("Nenhum checkpoint informado.".to_string());
             return;
         }
         let Some(history_dir) = self.history_dir() else {
-            self.status_message = Some("Histórico não disponível.".to_string());
+            self.set_status_message("Histórico não disponível.".to_string());
             return;
         };
         let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap_or_default();
@@ -1198,7 +1280,7 @@ impl App {
             .rev()
             .find(|c| c.name.contains(query) || c.id.contains(query))
         else {
-            self.status_message = Some(format!("Nenhum checkpoint encontrado para {query:?}."));
+            self.set_status_message(format!("Nenhum checkpoint encontrado para {query:?}."));
             return;
         };
         let checkpoint = checkpoint.clone();
@@ -1228,7 +1310,7 @@ impl App {
                     extra.join(", ")
                 ));
             }
-            self.status_message = Some(format!(
+            self.set_status_message(format!(
                 "{} — Ctrl+t r de novo com o mesmo nome confirma.",
                 warning.join("; ")
             ));
@@ -1324,7 +1406,7 @@ impl App {
         }
 
         self.flush_history();
-        self.status_message = Some(restore_summary_message(
+        self.set_status_message(restore_summary_message(
             &checkpoint.name,
             &restored,
             &trashed,
@@ -1403,12 +1485,12 @@ impl App {
     /// continuem sendo registradas.
     fn confirm_delete_history(&mut self, input: &str) {
         let Some(history_dir) = self.history_dir() else {
-            self.status_message = Some("Histórico não disponível.".to_string());
+            self.set_status_message("Histórico não disponível.".to_string());
             return;
         };
         match nas_history::delete_project_history(&history_dir, input.trim()) {
             Ok(()) => {
-                self.status_message = Some("Histórico apagado.".to_string());
+                self.set_status_message("Histórico apagado.".to_string());
                 // `delete_project_history` removeu a pasta inteira —
                 // `history_dir()` de novo a recria (ensure_history_dir
                 // é idempotente) antes de abrir o journal nela.
@@ -3067,6 +3149,49 @@ mod tests {
         assert!(
             nas_history::list_tracked(&history_dir).unwrap().is_empty(),
             "uma mudança externa não deveria, por si só, iniciar o rastreamento do arquivo"
+        );
+    }
+
+    #[test]
+    fn mensagem_expira_depois_do_tempo_mas_nao_antes() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.set_status_message("ola");
+
+        app.expire_status_message_at(Instant::now() + STATUS_MESSAGE_LIFETIME / 2);
+        assert_eq!(
+            app.status_message(),
+            Some("ola"),
+            "não deveria ter expirado ainda"
+        );
+
+        app.expire_status_message_at(Instant::now() + STATUS_MESSAGE_LIFETIME);
+        assert_eq!(app.status_message(), None, "deveria ter expirado");
+    }
+
+    #[test]
+    fn qualquer_tecla_descarta_a_mensagem_pendente() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.set_status_message("ola");
+        assert!(app.status_message().is_some());
+
+        app.handle_key(key(KeyCode::Char('j'))); // qualquer tecla, sem relação com a mensagem
+        assert_eq!(
+            app.status_message(),
+            None,
+            "a tecla seguinte deveria ter descartado a mensagem"
+        );
+    }
+
+    #[test]
+    fn historico_de_mensagens_guarda_cada_mensagem_definida() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.set_status_message("primeira");
+        app.handle_key(key(KeyCode::Char('j'))); // descarta "primeira" da tela, não do histórico
+        app.set_status_message("segunda");
+
+        assert_eq!(
+            app.message_history(),
+            &["primeira".to_string(), "segunda".to_string()]
         );
     }
 }

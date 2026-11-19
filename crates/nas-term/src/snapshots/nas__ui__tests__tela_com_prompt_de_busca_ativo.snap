@@ -1,7 +1,9 @@
 ---
 source: crates/nas-term/src/ui.rs
+assertion_line: 410
 expression: rendered
 ---
 1 ola mundo                   
                               
+[V] [sem nome] [+]         1:5
 Buscar: mun

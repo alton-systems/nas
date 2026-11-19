@@ -1,0 +1,17 @@
+---
+source: crates/nas-term/src/ui.rs
+assertion_line: 442
+expression: rendered
+---
+1 ola mundo                                                                     
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+[V] [sem nome] [+]                                                          1:10
+tempo (checkpoints e histórico)                                                 
+a autoria (histórico do arquivo)  e diff entre checkpoints                      
+l listar checkpoints              n novo checkpoint                             
+r restaurar checkpoint            z apagar histórico do projeto

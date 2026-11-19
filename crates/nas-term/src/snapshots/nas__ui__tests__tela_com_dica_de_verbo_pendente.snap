@@ -1,7 +1,19 @@
 ---
 source: crates/nas-term/src/ui.rs
+assertion_line: 426
 expression: rendered
 ---
 1 ola mundo                                                 
                                                             
-apagar  »  : até o fim da linha  ·  ; até aqui  ·  J até o i
+                                                            
+                                                            
+                                                            
+                                                            
+[V] [sem nome] [+]                                      1:10
+apagar                                                      
+: até o fim da linha          ; até aqui                    
+J até o início da linha       K até o fim do arquivo        
+L até o início do arquivo     W parágrafo                   
+a o arquivo inteiro           j até aqui, pra trás          
+k a linha atual e a de baixo  l a linha atual e a de cima   
+w palavra
