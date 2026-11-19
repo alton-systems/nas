@@ -4,13 +4,22 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use nas_keys::PendingHint;
+use nas_keys::{Key, PendingHint};
 
 use crate::app::{App, Overlay, PromptKind, buffer_name};
+
+/// Cor das letras das opções numa dica which-key — provisória, até
+/// existir um sistema de temas de verdade (issue #10, "Temas por
+/// arquivo de dados").
+const HINT_KEY_COLOR: Color = Color::Yellow;
+
+/// Cor de uma opção destrutiva (ex.: `Ctrl+t z`) numa dica which-key —
+/// provisória, mesma ressalva de `HINT_KEY_COLOR`.
+const HINT_DESTRUCTIVE_COLOR: Color = Color::Red;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let root = frame.area();
@@ -161,51 +170,101 @@ fn echo_area_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
 /// Desenha a echo area já computada por `echo_area_lines` — nunca
 /// decide o conteúdo, só a apresenta; `area.height` já reflete
-/// `lines.len()` (calculado por `draw` antes de montar o layout).
+/// `lines.len()` (calculado por `draw` antes de montar o layout). Usa
+/// o fundo do editor (não o invertido da status line, acima): a echo
+/// area é conteúdo passageiro, não estado fixo — ver `draw_status`.
 fn draw_echo_area(frame: &mut Frame, area: Rect, lines: &[Line<'static>]) {
-    let style = Style::default().add_modifier(Modifier::REVERSED);
-    frame.render_widget(Paragraph::new(lines.to_vec()).style(style), area);
+    frame.render_widget(Paragraph::new(lines.to_vec()), area);
+}
+
+/// Uma opção da dica, com a letra em destaque (`HINT_KEY_COLOR`) — o
+/// texto plano equivalente (pra medir largura) é `{key} {description}`.
+fn entry_spans(key: Key, description: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(key.to_string(), Style::default().fg(HINT_KEY_COLOR)),
+        Span::raw(format!(" {description}")),
+    ]
+}
+
+fn entry_text(key: Key, description: &str) -> String {
+    format!("{key} {description}")
 }
 
 /// Uma dica de verbo/prefixo/unidade pendente (docs/keys.md regra 8),
-/// no estilo which-key: numa linha só (`rótulo  »  tecla descrição  ·
-/// ...`) se couber em `width`; senão, o rótulo isolado na primeira
-/// linha e as opções em colunas nas seguintes, sem cortar nenhuma —
-/// a echo area cresce temporariamente pra caber. As entradas vêm de
-/// um `HashMap` dentro do `nas-keys` — ordenadas aqui pela própria
-/// tecla, pra não depender da ordem de iteração do hash.
+/// no estilo which-key: numa linha só (`tecla  rótulo  »  tecla
+/// descrição  · ...`) se couber em `width`; senão, o título isolado na
+/// primeira linha e as opções em colunas nas seguintes, sem cortar
+/// nenhuma — a echo area cresce temporariamente pra caber. Opções
+/// destrutivas (`entry.2`) nunca entram na linha única nem nas
+/// colunas: ficam isoladas, cada uma na própria linha, no fim, na cor
+/// de alerta — o que também força o layout crescido mesmo quando o
+/// resto caberia numa linha só.
+///
+/// As entradas de um prefixo de sistema já vêm na ordem declarada no
+/// TOML (`hint.ordered`); as da máquina modal vêm de um `HashMap` e
+/// são alfabetizadas aqui, pra não depender da ordem de iteração do
+/// hash.
 fn which_key_lines(mut hint: PendingHint, width: usize) -> Vec<Line<'static>> {
-    hint.entries.sort_by_key(|(key, _)| key.to_string());
-    let formatted: Vec<String> = hint
-        .entries
-        .iter()
-        .map(|(key, description)| format!("{key} {description}"))
-        .collect();
-
-    let single_line = format!("{}  »  {}", hint.label, formatted.join("  ·  "));
-    if single_line.chars().count() <= width {
-        return vec![Line::from(single_line)];
+    if !hint.ordered {
+        hint.entries.sort_by_key(|(key, _, _)| key.to_string());
     }
 
-    let col_width = formatted
-        .iter()
-        .map(|s| s.chars().count())
-        .max()
-        .unwrap_or(0)
-        + 2;
-    let columns = (width / col_width.max(1)).max(1);
+    let (destructive, normal): (Vec<_>, Vec<_>) =
+        hint.entries.into_iter().partition(|(_, _, d)| *d);
+
+    let title = format!("{}  {}", hint.keys, hint.label);
+
+    if destructive.is_empty() {
+        let mut spans = vec![Span::raw(format!("{title}  »  "))];
+        let mut plain_width = title.chars().count() + 5;
+        for (i, (key, description, _)) in normal.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  ·  "));
+                plain_width += 5;
+            }
+            spans.extend(entry_spans(*key, description));
+            plain_width += entry_text(*key, description).chars().count();
+        }
+        if plain_width <= width {
+            return vec![Line::from(spans)];
+        }
+    }
 
     let mut lines = vec![Line::from(Span::styled(
-        hint.label,
+        title,
         Style::default().add_modifier(Modifier::BOLD),
     ))];
-    for row in formatted.chunks(columns) {
-        let text: String = row
+
+    if !normal.is_empty() {
+        let col_width = normal
             .iter()
-            .map(|entry| format!("{entry:<col_width$}"))
-            .collect();
-        lines.push(Line::from(text.trim_end().to_string()));
+            .map(|(key, description, _)| entry_text(*key, description).chars().count())
+            .max()
+            .unwrap_or(0)
+            + 2;
+        let columns = (width / col_width.max(1)).max(1);
+
+        for row in normal.chunks(columns) {
+            let mut spans = Vec::new();
+            for (i, (key, description, _)) in row.iter().enumerate() {
+                spans.extend(entry_spans(*key, description));
+                if i + 1 < row.len() {
+                    let pad =
+                        col_width.saturating_sub(entry_text(*key, description).chars().count());
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
     }
+
+    for (key, description, _) in &destructive {
+        lines.push(Line::from(Span::styled(
+            entry_text(*key, description),
+            Style::default().fg(HINT_DESTRUCTIVE_COLOR),
+        )));
+    }
+
     lines
 }
 

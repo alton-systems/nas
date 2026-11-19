@@ -33,7 +33,7 @@ const STATUS_MESSAGE_LIFETIME: Duration = Duration::from_secs(4);
 
 /// Quantas mensagens o histórico consultável guarda, mais antiga
 /// primeiro — além disso, a mais antiga é descartada.
-const MESSAGE_HISTORY_LIMIT: usize = 200;
+const MESSAGE_HISTORY_LIMIT: usize = 1000;
 
 /// Um buffer aberto: o documento mais o estado de rolagem que é dele,
 /// não da aplicação como um todo (voltar a um buffer deveria mostrar
@@ -260,11 +260,7 @@ impl App {
     /// O histórico de mensagens, mais antiga primeiro — como o
     /// `*Messages*` do Emacs (docs/keys.md regra 8): a mensagem
     /// inteira, mesmo que a echo area só mostre uma versão cortada.
-    /// Ainda sem nenhuma tecla pra abrir uma visualização dele (fica
-    /// pra quando houver um jeito de navegar listas no terminal, como
-    /// a lista de checkpoints) — por ora só os testes chamam isto,
-    /// provando que o histórico já acumula corretamente.
-    #[allow(dead_code)]
+    /// `Ctrl+t m` (`show_message_history`) abre uma visualização dele.
     pub fn message_history(&self) -> &[String] {
         &self.message_history
     }
@@ -430,6 +426,7 @@ impl App {
             SystemAction::CheckpointRestore => self.open_prompt(PromptKind::RestoreCheckpoint),
             SystemAction::CheckpointBlame => self.checkpoint_blame(),
             SystemAction::HistoryDelete => self.open_prompt(PromptKind::DeleteHistoryConfirm),
+            SystemAction::MessageHistory => self.show_message_history(),
             SystemAction::Quit
             | SystemAction::CloseBuffer
             | SystemAction::Save
@@ -1258,6 +1255,22 @@ impl App {
             }
             Err(err) => self.set_status_message(format!("Erro ao ler histórico: {err}")),
         }
+    }
+
+    /// `Ctrl+t m`: histórico de mensagens da echo area, num `Overlay`
+    /// — mais recente primeiro, como `checkpoint_list`.
+    fn show_message_history(&mut self) {
+        if self.message_history().is_empty() {
+            self.set_status_message("Nenhuma mensagem ainda.".to_string());
+            return;
+        }
+        let lines = self.message_history().iter().rev().cloned().collect();
+        self.overlay = Some(Overlay {
+            title: "Histórico de mensagens (mais recente primeiro) — qualquer tecla fecha"
+                .to_string(),
+            lines,
+            scroll: 0,
+        });
     }
 
     /// `Ctrl+t r`: restaura o checkpoint cujo nome (ou id) contém
