@@ -274,6 +274,7 @@ seguinte, **sem** Ctrl, escolhe o comando — mesma ideia do líder
 | `Ctrl+t e` | diff entre os dois checkpoints mais recentes | `d` já é apagar (verbo); `e`ntre as duas versões |
 | `Ctrl+t r` | restaurar um checkpoint | `r`estaurar, livre |
 | `Ctrl+t a` | autoria — histórico de edições do arquivo atual | `b` já é `Ctrl+b` (buffer); `a`utoria |
+| `Ctrl+t m` | histórico de mensagens (echo area) num overlay | `m`ensagens, livre |
 | `Ctrl+t z` | apagar o histórico do projeto (exige digitar "apagar") | sem uso melhor por perto; ação rara e destrutiva, letra "longe" das outras |
 
 `Ctrl+t` por si só não faz nada além de abrir o prefixo — uma tecla

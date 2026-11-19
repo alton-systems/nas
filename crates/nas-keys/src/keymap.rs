@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::key::Key;
@@ -87,10 +88,25 @@ pub struct Keymap {
     /// a tecla seguinte (sem Ctrl) é quem resolve, em
     /// `system_prefixes`.
     system_prefix_keys: HashMap<Key, String>,
-    /// `[system-prefixes.<nome>]`: a tecla (sem Ctrl) que completa um
+    /// `[system_prefixes.<nome>]`: a tecla (sem Ctrl) que completa um
     /// prefixo de sistema pendente — hoje só `"tempo"`
-    /// (docs/keys.md §5.7, prefixo `Ctrl+t`).
-    system_prefixes: HashMap<String, HashMap<Key, SystemAction>>,
+    /// (docs/keys.md §5.7, prefixo `Ctrl+t`). Um `Vec`, não um
+    /// `HashMap`, porque a **ordem de declaração no TOML importa**
+    /// pra dica which-key (docs/keys.md regra 8) — ela não é
+    /// alfabetizada como as dicas da máquina modal.
+    system_prefixes: HashMap<String, Vec<SystemPrefixEntry>>,
+}
+
+/// Uma tecla dentro de um prefixo de sistema (`[system_prefixes.*]`),
+/// na ordem em que apareceu no TOML.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SystemPrefixEntry {
+    pub key: Key,
+    pub action: SystemAction,
+    /// Uma ação destrutiva (hoje só `history-delete`) sempre aparece
+    /// por último, na própria linha, destacada — ver
+    /// `ui::which_key_lines` em `nas-term`.
+    pub destructive: bool,
 }
 
 impl Keymap {
@@ -138,20 +154,65 @@ impl Keymap {
     /// O comando ligado a `key` dentro do prefixo de sistema `name`
     /// (ex.: `"tempo"`, `n` → `checkpoint-new`).
     pub(crate) fn system_prefix_action(&self, name: &str, key: &Key) -> Option<SystemAction> {
-        self.system_prefixes.get(name)?.get(key).copied()
+        self.system_prefixes
+            .get(name)?
+            .iter()
+            .find(|entry| entry.key == *key)
+            .map(|entry| entry.action)
     }
 
-    /// As teclas válidas e suas descrições para um prefixo de sistema
-    /// pendente (`Ctrl+t`) — mesma ideia de `hint_for_prefix`, mas
-    /// para `[system-prefixes.*]`.
-    pub(crate) fn hint_for_system_prefix(&self, name: &str) -> Vec<(Key, String)> {
-        let Some(bindings) = self.system_prefixes.get(name) else {
+    /// As teclas válidas, suas descrições e se são destrutivas, para
+    /// um prefixo de sistema pendente (`Ctrl+t`) — mesma ideia de
+    /// `hint_for_prefix`, mas para `[system_prefixes.*]`. **Na ordem
+    /// declarada no TOML** (não alfabetizada) — ver `SystemPrefixEntry`.
+    pub(crate) fn hint_for_system_prefix(&self, name: &str) -> Vec<(Key, String, bool)> {
+        let Some(entries) = self.system_prefixes.get(name) else {
             return Vec::new();
         };
-        bindings
+        entries
             .iter()
-            .map(|(key, action)| (*key, self.describe(action.command_name())))
+            .map(|entry| {
+                (
+                    entry.key,
+                    self.describe(entry.action.command_name()),
+                    entry.destructive,
+                )
+            })
             .collect()
+    }
+
+    /// A tecla (sem Ctrl) que abre o prefixo de sistema `name` — pra
+    /// mostrar "Ctrl+<tecla>" no título da dica which-key.
+    pub(crate) fn key_for_system_prefix(&self, name: &str) -> Option<Key> {
+        self.system_prefix_keys
+            .iter()
+            .find(|(_, n)| n.as_str() == name)
+            .map(|(key, _)| *key)
+    }
+
+    /// A tecla que abre o prefixo nomeado `name` em `[visual]` (`g`,
+    /// `Espaço`) — pra mostrar no título da dica which-key.
+    pub(crate) fn key_for_prefix(&self, name: &str) -> Option<Key> {
+        self.visual
+            .iter()
+            .find(|(_, binding)| matches!(binding, Binding::Prefix(n) if n == name))
+            .map(|(key, _)| *key)
+    }
+
+    /// A tecla que inicia o verbo `verb` em `[visual]` (`d`, `c`, `x`).
+    pub(crate) fn key_for_verb(&self, verb: Verb) -> Option<Key> {
+        self.visual
+            .iter()
+            .find(|(_, binding)| matches!(binding, Binding::Verb(v) if *v == verb))
+            .map(|(key, _)| *key)
+    }
+
+    /// A tecla que inicia a unidade `unit` em `[visual]` (`w`, `W`).
+    pub(crate) fn key_for_unit(&self, unit: Unit) -> Option<Key> {
+        self.visual
+            .iter()
+            .find(|(_, binding)| matches!(binding, Binding::Unit(u) if *u == unit))
+            .map(|(key, _)| *key)
     }
 
     /// Descrição curta de um nome de comando (ação, verbo, unidade,
@@ -239,6 +300,22 @@ enum RawSystemBinding {
     Prefix { prefix: String },
 }
 
+/// Uma entrada de `[system_prefixes.<nome>]`: ou só o nome do comando
+/// (`"checkpoint-new"`), ou uma forma detalhada marcando a ação como
+/// destrutiva (`{ action = "history-delete", destructive = true }`) —
+/// uma ação destrutiva sempre aparece por último, na própria linha,
+/// na dica which-key (ver `ui::which_key_lines` em `nas-term`).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawSystemPrefixEntry {
+    Named(String),
+    Detailed {
+        action: String,
+        #[serde(default)]
+        destructive: bool,
+    },
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawKeymap {
     #[serde(default)]
@@ -253,8 +330,12 @@ struct RawKeymap {
     commands: HashMap<String, String>,
     #[serde(default)]
     system: HashMap<String, RawSystemBinding>,
+    /// A ordem das chaves dentro de cada `IndexMap` é a ordem em que
+    /// apareceram no TOML — preservada de propósito (ver
+    /// `SystemPrefixEntry`), diferente dos outros `HashMap` deste
+    /// struct, cuja ordem não importa.
     #[serde(default)]
-    system_prefixes: HashMap<String, HashMap<String, String>>,
+    system_prefixes: HashMap<String, IndexMap<String, RawSystemPrefixEntry>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -376,16 +457,27 @@ fn resolve_system(raw: HashMap<String, RawSystemBinding>) -> Result<ResolvedSyst
 }
 
 fn resolve_system_prefixes(
-    raw: HashMap<String, HashMap<String, String>>,
-) -> Result<HashMap<String, HashMap<Key, SystemAction>>, KeymapError> {
+    raw: HashMap<String, IndexMap<String, RawSystemPrefixEntry>>,
+) -> Result<HashMap<String, Vec<SystemPrefixEntry>>, KeymapError> {
     raw.into_iter()
         .map(|(name, bindings)| {
             let resolved = bindings
                 .into_iter()
-                .map(|(key_spec, action_name)| {
+                .map(|(key_spec, raw_entry)| {
                     let key = parse_key(&key_spec)?;
+                    let (action_name, destructive) = match raw_entry {
+                        RawSystemPrefixEntry::Named(action) => (action, false),
+                        RawSystemPrefixEntry::Detailed {
+                            action,
+                            destructive,
+                        } => (action, destructive),
+                    };
                     let action = parse_system_action(&action_name)?;
-                    Ok((key, action))
+                    Ok(SystemPrefixEntry {
+                        key,
+                        action,
+                        destructive,
+                    })
                 })
                 .collect::<Result<_, KeymapError>>()?;
             Ok((name, resolved))
@@ -420,6 +512,7 @@ fn parse_system_action(name: &str) -> Result<SystemAction, KeymapError> {
         "checkpoint-restore" => SystemAction::CheckpointRestore,
         "checkpoint-blame" => SystemAction::CheckpointBlame,
         "history-delete" => SystemAction::HistoryDelete,
+        "message-history" => SystemAction::MessageHistory,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
