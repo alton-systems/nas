@@ -6,6 +6,7 @@ mod ui;
 
 use std::io::{self, Write as _};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
 use nas_editor::{Document, OpenError};
@@ -14,8 +15,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{self, SetCursorStyle};
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
-    KeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyEventKind, KeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -26,6 +27,18 @@ use ratatui::crossterm::terminal::{
 use app::{App, SharedJournal};
 
 type Backend = CrosstermBackend<io::Stdout>;
+
+/// Intervalo da checagem leve de mudança externa — "a cada poucos
+/// segundos", docs/decisions/0005 §1. Também é o timeout do `poll`
+/// que mantém o loop de eventos vivo sem bloquear indefinidamente:
+/// cada vez que `poll` retorna sem evento nenhum, já se passou esse
+/// tempo desde a última volta, então é a hora certa de conferir —
+/// sem precisar de um temporizador separado. Se o usuário está
+/// digitando sem pausa (eventos chegando mais rápido que isto), a
+/// checagem simplesmente espera a próxima pausa; os outros três
+/// momentos (trocar de buffer, salvar, foco) continuam cobrindo esse
+/// caso.
+const EXTERNAL_CHANGE_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
@@ -132,14 +145,23 @@ async fn run(terminal: &mut Terminal<Backend>, app: &mut App) -> io::Result<()> 
         execute!(io::stdout(), cursor_style_for(app))?;
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
-            // Texto colado via bracketed paste nunca passa pela máquina
-            // modal — sem isso, colar algo como "dd" seria interpretado
-            // tecla por tecla como comandos do estado Visual, em vez de
-            // simplesmente inserido como texto.
-            Event::Paste(text) => app.handle_paste(text),
-            _ => {}
+        // `poll` com um timeout em vez de `read` bloqueando sem fim:
+        // quando ele retorna `false` (nenhum evento chegou dentro do
+        // intervalo), é a vez da checagem leve de mudança externa —
+        // ver `EXTERNAL_CHANGE_CHECK_INTERVAL`.
+        if !event::poll(EXTERNAL_CHANGE_CHECK_INTERVAL)? {
+            app.check_external_changes();
+        } else {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
+                // Texto colado via bracketed paste nunca passa pela
+                // máquina modal — sem isso, colar algo como "dd" seria
+                // interpretado tecla por tecla como comandos do estado
+                // Visual, em vez de simplesmente inserido como texto.
+                Event::Paste(text) => app.handle_paste(text),
+                Event::FocusGained => app.handle_focus_gained(),
+                _ => {}
+            }
         }
 
         if let Some(text) = app.pending_clipboard_write.take() {
@@ -214,6 +236,10 @@ fn setup_terminal() -> io::Result<Terminal<Backend>> {
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
     execute!(io::stdout(), EnableBracketedPaste)?;
+    // `Event::FocusGained` é um dos quatro momentos em que o nas
+    // confere mudança externa (docs/decisions/0005 §1) — sem
+    // habilitar isto, o terminal nunca reporta foco.
+    execute!(io::stdout(), EnableFocusChange)?;
     if supports_keyboard_enhancement().unwrap_or(false) {
         execute!(
             io::stdout(),
@@ -236,6 +262,7 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), cursor::Show);
     let _ = execute!(io::stdout(), SetCursorStyle::DefaultUserShape);
     let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(io::stdout(), DisableFocusChange);
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
