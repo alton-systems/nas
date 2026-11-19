@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use helix_core::chars::{CharCategory, categorize_char};
 use helix_core::line_ending::LineEnding;
@@ -152,6 +153,24 @@ pub struct Document {
     path: Option<PathBuf>,
     modified: bool,
     line_ending: LineEnding,
+    /// `mtime`/tamanho do arquivo em disco como o nas conhece por
+    /// última vez (ao abrir, salvar ou recarregar) — a conferência
+    /// barata de mudança externa (docs/decisions/0005 §1) compara
+    /// isto contra o disco antes de ler qualquer conteúdo.
+    disk_mtime: Option<SystemTime>,
+    disk_len: Option<u64>,
+    /// O conteúdo do arquivo como o nas conhece por última vez — não
+    /// necessariamente igual a `rope` (que pode ter edições locais
+    /// não salvas). É contra isto, não contra `rope`, que uma mudança
+    /// externa é comparada: "mudou" significa "mudou no disco desde a
+    /// última vez que o nas leu ou escreveu", independente de haver
+    /// edição local pendente.
+    disk_snapshot: Option<String>,
+    /// Uma mudança externa foi detectada e ainda não foi resolvida —
+    /// recarregada (`reload`) ou confirmada a sobrescrita (`save`
+    /// chamado de propósito depois do aviso). Enquanto `true`, quem
+    /// chama (`nas-term`) não deve salvar por cima sem perguntar.
+    external_change_pending: bool,
 }
 
 impl Document {
@@ -165,6 +184,10 @@ impl Document {
             path: None,
             modified: false,
             line_ending: LineEnding::LF,
+            disk_mtime: None,
+            disk_len: None,
+            disk_snapshot: None,
+            external_change_pending: false,
         }
     }
 
@@ -175,15 +198,22 @@ impl Document {
     /// com o conteúdo inválido.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenError> {
         let path = path.as_ref();
-        let rope = match fs::File::open(path) {
-            Ok(file) => Rope::from_reader(BufReader::new(file)).map_err(|err| {
-                if err.kind() == io::ErrorKind::InvalidData {
-                    OpenError::NotUtf8
-                } else {
-                    OpenError::Io(err)
-                }
-            })?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Rope::new(),
+        let (rope, disk_mtime, disk_len, disk_snapshot) = match fs::File::open(path) {
+            Ok(file) => {
+                let rope = Rope::from_reader(BufReader::new(file)).map_err(|err| {
+                    if err.kind() == io::ErrorKind::InvalidData {
+                        OpenError::NotUtf8
+                    } else {
+                        OpenError::Io(err)
+                    }
+                })?;
+                let metadata = fs::metadata(path).ok();
+                let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
+                let len = metadata.map(|m| m.len());
+                let snapshot = Some(rope.to_string());
+                (rope, mtime, len, snapshot)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (Rope::new(), None, None, None),
             Err(err) => return Err(OpenError::Io(err)),
         };
         let line_ending = line_ending::auto_detect_line_ending(&rope).unwrap_or(LineEnding::LF);
@@ -196,6 +226,10 @@ impl Document {
             path: Some(path.to_path_buf()),
             modified: false,
             line_ending,
+            disk_mtime,
+            disk_len,
+            disk_snapshot,
+            external_change_pending: false,
         })
     }
 
@@ -207,18 +241,119 @@ impl Document {
         self.modified
     }
 
+    /// Uma mudança externa foi detectada (por `check_external_change`)
+    /// e ainda não foi resolvida — ver o campo `external_change_pending`.
+    pub fn external_change_pending(&self) -> bool {
+        self.external_change_pending
+    }
+
     /// Escreve o buffer no caminho associado, atomicamente (arquivo
     /// temporário na mesma pasta + fsync + rename por cima do original,
     /// preservando as permissões). Retorna `false` se o documento não
-    /// tiver um caminho (ainda não há "salvar como").
+    /// tiver um caminho (ainda não há "salvar como"). Depois de salvar,
+    /// o disco e a memória estão em sincronia — `external_change_pending`
+    /// some, mesmo que estivesse pendente (salvar é como o nas resolve
+    /// uma mudança externa escolhendo sobrescrever).
     pub fn save(&mut self) -> io::Result<bool> {
-        let Some(path) = &self.path else {
+        let Some(path) = self.path.clone() else {
             return Ok(false);
         };
-        write_atomic(path, &self.rope)?;
+        write_atomic(&path, &self.rope)?;
         self.modified = false;
+        self.external_change_pending = false;
+        if let Ok(metadata) = fs::metadata(&path) {
+            self.disk_mtime = metadata.modified().ok();
+            self.disk_len = Some(metadata.len());
+        }
+        self.disk_snapshot = Some(self.rope.to_string());
         tracing::info!(path = %path.display(), "documento salvo");
         Ok(true)
+    }
+
+    /// Confere o arquivo em disco contra o que o nas conhece —
+    /// docs/decisions/0005 §1. Primeiro compara `mtime`/tamanho (um
+    /// `stat`, barato); só lê o conteúdo de verdade se algum dos dois
+    /// mudou (podem mudar sem o conteúdo mudar — um `touch`, por
+    /// exemplo — por isso a leitura confirma antes de reportar uma
+    /// mudança de verdade). `None` se não há caminho associado, ou se
+    /// nada mudou. Atualiza o que o nas conhece do disco e marca
+    /// `external_change_pending`, mas **não toca no buffer em
+    /// memória** — quem chama decide se recarrega (`reload`).
+    ///
+    /// O `TextChange` devolvido trata o arquivo inteiro como a região
+    /// afetada (`from: 0`, `to: <tamanho antigo>`) — uma mudança
+    /// externa não tem uma transação nossa pra computar uma região
+    /// exata menor, então o arquivo inteiro é a única região que se
+    /// pode afirmar com certeza.
+    pub fn check_external_change(&mut self) -> io::Result<Option<TextChange>> {
+        let Some(path) = self.path.clone() else {
+            return Ok(None);
+        };
+
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
+        let len = metadata.as_ref().map(|m| m.len());
+
+        if mtime == self.disk_mtime && len == self.disk_len {
+            return Ok(None);
+        }
+
+        let old_content = self.disk_snapshot.clone().unwrap_or_default();
+        let new_content = match &metadata {
+            Some(_) => fs::read_to_string(&path)?,
+            None => String::new(),
+        };
+
+        self.disk_mtime = mtime;
+        self.disk_len = len;
+        self.disk_snapshot = metadata.as_ref().map(|_| new_content.clone());
+
+        if new_content == old_content {
+            return Ok(None);
+        }
+
+        self.external_change_pending = true;
+        Ok(Some(TextChange {
+            from: 0,
+            to: old_content.chars().count(),
+            removed: old_content,
+            inserted: new_content,
+        }))
+    }
+
+    /// Recarrega o buffer com o conteúdo atual do disco, descartando
+    /// qualquer edição local não salva — a resposta a uma mudança
+    /// externa detectada (ou simplesmente "sei que mudei isto fora do
+    /// nas"). Sempre relê e atualiza o que o nas conhece do disco,
+    /// independente de `check_external_change` já ter sido chamado.
+    /// `None` se não há caminho associado, ou se o conteúdo já era
+    /// igual (nesse caso só atualiza o registro interno). O buffer
+    /// passa a corresponder ao disco, então fica como não-modificado
+    /// — diferente de `replace_all` sozinho (usado por restaurar um
+    /// checkpoint, que ainda salva depois).
+    pub fn reload(&mut self) -> io::Result<Option<TextChange>> {
+        let Some(path) = self.path.clone() else {
+            return Ok(None);
+        };
+        let content = fs::read_to_string(&path)?;
+        if let Ok(metadata) = fs::metadata(&path) {
+            self.disk_mtime = metadata.modified().ok();
+            self.disk_len = Some(metadata.len());
+        }
+        self.disk_snapshot = Some(content.clone());
+        self.external_change_pending = false;
+
+        if content == self.rope {
+            self.modified = false;
+            return Ok(None);
+        }
+        let change = self.replace_all(&content);
+        self.modified = false;
+        Ok(Some(change))
     }
 
     pub fn len_lines(&self) -> usize {
@@ -870,6 +1005,115 @@ mod tests {
             1,
             "cursor que ainda cabe não deveria mudar"
         );
+    }
+
+    #[test]
+    fn check_external_change_nada_mudou_e_none() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("arquivo.txt");
+        fs::write(&path, "conteudo").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        assert_eq!(doc.check_external_change().unwrap(), None);
+        assert!(!doc.external_change_pending());
+    }
+
+    #[test]
+    fn check_external_change_detecta_conteudo_novo_no_disco() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("arquivo.txt");
+        fs::write(&path, "original").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        // dorme um pouco pra garantir um mtime diferente em sistemas
+        // de arquivo com granularidade grosseira.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, "mudou por fora").unwrap();
+
+        let change = doc
+            .check_external_change()
+            .unwrap()
+            .expect("deveria ter detectado a mudança");
+        assert_eq!(change.removed, "original");
+        assert_eq!(change.inserted, "mudou por fora");
+        assert!(doc.external_change_pending());
+
+        // a segunda chamada não detecta nada novo — já está ciente.
+        assert_eq!(doc.check_external_change().unwrap(), None);
+    }
+
+    #[test]
+    fn check_external_change_touch_sem_mudar_conteudo_nao_reporta_mudanca() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("arquivo.txt");
+        fs::write(&path, "conteudo").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, "conteudo").unwrap(); // "touch": mtime muda, conteúdo não
+
+        assert_eq!(doc.check_external_change().unwrap(), None);
+        assert!(!doc.external_change_pending());
+    }
+
+    #[test]
+    fn check_external_change_detecta_arquivo_apagado() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("arquivo.txt");
+        fs::write(&path, "conteudo").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        fs::remove_file(&path).unwrap();
+
+        let change = doc
+            .check_external_change()
+            .unwrap()
+            .expect("deveria ter detectado a remoção");
+        assert_eq!(change.removed, "conteudo");
+        assert_eq!(change.inserted, "");
+    }
+
+    #[test]
+    fn check_external_change_sem_caminho_e_none() {
+        let mut doc = Document::empty();
+        assert_eq!(doc.check_external_change().unwrap(), None);
+    }
+
+    #[test]
+    fn reload_atualiza_o_buffer_e_fica_nao_modificado() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("arquivo.txt");
+        fs::write(&path, "original").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        doc.insert_char('X'); // edição local não salva
+        assert!(doc.is_modified());
+
+        fs::write(&path, "mudou por fora").unwrap();
+        doc.check_external_change().unwrap();
+        assert!(doc.external_change_pending());
+
+        let change = doc.reload().unwrap().expect("deveria ter recarregado");
+        assert_eq!(change.inserted, "mudou por fora");
+        assert_eq!(doc_text(&doc), "mudou por fora");
+        assert!(!doc.is_modified(), "recarregar sincroniza com o disco");
+        assert!(!doc.external_change_pending());
+    }
+
+    #[test]
+    fn reload_com_conteudo_ja_igual_devolve_none() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = dir.path().join("arquivo.txt");
+        fs::write(&path, "conteudo").unwrap();
+
+        let mut doc = Document::open(&path).expect("abrir deve funcionar");
+        assert_eq!(doc.reload().unwrap(), None);
+    }
+
+    #[test]
+    fn reload_sem_caminho_e_none() {
+        let mut doc = Document::empty();
+        assert_eq!(doc.reload().unwrap(), None);
     }
 
     #[test]
