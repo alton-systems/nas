@@ -124,7 +124,8 @@ l = "checkpoint-list"
 e = "checkpoint-diff"
 r = "checkpoint-restore"
 a = "checkpoint-blame"
-z = "history-delete"
+m = "message-history"
+z = { action = "history-delete", destructive = true }
 
 [commands]
 move-left = "caractere anterior"
@@ -181,3 +182,4 @@ checkpoint-diff = "diff entre checkpoints"
 checkpoint-restore = "restaurar checkpoint"
 checkpoint-blame = "autoria (histórico do arquivo)"
 history-delete = "apagar histórico do projeto"
+message-history = "histórico de mensagens"

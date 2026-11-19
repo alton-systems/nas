@@ -162,6 +162,9 @@ pub enum SystemAction {
     CheckpointBlame,
     /// `Ctrl+t z` — apaga o histórico do projeto, com confirmação.
     HistoryDelete,
+    /// `Ctrl+t m` — abre o histórico de mensagens (a echo area,
+    /// docs/keys.md regra 8) numa visualização — "mensagens".
+    MessageHistory,
 }
 
 impl SystemAction {
@@ -180,6 +183,7 @@ impl SystemAction {
             SystemAction::CheckpointRestore => "checkpoint-restore",
             SystemAction::CheckpointBlame => "checkpoint-blame",
             SystemAction::HistoryDelete => "history-delete",
+            SystemAction::MessageHistory => "message-history",
         }
     }
 }
@@ -329,12 +333,36 @@ enum Pending {
 }
 
 /// Rótulo e teclas válidas para a dica mostrada enquanto algo está
-/// pendente (verbo, unidade ou prefixo) — docs/keys.md regra 8
-/// (descobrível).
+/// pendente (verbo, unidade, prefixo da máquina modal, ou prefixo de
+/// sistema) — docs/keys.md regra 8 (descobrível).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingHint {
+    /// A tecla (ou teclas) que levou a este pendente — ex.: `"d"`,
+    /// `"g"`, `"d w"` (verbo seguido de unidade), `"Ctrl+t"`. Vazia se
+    /// não houver uma tecla única (não deveria acontecer em uso
+    /// normal, só uma salvaguarda).
+    pub keys: String,
     pub label: String,
-    pub entries: Vec<(Key, String)>,
+    /// Tecla, descrição, e se é uma ação destrutiva (só o prefixo de
+    /// sistema usa o terceiro campo — a máquina modal nunca marca
+    /// nada como destrutivo).
+    pub entries: Vec<(Key, String, bool)>,
+    /// `true` se `entries` já está na ordem que deveria ser mostrada
+    /// (a ordem declarada no TOML, do prefixo de sistema) — `false`
+    /// se vem de um `HashMap` sem ordem significativa (a máquina
+    /// modal), e quem exibe precisa alfabetizar por conta própria pra
+    /// ficar determinístico.
+    pub ordered: bool,
+}
+
+/// A máquina modal nunca marca nada como destrutivo — só o prefixo de
+/// sistema (`Ctrl+t z`) tem esse conceito. Completa o terceiro campo
+/// com `false` pra encaixar no formato comum de `PendingHint::entries`.
+fn without_destructive(entries: Vec<(Key, String)>) -> Vec<(Key, String, bool)> {
+    entries
+        .into_iter()
+        .map(|(key, desc)| (key, desc, false))
+        .collect()
 }
 
 /// A máquina de estados. Testável sem terminal: alimente com [`Key`]s e
@@ -399,26 +427,59 @@ impl Machine {
     pub fn pending_hint(&self) -> Option<PendingHint> {
         match self.pending.as_ref()? {
             Pending::Prefix(name) => Some(PendingHint {
+                keys: self.key_text_for_prefix(name),
                 label: self.keymap.describe(name),
-                entries: self.keymap.hint_for_prefix(name),
+                entries: without_destructive(self.keymap.hint_for_prefix(name)),
+                ordered: false,
             }),
             Pending::Verb(verb) => Some(PendingHint {
+                keys: self.key_text_for_verb(*verb),
                 label: self.keymap.describe(verb.command_name()),
-                entries: self.keymap.hint_for_verb(),
+                entries: without_destructive(self.keymap.hint_for_verb()),
+                ordered: false,
             }),
             Pending::VerbUnit(verb, unit) => Some(PendingHint {
+                keys: format!(
+                    "{} {}",
+                    self.key_text_for_verb(*verb),
+                    self.key_text_for_unit(*unit)
+                ),
                 label: format!(
                     "{} {}",
                     self.keymap.describe(verb.command_name()),
                     self.keymap.describe(unit.command_name())
                 ),
-                entries: self.keymap.hint_for_unit(*unit),
+                entries: without_destructive(self.keymap.hint_for_unit(*unit)),
+                ordered: false,
             }),
             Pending::Unit(unit) => Some(PendingHint {
+                keys: self.key_text_for_unit(*unit),
                 label: self.keymap.describe(unit.command_name()),
-                entries: self.keymap.hint_for_unit(*unit),
+                entries: without_destructive(self.keymap.hint_for_unit(*unit)),
+                ordered: false,
             }),
         }
+    }
+
+    fn key_text_for_prefix(&self, name: &str) -> String {
+        self.keymap
+            .key_for_prefix(name)
+            .map(|k| k.to_string())
+            .unwrap_or_default()
+    }
+
+    fn key_text_for_verb(&self, verb: Verb) -> String {
+        self.keymap
+            .key_for_verb(verb)
+            .map(|k| k.to_string())
+            .unwrap_or_default()
+    }
+
+    fn key_text_for_unit(&self, unit: Unit) -> String {
+        self.keymap
+            .key_for_unit(unit)
+            .map(|k| k.to_string())
+            .unwrap_or_default()
     }
 
     /// Resolve uma tecla da classe sistema (Ctrl + tecla, docs/keys.md
@@ -457,9 +518,16 @@ impl Machine {
     /// mesma ideia de [`Machine::pending_hint`], mas pro `Ctrl+t` da
     /// classe sistema, que a máquina modal não controla.
     pub fn system_prefix_hint(&self, name: &str) -> PendingHint {
+        let keys = self
+            .keymap
+            .key_for_system_prefix(name)
+            .map(|k| format!("Ctrl+{k}"))
+            .unwrap_or_default();
         PendingHint {
+            keys,
             label: self.keymap.describe(name),
             entries: self.keymap.hint_for_system_prefix(name),
+            ordered: true,
         }
     }
 

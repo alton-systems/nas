@@ -6,5 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.2.1"
+toml = { version = "1.2.1", features = ["preserve_order"] }
