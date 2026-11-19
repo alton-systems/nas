@@ -1,6 +1,6 @@
 ---
 source: crates/nas-term/src/ui.rs
-assertion_line: 426
+assertion_line: 493
 expression: rendered
 ---
 1 ola mundo                                                 
@@ -10,7 +10,7 @@ expression: rendered
                                                             
                                                             
 [V] [sem nome] [+]                                      1:10
-apagar                                                      
+d  apagar                                                   
 : até o fim da linha          ; até aqui                    
 J até o início da linha       K até o fim do arquivo        
 L até o início do arquivo     W parágrafo                   
