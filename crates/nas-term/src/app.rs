@@ -5,11 +5,14 @@
 //! aqui, antes de chegar à máquina de estados. Ver docs/keys.md.
 
 use std::collections::HashSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nas_editor::{Document, OpenError, RegionObject};
-use nas_history::{Author, CheckpointManifest, ExcludedReason, FileChange, Journal, ProjectId};
+use nas_history::{
+    Author, CheckpointManifest, ExcludedReason, FileChange, Journal, OriginalEntry, ProjectId,
+};
 use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, SystemAction, Verb};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -460,6 +463,14 @@ impl App {
     /// ativo — usado por `restore_file`, que pode afetar um arquivo
     /// que não é o buffer atual (e, pros arquivos restaurados que não
     /// estão abertos, nem é um buffer de verdade).
+    ///
+    /// Também é aqui que um arquivo passa a ser **rastreado**
+    /// (`nas_history::ensure_tracked`): na primeira vez que `file`
+    /// aparece — e só nessa vez — captura o conteúdo que já estava no
+    /// disco, antes desta edição. Isto é seguro porque nenhuma ação
+    /// comum de editar escreve em disco (só `save`/`restore_file`, que
+    /// só tocam arquivos já rastreados); se já fosse tarde pra capturar
+    /// o original, `ensure_tracked` não teria como saber.
     fn journal_record_for(
         &mut self,
         file: String,
@@ -471,6 +482,12 @@ impl App {
     ) {
         if from == to && removed.is_empty() && inserted.is_empty() {
             return;
+        }
+        if file != UNNAMED_BUFFER
+            && let Some(history_dir) = self.history_dir()
+        {
+            let disk_content = std::fs::read(&file).ok();
+            let _ = nas_history::ensure_tracked(&history_dir, &file, disk_content.as_deref());
         }
         let Ok(mut guard) = self.history.lock() else {
             return;
@@ -831,13 +848,16 @@ impl App {
         }
     }
 
-    /// `Ctrl+t n`: cria um checkpoint nomeado com o conteúdo atual dos
-    /// buffers abertos que têm um caminho (buffers `[sem nome]` não
-    /// entram — não há arquivo pra identificá-los entre checkpoints)
-    /// e que mudaram desde o checkpoint anterior (docs/decisions/0005
-    /// §4). Faz flush do journal antes, pra que
-    /// `changed_files_since_last_checkpoint` veja as edições mais
-    /// recentes.
+    /// `Ctrl+t n`: cria um checkpoint nomeado com o estado atual de
+    /// **todo arquivo rastreado** do projeto — não só os que mudaram
+    /// desde o checkpoint anterior (correção de
+    /// docs/decisions/0005 §4: só assim restaurar um checkpoint antigo
+    /// sabe o estado de um arquivo tocado por primeira vez depois
+    /// dele). O conteúdo vem do buffer aberto, se houver um, senão do
+    /// disco (`current_content_for`) — um arquivo rastreado que não
+    /// está mais aberto como buffer ainda entra no checkpoint. Faz
+    /// flush do journal antes, pra que todo arquivo editado até agora
+    /// já esteja rastreado.
     fn checkpoint_new(&mut self, name: &str) {
         let name = name.trim();
         if name.is_empty() {
@@ -850,26 +870,17 @@ impl App {
         };
         self.flush_history();
 
-        let changed: HashSet<String> =
-            nas_history::changed_files_since_last_checkpoint(&history_dir)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-        let files: Vec<(String, Vec<u8>)> = self
-            .buffers
+        let tracked = nas_history::list_tracked(&history_dir).unwrap_or_default();
+        let files: Vec<(String, Vec<u8>)> = tracked
             .iter()
-            .filter(|b| b.document.path().is_some())
-            .map(|b| {
-                (
-                    buffer_name(&b.document),
-                    b.document.full_text().into_bytes(),
-                )
+            .filter_map(|entry| {
+                let content = self.current_content_for(&entry.path)?;
+                Some((entry.path.clone(), content))
             })
-            .filter(|(path, _)| changed.contains(path))
             .collect();
 
         if files.is_empty() {
-            self.status_message = Some("Nada mudou desde o último checkpoint.".to_string());
+            self.status_message = Some("Nenhum arquivo rastreado ainda.".to_string());
             return;
         }
 
@@ -1037,12 +1048,25 @@ impl App {
             })
             .map(|b| buffer_name(&b.document))
             .collect();
+        let extra = files_not_in_checkpoint(&history_dir, &checkpoint);
 
-        if !unsaved.is_empty() && self.restore_confirm_pending.as_deref() != Some(&checkpoint.id) {
+        if (!unsaved.is_empty() || !extra.is_empty())
+            && self.restore_confirm_pending.as_deref() != Some(&checkpoint.id)
+        {
             self.restore_confirm_pending = Some(checkpoint.id.clone());
+            let mut warning = Vec::new();
+            if !unsaved.is_empty() {
+                warning.push(format!("sem salvar: {}", unsaved.join(", ")));
+            }
+            if !extra.is_empty() {
+                warning.push(format!(
+                    "não rastreados por este checkpoint, vão pro original ou pra lixeira: {}",
+                    extra.join(", ")
+                ));
+            }
             self.status_message = Some(format!(
-                "{} têm alterações não salvas — Ctrl+t r de novo com o mesmo nome confirma.",
-                unsaved.join(", ")
+                "{} — Ctrl+t r de novo com o mesmo nome confirma.",
+                warning.join("; ")
             ));
             return;
         }
@@ -1052,19 +1076,33 @@ impl App {
     }
 
     /// A restauração de verdade, depois de resolvida qualquer
-    /// confirmação: cria primeiro um checkpoint automático "antes de
-    /// restaurar" com o conteúdo atual dos mesmos arquivos (o que
-    /// torna a própria restauração desfazível — restaurar esse
-    /// checkpoint automático desfaz a restauração, sem nenhum código
-    /// separado), depois escreve o conteúdo de cada arquivo do
-    /// checkpoint — docs/decisions/0005 §7.
+    /// confirmação — restaura o **projeto inteiro** pro estado do
+    /// checkpoint, não só os arquivos que ele lista
+    /// (docs/decisions/0005 §4, correção):
+    ///
+    /// 1. Cria primeiro um checkpoint automático "antes de restaurar"
+    ///    com o conteúdo atual de **todo arquivo rastreado** (o que
+    ///    torna a própria restauração desfazível por completo —
+    ///    restaurar esse automático desfaz tudo, inclusive os
+    ///    arquivos revertidos ou jogados na lixeira abaixo — sem
+    ///    nenhum código separado).
+    /// 2. Arquivos rastreados que o checkpoint sendo restaurado não
+    ///    lista (tocados pela primeira vez depois dele): revertidos
+    ///    ao conteúdo original, se existiam; jogados na lixeira
+    ///    (nunca apagados de vez), se não existiam ainda.
+    /// 3. Os arquivos que o checkpoint lista: escritos com o conteúdo
+    ///    guardado nele.
+    ///
+    /// Nenhum erro de gravação é ignorado — cada arquivo que falhar
+    /// aparece na mensagem final, com o motivo.
     fn perform_restore(&mut self, history_dir: &Path, checkpoint: &CheckpointManifest) {
-        let pre_restore_files: Vec<(String, Vec<u8>)> = checkpoint
-            .files
+        let tracked = nas_history::list_tracked(history_dir).unwrap_or_default();
+
+        let pre_restore_files: Vec<(String, Vec<u8>)> = tracked
             .iter()
-            .filter_map(|f| {
-                let content = self.current_content_for(&f.path)?;
-                Some((f.path.clone(), content))
+            .filter_map(|e| {
+                let content = self.current_content_for(&e.path)?;
+                Some((e.path.clone(), content))
             })
             .collect();
         if !pre_restore_files.is_empty() {
@@ -1079,38 +1117,56 @@ impl App {
             );
         }
 
-        let mut restored = 0;
+        let mut restored = Vec::new();
+        let mut trashed = Vec::new();
         let mut skipped = Vec::new();
+        let mut failed = Vec::new();
+
+        let in_checkpoint: HashSet<&str> =
+            checkpoint.files.iter().map(|f| f.path.as_str()).collect();
+        for entry in tracked
+            .iter()
+            .filter(|e| !in_checkpoint.contains(e.path.as_str()))
+        {
+            if !entry.existed {
+                match self.trash_file(&entry.path) {
+                    Ok(()) => trashed.push(entry.path.clone()),
+                    Err(err) => failed.push((entry.path.clone(), err.to_string())),
+                }
+                continue;
+            }
+            restore_tracked_entry(
+                self,
+                history_dir,
+                entry,
+                &mut restored,
+                &mut skipped,
+                &mut failed,
+            );
+        }
+
         for file in &checkpoint.files {
             let Some(hash) = &file.content_hash else {
                 skipped.push(file.path.clone());
                 continue;
             };
-            let Ok(bytes) = nas_history::read_object(history_dir, hash) else {
-                skipped.push(file.path.clone());
-                continue;
-            };
-            let Ok(content) = String::from_utf8(bytes) else {
-                skipped.push(file.path.clone());
-                continue;
-            };
-            self.restore_file(&file.path, &content);
-            restored += 1;
+            match read_object_as_text(history_dir, hash) {
+                Some(content) => match self.restore_file(&file.path, &content) {
+                    Ok(()) => restored.push(file.path.clone()),
+                    Err(err) => failed.push((file.path.clone(), err.to_string())),
+                },
+                None => skipped.push(file.path.clone()),
+            }
         }
 
         self.flush_history();
-        self.status_message = Some(if skipped.is_empty() {
-            format!(
-                "Restaurado o checkpoint \"{}\" ({restored} arquivo(s)).",
-                checkpoint.name
-            )
-        } else {
-            format!(
-                "Restaurado o checkpoint \"{}\" ({restored} arquivo(s)); ficaram de fora (sem conteúdo guardado): {}.",
-                checkpoint.name,
-                skipped.join(", ")
-            )
-        });
+        self.status_message = Some(restore_summary_message(
+            &checkpoint.name,
+            &restored,
+            &trashed,
+            &skipped,
+            &failed,
+        ));
     }
 
     /// O conteúdo atual de `path` — do buffer aberto, se houver um; senão,
@@ -1134,15 +1190,18 @@ impl App {
     /// restaurar afeta o arquivo, não só um buffer que porventura
     /// esteja aberto. Em ambos os casos, salvar também grava o
     /// arquivo em disco de uma vez, sem deixar o resultado "só na
-    /// memória". Journala como `"restore-checkpoint"`.
-    fn restore_file(&mut self, path: &str, content: &str) {
+    /// memória". Journala como `"restore-checkpoint"`. Propaga
+    /// qualquer erro de gravação (ex.: sem permissão de escrita) —
+    /// nunca ignorado, quem chama reporta qual arquivo falhou e por
+    /// quê.
+    fn restore_file(&mut self, path: &str, content: &str) -> io::Result<()> {
         if let Some(index) = self
             .buffers
             .iter()
             .position(|b| buffer_name(&b.document) == path)
         {
             let change = self.buffers[index].document.replace_all(content);
-            let _ = self.buffers[index].document.save();
+            self.buffers[index].document.save()?;
             self.journal_record_for(
                 path.to_string(),
                 "restore-checkpoint",
@@ -1151,20 +1210,27 @@ impl App {
                 change.removed,
                 change.inserted,
             );
-            return;
+            return Ok(());
         }
-        if let Ok(mut doc) = Document::open(path) {
-            let change = doc.replace_all(content);
-            let _ = doc.save();
-            self.journal_record_for(
-                path.to_string(),
-                "restore-checkpoint",
-                change.from,
-                change.to,
-                change.removed,
-                change.inserted,
-            );
-        }
+        let mut doc = Document::open(path)?;
+        let change = doc.replace_all(content);
+        doc.save()?;
+        self.journal_record_for(
+            path.to_string(),
+            "restore-checkpoint",
+            change.from,
+            change.to,
+            change.removed,
+            change.inserted,
+        );
+        Ok(())
+    }
+
+    /// Move `path` pra lixeira do sistema (nunca apaga de vez) — um
+    /// arquivo rastreado que o checkpoint sendo restaurado não
+    /// conhece e que não existia originalmente.
+    fn trash_file(&self, path: &str) -> io::Result<()> {
+        nas_history::move_to_trash(Path::new(path))
     }
 
     /// `Ctrl+t z`: apaga o histórico do projeto inteiro — só se
@@ -1201,6 +1267,94 @@ impl App {
 /// arquivos ficaram de fora de `objects/` (grandes demais ou
 /// não-UTF8), se algum (docs/decisions/0005 §5: "nunca falha
 /// silenciosamente nem finge que o checkpoint capturou tudo").
+/// Os caminhos rastreados que `checkpoint` não lista — tocados pela
+/// primeira vez depois dele; `perform_restore` reverte ao original ou
+/// joga na lixeira cada um, e `restore_checkpoint` avisa sobre eles
+/// antes de pedir confirmação.
+fn files_not_in_checkpoint(history_dir: &Path, checkpoint: &CheckpointManifest) -> Vec<String> {
+    let in_checkpoint: HashSet<&str> = checkpoint.files.iter().map(|f| f.path.as_str()).collect();
+    nas_history::list_tracked(history_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.path)
+        .filter(|p| !in_checkpoint.contains(p.as_str()))
+        .collect()
+}
+
+/// O conteúdo de um objeto do histórico como texto — `None` se não
+/// puder ser lido ou não for UTF-8 válido (não deveria acontecer:
+/// objetos só guardam conteúdo que já passou por esse mesmo crivo ao
+/// serem criados, mas um erro de E/S na leitura ainda é possível).
+fn read_object_as_text(history_dir: &Path, hash: &str) -> Option<String> {
+    nas_history::read_object(history_dir, hash)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Restaura um arquivo rastreado (não listado pelo checkpoint sendo
+/// restaurado) ao seu conteúdo original, acumulando o resultado num
+/// dos três baldes — usado só pelo caso "existia" de
+/// `App::perform_restore`, o caso "não existia" (lixeira) é tratado
+/// ali mesmo.
+fn restore_tracked_entry(
+    app: &mut App,
+    history_dir: &Path,
+    entry: &OriginalEntry,
+    restored: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+    failed: &mut Vec<(String, String)>,
+) {
+    let Some(hash) = &entry.content_hash else {
+        skipped.push(entry.path.clone());
+        return;
+    };
+    match read_object_as_text(history_dir, hash) {
+        Some(content) => match app.restore_file(&entry.path, &content) {
+            Ok(()) => restored.push(entry.path.clone()),
+            Err(err) => failed.push((entry.path.clone(), err.to_string())),
+        },
+        None => skipped.push(entry.path.clone()),
+    }
+}
+
+/// Mensagem final de uma restauração — nunca esconde o que deu
+/// errado: cada arquivo que falhou aparece com o motivo
+/// (docs/decisions/0005, correção: "nenhum erro de gravação pode ser
+/// ignorado").
+fn restore_summary_message(
+    checkpoint_name: &str,
+    restored: &[String],
+    trashed: &[String],
+    skipped: &[String],
+    failed: &[(String, String)],
+) -> String {
+    let mut message = format!(
+        "Restaurado o checkpoint \"{checkpoint_name}\" ({} arquivo(s))",
+        restored.len()
+    );
+    if !trashed.is_empty() {
+        message.push_str(&format!(
+            "; pra lixeira (não existiam neste checkpoint): {}",
+            trashed.join(", ")
+        ));
+    }
+    if !skipped.is_empty() {
+        message.push_str(&format!(
+            "; ficaram de fora (sem conteúdo guardado): {}",
+            skipped.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        let details: Vec<String> = failed
+            .iter()
+            .map(|(path, err)| format!("{path} ({err})"))
+            .collect();
+        message.push_str(&format!("; FALHARAM: {}", details.join(", ")));
+    }
+    message.push('.');
+    message
+}
+
 fn checkpoint_created_message(created: &nas_history::CreatedCheckpoint) -> String {
     if created.excluded.is_empty() {
         return format!(
@@ -1294,6 +1448,11 @@ fn to_region_object(object: Object) -> RegionObject {
     }
 }
 
+/// O nome de exibição de um buffer sem arquivo associado — nunca um
+/// caminho real, então nunca rastreado por checkpoint (ver
+/// `journal_record_for`).
+const UNNAMED_BUFFER: &str = "[sem nome]";
+
 /// Nome de exibição de um buffer: o caminho do arquivo, ou
 /// `[sem nome]` se ainda não tiver um — usado na barra de status, no
 /// prompt de trocar de buffer e nas mensagens de confirmação.
@@ -1301,7 +1460,7 @@ pub fn buffer_name(document: &Document) -> String {
     document
         .path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "[sem nome]".to_string())
+        .unwrap_or_else(|| UNNAMED_BUFFER.to_string())
 }
 
 /// Traduz um `KeyEvent` do crossterm para a tecla neutra do nas-keys.
@@ -2416,5 +2575,166 @@ mod tests {
         app.flush_history();
         let entries = journal_entries(&history_dir);
         assert!(!entries.is_empty(), "o journal deveria ter sido reaberto");
+    }
+
+    #[test]
+    fn restaurar_um_checkpoint_antigo_tambem_reverte_arquivo_tocado_depois_dele() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let x_path = project_dir.path().join("x.txt");
+        let y_path = project_dir.path().join("y.txt");
+        // y.txt já existe no disco (conteúdo original) antes de o nas
+        // tocar nele — é o "arquivo novo" (novo pra este checkpoint,
+        // não necessariamente um arquivo que nunca existiu).
+        fs::write(&y_path, "y original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        // checkpoint A: só x.txt foi tocado até aqui.
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, x_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "x conteudo");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "checkpoint-a");
+        app.handle_key(key(KeyCode::Enter));
+
+        // só agora y.txt é editado por primeira vez — depois de A.
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, y_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('K'))); // fim do buffer
+        type_text(&mut app, " mudou");
+
+        // checkpoint B: agora y.txt também está rastreado.
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "checkpoint-b");
+        app.handle_key(key(KeyCode::Enter));
+
+        // restaurar A: y.txt não está no manifesto de A (só passou a
+        // ser rastreado depois) — primeira tentativa só avisa, sem
+        // restaurar nada ainda (y.txt nunca foi salvo, então checar o
+        // disco não provaria nada aqui — ele já é "y original" desde
+        // o início; o que importa é que o buffer em memória, ainda
+        // modificado, não tenha sido tocado).
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, "checkpoint-a");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            text(&app),
+            "y original mudou",
+            "a primeira tentativa não deveria ter restaurado nada"
+        );
+        assert!(app.document().is_modified());
+        assert!(
+            app.status_message.as_ref().unwrap().contains("Ctrl+t r"),
+            "{:?}",
+            app.status_message
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, "checkpoint-a");
+        app.handle_key(key(KeyCode::Enter)); // confirma
+
+        assert_eq!(
+            fs::read_to_string(&x_path).unwrap(),
+            "x conteudo",
+            "x.txt já estava no checkpoint A"
+        );
+        assert_eq!(
+            fs::read_to_string(&y_path).unwrap(),
+            "y original",
+            "y.txt deveria ter voltado ao conteúdo que tinha quando A foi criado"
+        );
+    }
+
+    #[test]
+    fn checkpoint_inclui_arquivo_editado_salvo_e_fechado() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let file_path = project_dir.path().join("fechado.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "conteudo");
+        app.handle_key(ctrl_key(KeyCode::Char('s'))); // salva
+        app.handle_key(ctrl_key(KeyCode::Char('k'))); // fecha (já salvo, sem confirmação)
+        assert_eq!(
+            app.buffers.len(),
+            1,
+            "deveria ter fechado direto, sem pedir confirmação"
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "cp");
+        app.handle_key(key(KeyCode::Enter));
+
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert!(
+            checkpoints[0]
+                .files
+                .iter()
+                .any(|f| f.path == file_path.to_str().unwrap()),
+            "o checkpoint deveria incluir o arquivo fechado: {:?}",
+            checkpoints[0].files
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restaurar_arquivo_sem_permissao_de_escrita_mostra_o_erro() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let readonly_subdir = project_dir.path().join("somente-leitura");
+        fs::create_dir(&readonly_subdir).unwrap();
+        let file_path = readonly_subdir.join("arquivo.txt");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, file_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "conteudo original");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_str(&mut app, "cp");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+        app.handle_key(ctrl_key(KeyCode::Char('k')));
+        // a escrita atômica precisa criar um arquivo temporário na
+        // mesma pasta antes de renomear por cima do original — sem
+        // permissão de escrita na pasta, isso falha.
+        fs::set_permissions(&readonly_subdir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, "cp");
+        app.handle_key(key(KeyCode::Enter));
+
+        let message = app
+            .status_message
+            .as_ref()
+            .expect("deveria ter uma mensagem de status");
+        assert!(message.contains("FALHARAM"), "{message:?}");
+        assert!(message.contains("arquivo.txt"), "{message:?}");
+
+        // devolve a permissão — o Drop do tempdir precisa conseguir
+        // remover o conteúdo da pasta.
+        fs::set_permissions(&readonly_subdir, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

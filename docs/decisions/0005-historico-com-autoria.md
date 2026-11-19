@@ -174,16 +174,42 @@ como ser vistos juntos depois. Isso também casa com o pilar 3 do
 README ("tudo que a IA avalia vira um changeset") — um changeset já é,
 por definição, um conjunto de arquivos.
 
-Um checkpoint só inclui arquivos que **mudaram** desde o checkpoint
-anterior (têm pelo menos uma entrada no journal nesse intervalo) —
-não todo arquivo aberto.
-
-Um checkpoint captura o conteúdo **atual dos buffers em memória**,
-salvos ou não — não precisa de `Ctrl+s` antes. Isso é deliberado:
+Um checkpoint captura o conteúdo **atual de todo arquivo rastreado**
+— não precisa de `Ctrl+s` antes, nem de o arquivo ter um buffer aberto
+(vem do buffer, se houver um; senão, do disco). Isso é deliberado:
 checkpoint é um mecanismo do nas, anterior e independente de salvar no
 disco do projeto ou de um commit no Git (que continua sendo decisão
 do usuário, promovida manualmente — pilar 3). **O histórico nunca
 toca o `.git` do projeto.**
+
+**Correção (a versão original desta ADR dizia "só os arquivos que
+mudaram desde o checkpoint anterior" — errado):** um checkpoint
+registra o estado de **todo arquivo rastreado até ali**, não só os
+que mudaram desde o anterior. Rastreado = já teve ao menos uma entrada
+no journal, nesta sessão ou numa anterior. A razão é restaurar: se um
+checkpoint só lista arquivos que mudaram desde o anterior, e um
+arquivo `y` é editado por primeira vez *depois* de um checkpoint `A`
+(mas antes de restaurá-lo), `A` nunca chega a mencionar `y` — e
+restaurar `A` precisa, mesmo assim, voltar `y` ao estado que tinha
+quando `A` foi criado. A correção tem duas partes:
+
+- **Original capturado na primeira edição.** Na primeira vez que um
+  arquivo é rastreado (sua primeira entrada no journal), o conteúdo
+  que já estava no disco é capturado e guardado em `objects/` (mesmo
+  critério de tamanho/UTF8 que os checkpoints já usam) — nunca
+  sobrescrito depois. É "como o arquivo estava" no instante em que o
+  nas passou a prestar atenção nele.
+- **Todo checkpoint registra todo arquivo rastreado**, reaproveitando
+  o hash de `objects/` quando o conteúdo não mudou desde o checkpoint
+  anterior — o armazenamento por conteúdo já garante que isso não
+  duplica nada em disco, só mais uma linha no manifesto.
+
+Com isso, restaurar um checkpoint `A` sabe exatamente o que fazer com
+**todo** arquivo rastreado, não só os que `A` lista: se está no
+manifesto de `A`, usa o conteúdo de lá; se não está (foi rastreado
+*depois* de `A`), usa o original capturado na primeira edição —
+exatamente o estado do arquivo no instante de `A`, já que nada o tocou
+antes daquela primeira edição. Ver §7.
 
 ### 5. Persistência
 
@@ -323,17 +349,37 @@ do helix — proponho a crate [`similar`](https://docs.rs/similar) (diff
 de linhas, madura, usada amplamente) em vez de reimplementar Myers
 diff. É a única dependência nova que esta proposta pede.
 
-**Restaurar** um checkpoint sobrescreve, nos arquivos **que esse
-checkpoint contém** — arquivos fora dele não são tocados. Antes de
-sobrescrever qualquer coisa, a restauração **cria automaticamente um
-checkpoint novo** (marcado como automático, §5) com o estado atual
-desses mesmos arquivos (nome gerado, ex. `"antes de restaurar
-<nome>"`, autor = quem disparou a restauração). Isso responde a "o que
-acontece com mudanças feitas depois" (nada se perde — ficam naquele
-checkpoint automático) e a "restaurar precisa ser desfazível" ao mesmo
-tempo, com o mesmo mecanismo: desfazer uma restauração é só restaurar
-o checkpoint automático que ela mesma criou. Nenhum código separado de
-"desfazer restauração".
+**Restaurar** um checkpoint volta **o projeto inteiro** ao estado
+daquele momento — não só os arquivos que o manifesto dele lista
+(correção, ver §4): para cada arquivo **rastreado**,
+
+- se está no manifesto do checkpoint sendo restaurado, usa o conteúdo
+  de lá;
+- se não está (foi rastreado só *depois* dele), mas **existia** no
+  disco antes de ser rastreado, volta ao conteúdo original capturado
+  na primeira edição (§4) — exatamente o estado no instante do
+  checkpoint;
+- se não está, e **não existia** (foi criado depois do checkpoint),
+  vai pra **lixeira do sistema** (`~/.local/share/Trash`) — nunca
+  apagado de vez. A confirmação antes de restaurar lista esses
+  arquivos.
+
+Antes de tocar em qualquer arquivo, a restauração **cria
+automaticamente um checkpoint novo** (marcado como automático, §5)
+com o estado atual de **todo arquivo rastreado** (nome gerado, ex.
+`"antes de restaurar <nome>"`, autor = quem disparou a restauração).
+Isso responde a "o que acontece com mudanças feitas depois" (nada se
+perde — ficam naquele checkpoint automático, inclusive o que seria
+revertido ao original ou jogado na lixeira) e a "restaurar precisa ser
+desfazível" ao mesmo tempo, com o mesmo mecanismo: desfazer uma
+restauração é só restaurar o checkpoint automático que ela mesma
+criou. Nenhum código separado de "desfazer restauração" — e nada que
+foi pra lixeira precisa ser recuperado de lá manualmente, já que o
+automático guarda o conteúdo de qualquer forma.
+
+Nenhum erro de gravação é ignorado: se escrever um arquivo falhar
+(permissão, disco cheio), a restauração continua com os outros e
+reporta, ao final, quais falharam e por quê — nunca finge sucesso.
 
 **Buffers abertos**: os buffers correspondentes a um arquivo do
 checkpoint sendo restaurado são **recarregados** com o conteúdo
@@ -344,7 +390,9 @@ confirmação que `Ctrl+q`/`Ctrl+k` já usam. Isso não é sobre perder
 dados de verdade (o checkpoint automático já garante que nada se
 perde, nem o que só estava na memória) — é sobre não trocar o
 conteúdo debaixo do usuário, sem aviso, enquanto ele ainda está
-olhando ou editando aquele buffer.
+olhando ou editando aquele buffer. A mesma confirmação também lista os
+arquivos que vão pro original ou pra lixeira (acima) — as duas coisas
+pedem confirmação juntas, numa pergunta só.
 
 A escrita de cada arquivo restaurado passa pelo `Document::apply()`
 normal (como uma transação "substituir tudo"), então também entra no
