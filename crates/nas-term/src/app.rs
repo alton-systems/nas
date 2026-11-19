@@ -138,6 +138,14 @@ pub struct App {
     /// confirmar se o mesmo nome for restaurado de novo. Mesma ideia
     /// de `whole_buffer_confirm_pending`.
     restore_confirm_pending: Option<String>,
+    /// `Ctrl+s` encontrou uma mudança externa não resolvida no buffer
+    /// atual — a mesma tecla de novo confirma a sobrescrita
+    /// (docs/decisions/0005 §1: "nunca salva por cima de uma mudança
+    /// externa sem perguntar"). Mesma ideia de `close_confirm_pending`.
+    external_overwrite_confirm_pending: bool,
+    /// `Ctrl+r` encontrou alterações locais não salvas no buffer atual
+    /// — a mesma tecla de novo confirma descartá-las e recarregar.
+    reload_confirm_pending: bool,
     /// Uma visualização somente-leitura ativa (diff, lista de
     /// checkpoints, autoria) — ver [`Overlay`].
     pub overlay: Option<Overlay>,
@@ -164,6 +172,8 @@ impl App {
             project: None,
             pending_system_prefix: None,
             restore_confirm_pending: None,
+            external_overwrite_confirm_pending: false,
+            reload_confirm_pending: false,
             overlay: None,
         }
     }
@@ -302,10 +312,10 @@ impl App {
         self.dispatch_system_action(action);
     }
 
-    /// `Quit` e `CloseBuffer` cuidam da própria confirmação (campos
-    /// de pendência que não devem ser limpos pela repetição da mesma
-    /// tecla); os demais limpam qualquer mensagem/confirmação
-    /// pendente antes de agir.
+    /// `Quit`, `CloseBuffer`, `Save` e `ReloadBuffer` cuidam da própria
+    /// confirmação (campos de pendência que não devem ser limpos pela
+    /// repetição da mesma tecla); os demais limpam qualquer
+    /// mensagem/confirmação pendente antes de agir.
     fn dispatch_system_action(&mut self, action: SystemAction) {
         if action == SystemAction::Quit {
             self.handle_quit_request();
@@ -315,13 +325,20 @@ impl App {
             self.close_buffer();
             return;
         }
+        if action == SystemAction::Save {
+            self.save();
+            return;
+        }
+        if action == SystemAction::ReloadBuffer {
+            self.reload_buffer();
+            return;
+        }
 
         self.quit_confirm_pending = false;
         self.close_confirm_pending = false;
         self.status_message = None;
 
         match action {
-            SystemAction::Save => self.save(),
             SystemAction::OpenFile => self.open_prompt(PromptKind::OpenFile),
             SystemAction::SwitchBuffer => self.open_prompt(PromptKind::SwitchBuffer),
             SystemAction::CheckpointNew => self.open_prompt(PromptKind::CheckpointName),
@@ -330,7 +347,12 @@ impl App {
             SystemAction::CheckpointRestore => self.open_prompt(PromptKind::RestoreCheckpoint),
             SystemAction::CheckpointBlame => self.checkpoint_blame(),
             SystemAction::HistoryDelete => self.open_prompt(PromptKind::DeleteHistoryConfirm),
-            SystemAction::Quit | SystemAction::CloseBuffer => unreachable!(),
+            SystemAction::Quit
+            | SystemAction::CloseBuffer
+            | SystemAction::Save
+            | SystemAction::ReloadBuffer => {
+                unreachable!()
+            }
         }
     }
 
@@ -706,6 +728,7 @@ impl App {
 
         if let Some(index) = self.find_buffer_by_path(&resolved) {
             self.active = index;
+            self.check_external_change_active();
             return;
         }
 
@@ -743,7 +766,10 @@ impl App {
             .iter()
             .position(|b| buffer_name(&b.document).contains(query))
         {
-            Some(index) => self.active = index,
+            Some(index) => {
+                self.active = index;
+                self.check_external_change_active();
+            }
             None => {
                 self.status_message = Some(format!("Nenhum buffer encontrado para {query:?}."));
             }
@@ -780,6 +806,7 @@ impl App {
         } else if self.active >= self.buffers.len() {
             self.active = self.buffers.len() - 1;
         }
+        self.check_external_change_active();
         self.flush_history();
     }
 
@@ -826,13 +853,150 @@ impl App {
         ));
     }
 
+    /// Ctrl+s. Confere antes se o arquivo mudou no disco desde a
+    /// última leitura/escrita do nas (docs/decisions/0005 §1) — se
+    /// mudou, pede confirmação (repetir a tecla) em vez de
+    /// sobrescrever direto; a própria mudança externa já foi
+    /// journalada no momento em que foi detectada, independente de
+    /// confirmar ou não a sobrescrita aqui.
     fn save(&mut self) {
+        self.quit_confirm_pending = false;
+        self.close_confirm_pending = false;
+
+        self.check_external_change_active();
+        if self.document().external_change_pending() && !self.external_overwrite_confirm_pending {
+            self.external_overwrite_confirm_pending = true;
+            self.status_message = Some(format!(
+                "{} mudou no disco desde a última leitura — Ctrl+S de novo sobrescreve, Ctrl+R recarrega.",
+                buffer_name(self.document())
+            ));
+            return;
+        }
+        self.external_overwrite_confirm_pending = false;
+
         self.status_message = Some(match self.document_mut().save() {
             Ok(true) => "Salvo.".to_string(),
             Ok(false) => "Sem nome de arquivo; nada para salvar.".to_string(),
             Err(err) => format!("Erro ao salvar: {err}"),
         });
         self.flush_history();
+    }
+
+    /// Ctrl+r: recarrega o buffer atual a partir do disco — resolve
+    /// de propósito uma mudança externa detectada, ou simplesmente
+    /// "sei que mudei isto fora do nas". Pede confirmação (repetir a
+    /// tecla) se houver alterações locais não salvas, já que
+    /// recarregar as descarta — mesmo risco que fechar o buffer.
+    fn reload_buffer(&mut self) {
+        self.quit_confirm_pending = false;
+        self.close_confirm_pending = false;
+
+        if self.document().is_modified() && !self.reload_confirm_pending {
+            self.reload_confirm_pending = true;
+            self.status_message = Some(format!(
+                "{} tem alterações não salvas — Ctrl+R de novo descarta e recarrega.",
+                buffer_name(self.document())
+            ));
+            return;
+        }
+        self.reload_confirm_pending = false;
+        self.external_overwrite_confirm_pending = false;
+
+        let file = buffer_name(self.document());
+        match self.document_mut().reload() {
+            Ok(Some(change)) => {
+                self.journal_record_for(
+                    file,
+                    "reload",
+                    change.from,
+                    change.to,
+                    change.removed,
+                    change.inserted,
+                );
+                self.status_message = Some("Recarregado.".to_string());
+            }
+            Ok(None) => {
+                self.status_message = Some("Já estava sincronizado com o disco.".to_string())
+            }
+            Err(err) => self.status_message = Some(format!("Erro ao recarregar: {err}")),
+        }
+    }
+
+    /// Confere o buffer **ativo** contra o disco — chamado
+    /// explicitamente antes de salvar (docs/decisions/0005 §1), além
+    /// da conferência geral de `check_external_changes`.
+    fn check_external_change_active(&mut self) {
+        if let Some(message) = self.check_external_change_at(self.active) {
+            self.status_message = Some(message);
+        }
+    }
+
+    /// Confere **todo buffer aberto** contra o disco — um `stat` por
+    /// buffer, barato (docs/decisions/0005 §1: "de forma leve, a cada
+    /// poucos segundos"). Chamado pela checagem periódica e por
+    /// `handle_focus_gained`. Mostra uma mensagem combinando todos os
+    /// buffers que mudaram, se algum mudou.
+    pub fn check_external_changes(&mut self) {
+        let messages: Vec<String> = (0..self.buffers.len())
+            .filter_map(|index| self.check_external_change_at(index))
+            .collect();
+        if !messages.is_empty() {
+            self.status_message = Some(messages.join("; "));
+        }
+    }
+
+    /// O terminal recuperou o foco (`Event::FocusGained` do
+    /// crossterm) — o caso mais comum de um editor externo ou um
+    /// `git checkout` acontecerem enquanto o usuário estava noutra
+    /// janela (docs/decisions/0005 §1).
+    pub fn handle_focus_gained(&mut self) {
+        self.check_external_changes();
+    }
+
+    /// A conferência de verdade pra um buffer: `stat`, e só lê o
+    /// conteúdo se `mtime`/tamanho mudaram. Se uma mudança externa for
+    /// confirmada, journala como `Author::External` na hora (mesmo que
+    /// o usuário nunca chegue a recarregar) e devolve uma mensagem pra
+    /// avisar. Falha de E/S ao conferir (ex.: pasta removida) não trava
+    /// a interface — só não detecta nada desta vez.
+    fn check_external_change_at(&mut self, index: usize) -> Option<String> {
+        let file = buffer_name(&self.buffers[index].document);
+        let change = self.buffers[index]
+            .document
+            .check_external_change()
+            .ok()??;
+        self.journal_record_external(file.clone(), change);
+        Some(format!("{file} mudou no disco — Ctrl+R recarrega"))
+    }
+
+    /// Registra uma mudança externa no journal — como `journal_record`,
+    /// mas com `Author::External` em vez de `Author::User`, e sem
+    /// marcar `file` como rastreado (`nas_history::ensure_tracked`):
+    /// uma mudança externa não é uma edição do nas, então não deveria
+    /// iniciar o rastreamento de um arquivo que o nas ainda não tinha
+    /// tocado (docs/decisions/0005 §4) — só a primeira edição de
+    /// verdade (`journal_record_for`) faz isso.
+    fn journal_record_external(&mut self, file: String, change: nas_editor::TextChange) {
+        if change.from == change.to && change.removed.is_empty() && change.inserted.is_empty() {
+            return;
+        }
+        let Ok(mut guard) = self.history.lock() else {
+            return;
+        };
+        let Some(journal) = guard.as_mut() else {
+            return;
+        };
+        let now = nas_history::now_unix();
+        let _ = journal.record(
+            now,
+            Author::External,
+            "external-change".to_string(),
+            file,
+            change.from,
+            change.to,
+            change.removed,
+            change.inserted,
+        );
     }
 
     fn undo(&mut self) {
@@ -2736,5 +2900,173 @@ mod tests {
         // devolve a permissão — o Drop do tempdir precisa conseguir
         // remover o conteúdo da pasta.
         fs::set_permissions(&readonly_subdir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn trocar_de_buffer_detecta_mudanca_externa_e_avisa() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let a_path = project_dir.path().join("a.txt");
+        let b_path = project_dir.path().join("b.txt");
+        fs::write(&a_path, "a original").unwrap();
+        fs::write(&b_path, "b original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, a_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, b_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&a_path, "a mudou por fora").unwrap();
+
+        app.handle_key(ctrl_key(KeyCode::Char('b'))); // Ctrl+b: trocar de buffer
+        type_str(&mut app, "a.txt");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.document().external_change_pending());
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains("mudou no disco"),
+            "{:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn salvar_com_mudanca_externa_pede_confirmacao_e_journala_a_mudanca_externa() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let path = project_dir.path().join("arquivo.txt");
+        fs::write(&path, "original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('K'))); // fim do buffer
+        type_text(&mut app, " e editado"); // edição local não salva
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, "mudou por fora").unwrap();
+
+        app.handle_key(ctrl_key(KeyCode::Char('s'))); // primeira tentativa: só avisa
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains("Ctrl+S de novo"),
+            "{:?}",
+            app.status_message
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "mudou por fora",
+            "não deveria ter sobrescrito ainda"
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('s'))); // confirma
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original e editado");
+
+        app.flush_history();
+        let entries = journal_entries(&history_dir);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.author == Author::External && e.inserted == "mudou por fora"),
+            "entradas: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_r_recarrega_e_confirma_antes_de_descartar_edicoes_locais() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let path = project_dir.path().join("arquivo.txt");
+        fs::write(&path, "original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('K')));
+        type_text(&mut app, " edicao local");
+
+        app.handle_key(ctrl_key(KeyCode::Char('r'))); // primeira vez: avisa
+        assert_eq!(text(&app), "original edicao local");
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains("Ctrl+R de novo"),
+            "{:?}",
+            app.status_message
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('r'))); // confirma
+        assert_eq!(text(&app), "original");
+        assert!(!app.document().is_modified());
+    }
+
+    #[test]
+    fn handle_focus_gained_confere_todos_os_buffers_abertos() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let a_path = project_dir.path().join("a.txt");
+        fs::write(&a_path, "original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, a_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&a_path, "mudou por fora").unwrap();
+
+        app.handle_focus_gained();
+
+        assert!(app.document().external_change_pending());
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains("mudou no disco")
+        );
+    }
+
+    #[test]
+    fn mudanca_externa_nao_marca_arquivo_como_rastreado() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let path = project_dir.path().join("arquivo.txt");
+        fs::write(&path, "original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, "mudou por fora").unwrap();
+        app.check_external_changes();
+
+        assert!(
+            nas_history::list_tracked(&history_dir).unwrap().is_empty(),
+            "uma mudança externa não deveria, por si só, iniciar o rastreamento do arquivo"
+        );
     }
 }
