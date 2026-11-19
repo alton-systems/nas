@@ -1,5 +1,8 @@
 //! Checkpoints nomeados do projeto: um snapshot, num só momento, do
-//! conteúdo de todo arquivo que mudou desde o checkpoint anterior —
+//! conteúdo de **todo arquivo rastreado** (ver `crate::originals`) —
+//! não só os que mudaram desde o checkpoint anterior, pra que
+//! restaurar um checkpoint antigo saiba o estado de qualquer arquivo,
+//! mesmo um tocado por primeira vez depois dele —
 //! docs/decisions/0005-historico-com-autoria.md §4 e §5.
 
 use std::collections::HashSet;
@@ -80,8 +83,25 @@ pub struct PruneReport {
     pub stopped_due_to_named_only: bool,
 }
 
-fn objects_dir(history_dir: &Path) -> PathBuf {
+pub(crate) fn objects_dir(history_dir: &Path) -> PathBuf {
     history_dir.join("objects")
+}
+
+/// Grava `content` em `objects/`, endereçado pelo hash do próprio
+/// conteúdo — se o objeto já existir (mesmo conteúdo de outro
+/// arquivo, ou deste mesmo arquivo num momento anterior), não
+/// regrava. Devolve o hash. Compartilhado entre [`create`] e
+/// `crate::originals::ensure_tracked`, que também precisa guardar
+/// conteúdo endereçado por hash.
+pub(crate) fn store_object(history_dir: &Path, content: &[u8]) -> io::Result<String> {
+    let objects = objects_dir(history_dir);
+    fs::create_dir_all(&objects)?;
+    let hash = hash_bytes(content);
+    let object_path = objects.join(&hash);
+    if !object_path.exists() {
+        fs::write(&object_path, content)?;
+    }
+    Ok(hash)
 }
 
 fn checkpoints_dir(history_dir: &Path) -> PathBuf {
@@ -111,11 +131,15 @@ fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 /// Cria um checkpoint com o conteúdo atual de `files` (caminho,
-/// bytes) — normalmente os arquivos que mudaram desde o anterior (ver
-/// [`changed_files_since_last_checkpoint`]), mas este módulo só guarda
-/// o que recebe; decidir quais arquivos passar é de quem chama.
-/// Arquivos grandes demais ou não-UTF8 ainda entram no manifesto (nome
-/// e tamanho), só não em `objects/` — devolvidos em `excluded`.
+/// bytes) — desde a correção do restaurar parcial, isto é sempre
+/// **todo arquivo rastreado** do projeto (ver `crate::originals`),
+/// não só os que mudaram desde o checkpoint anterior: só assim
+/// restaurar um checkpoint antigo sabe o estado de um arquivo que foi
+/// tocado por primeira vez *depois* dele. Este módulo só guarda o que
+/// recebe; reunir "todo arquivo rastreado, com o conteúdo atual" é
+/// responsabilidade de quem chama (`nas-term`). Arquivos grandes
+/// demais ou não-UTF8 ainda entram no manifesto (nome e tamanho), só
+/// não em `objects/` — devolvidos em `excluded`.
 pub fn create(
     history_dir: &Path,
     name: &str,
@@ -124,8 +148,7 @@ pub fn create(
     automatic: bool,
     files: &[(String, Vec<u8>)],
 ) -> io::Result<CreatedCheckpoint> {
-    let objects = objects_dir(history_dir);
-    fs::create_dir_all(&objects)?;
+    fs::create_dir_all(objects_dir(history_dir))?;
 
     let mut checkpoint_files = Vec::with_capacity(files.len());
     let mut excluded = Vec::new();
@@ -157,11 +180,7 @@ pub fn create(
             continue;
         }
 
-        let hash = hash_bytes(content);
-        let object_path = objects.join(&hash);
-        if !object_path.exists() {
-            fs::write(&object_path, content)?;
-        }
+        let hash = store_object(history_dir, content)?;
         checkpoint_files.push(CheckpointFile {
             path: path.clone(),
             size,
@@ -208,23 +227,6 @@ pub fn list(history_dir: &Path) -> io::Result<Vec<CheckpointManifest>> {
     }
     manifests.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(manifests)
-}
-
-/// Os caminhos distintos com ao menos uma entrada no journal desde o
-/// checkpoint mais recente (ou desde o início, se não houver nenhum
-/// ainda) — docs/decisions/0005 §4: um checkpoint só inclui arquivos
-/// que mudaram.
-pub fn changed_files_since_last_checkpoint(history_dir: &Path) -> io::Result<Vec<String>> {
-    let since = list(history_dir)?.last().map_or(0, |c| c.created_at);
-    let entries = read_entries(&journal_path(history_dir))?;
-    let mut seen = HashSet::new();
-    let mut files = Vec::new();
-    for entry in entries {
-        if entry.ts_end >= since && seen.insert(entry.file.clone()) {
-            files.push(entry.file);
-        }
-    }
-    Ok(files)
 }
 
 /// Lê o conteúdo de um objeto pelo hash — o mesmo conteúdo gravado
@@ -669,35 +671,6 @@ mod tests {
         journal
             .record(now, Author::User, "insert", file, pos, pos, "", "x")
             .unwrap();
-    }
-
-    #[test]
-    fn changed_files_sem_checkpoint_pega_tudo_que_ja_foi_journalado() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path()).unwrap();
-        record(&mut journal, 50, "a.txt", 0);
-        record(&mut journal, 60, "b.txt", 0);
-        journal.flush(60).unwrap();
-
-        let mut changed = changed_files_since_last_checkpoint(dir.path()).unwrap();
-        changed.sort();
-        assert_eq!(changed, vec!["a.txt".to_string(), "b.txt".to_string()]);
-    }
-
-    #[test]
-    fn changed_files_so_pega_o_que_mudou_depois_do_ultimo_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path()).unwrap();
-        record(&mut journal, 50, "a.txt", 0);
-        journal.flush(50).unwrap();
-
-        create(dir.path(), "cp", Author::User, 100, false, &[]).unwrap();
-
-        record(&mut journal, 150, "b.txt", 0);
-        journal.flush(150).unwrap();
-
-        let changed = changed_files_since_last_checkpoint(dir.path()).unwrap();
-        assert_eq!(changed, vec!["b.txt".to_string()]);
     }
 
     fn automatic_checkpoint(dir: &Path, name: &str, now: u64) {
