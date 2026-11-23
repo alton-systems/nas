@@ -189,6 +189,16 @@ que o núcleo recebe.
   `is_modified()` continua significando exatamente o que significa
   hoje — "o `Document` difere do que está no disco" — e vale pro
   documento como um todo, não por cliente.
+- **`write_file`/`checkpoint_*` quando há alteração não salva do
+  usuário**: como só existe um `Document`, salvar no disco salva
+  **tudo** que está nele — a edição da IA e qualquer alteração do
+  usuário que ainda não tinha ido pro disco, juntas, sem distinção.
+  O pedido de aprovação (§5) avisa isso explicitamente quando for o
+  caso — algo como "salvar `src/foo.rs` — inclui 12 linhas suas ainda
+  não salvas" — pra nunca surpreender o usuário com o próprio trabalho
+  sendo salvo sem ter pedido. Sem a aprovação, nada vai pro disco: nem
+  a parte da IA, nem a do usuário (não existe "salvar só a parte de
+  um autor" — é tudo o mesmo arquivo).
 - **Ordem das transações**: estritamente a ordem de chegada ao
   núcleo (FIFO por documento, §2) — cada transação se aplica por
   completo antes da próxima começar, nunca duas em paralelo sobre o
@@ -198,6 +208,21 @@ que o núcleo recebe.
   algo entre a última leitura da IA e este `edit`, a busca ainda acha
   o texto certo (se ainda existir) ou recusa com um erro claro (se já
   tiver sido alterado) — nunca aplica no deslocamento errado.
+- **Desfazer é um histórico só, não um por autor**: `u` desfaz a
+  **última transação do documento, de quem for** — do usuário ou da
+  IA, pela mesma ordem FIFO acima — nunca só as próprias. A echo area
+  diz de quem era a transação desfeita, ex. `"desfeito: edição da IA
+  (claude-code)"` ou `"desfeito: sua edição"`, reaproveitando a
+  autoria que o journal já guarda (ADR 0005 §1) — sem isso, desfazer
+  algo que não foi você quem fez seria uma surpresa silenciosa. Pra
+  desfazer o trabalho **inteiro** de uma sessão de IA de uma vez (em
+  vez de tecla por tecla), vale o checkpoint automático da sessão
+  (§6) — `Ctrl+t r` nele, não `u` repetido. **Desfazer seletivo por
+  autor** (ex.: "desfaça só as edições da IA, mantendo as minhas que
+  vieram depois, sem tocar nelas") fica como ideia pra depois, fora
+  desta fase — exigiria recompor o texto a partir do journal pulando
+  entradas de um autor específico, uma operação bem mais complexa que
+  desfazer linear ou restaurar um checkpoint inteiro.
 - **Teste de aceite (parte do critério de pronto de 3b)**: com um
   `Document` compartilhado, um cliente simulando o `nas-term` com o
   cursor no meio do texto e uma edição pendente de não-salvo, e um
@@ -447,6 +472,11 @@ ACP (§4) fica de fora desta lista de propósito.
   edições que alteram exatamente o mesmo trecho ao mesmo tempo — a
   segunda, nesse caso raro, ainda só se aplica sobre o resultado da
   primeira, na ordem de chegada, sem tentativa de combinar as duas.
+- **Desfazer seletivo por autor** (§2.1) — "desfaça só as edições da
+  IA, mantendo as minhas" fica como ideia pra depois; por ora,
+  desfazer é `u` sobre a última transação de qualquer autor, ou
+  restaurar o checkpoint automático da sessão pra desfazer uma
+  sessão inteira.
 
 ## Consequências
 
