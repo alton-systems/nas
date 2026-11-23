@@ -912,6 +912,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nas-config"
+version = "0.1.0"
+dependencies = [
+ "nas-keys",
+ "tempfile",
+ "toml 1.2.1+spec-1.1.0",
+ "toml_edit",
+]
+
+[[package]]
 name = "nas-editor"
 version = "0.1.0"
 dependencies = [
@@ -948,6 +958,7 @@ dependencies = [
  "arboard",
  "base64",
  "insta",
+ "nas-config",
  "nas-editor",
  "nas-history",
  "nas-keys",
