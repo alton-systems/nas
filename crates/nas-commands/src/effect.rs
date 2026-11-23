@@ -12,6 +12,12 @@ pub enum Effect {
     Pure,
     ReadFile,
     WriteBuffer,
+    /// Escreve no armazenamento do histórico (`~/.local/state/nas/`)
+    /// — nunca no arquivo do projeto em si. Separado de `WriteFile`
+    /// porque o risco é outro: `checkpoint_create` só acrescenta um
+    /// snapshot ao histórico, sempre reversível (não existe "apagar
+    /// um checkpoint" ainda) — liberado por padrão, ADR 0006 §5.
+    WriteHistory,
     WriteFile,
     Shell,
     Network,

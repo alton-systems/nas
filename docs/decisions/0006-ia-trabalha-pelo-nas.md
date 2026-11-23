@@ -49,6 +49,12 @@ pub enum Effect {
     Pure,
     ReadFile,
     WriteBuffer,
+    /// Escreve no armazenamento do histórico (`~/.local/state/nas/`)
+    /// — nunca no arquivo do projeto em si. Separado de `WriteFile`
+    /// porque o risco é outro: `checkpoint_create` só acrescenta um
+    /// snapshot ao histórico, sempre reversível (apagar um
+    /// checkpoint não é uma operação que exista ainda) — ver §5.
+    WriteHistory,
     WriteFile,
     Shell,
     Network,
@@ -74,14 +80,31 @@ dentro de um `register_all` central) — nada de macro (`defcommand` é
 Lisp, Marco 3 original; aqui ainda é só Rust simples, sem abstração
 antecipando o que ainda não existe, por `CLAUDE.md`).
 
-**Isto não substitui `nas-keys`/`[commands]`.** São camadas
-diferentes: `nas-keys` liga uma tecla a uma ação síncrona, sem
-argumentos, só pro estado Visual/Sequential. `nas-commands` é
-invocável por nome com argumentos explícitos — por um agente via MCP
-(§3), e no futuro pelo próprio Sequential do usuário (pilar 4) ou por
-Lisp. As duas tabelas de nomes (`docs/keys.md [commands]` e
-`nas-commands`) continuam independentes; nada aqui pede renomear uma
-pra bater com a outra.
+**Isto cria, de propósito, dois sistemas de comando que ainda não se
+falam** — uma duplicação reconhecida, não um descuido:
+`nas-keys`/`[commands]` liga uma tecla a uma ação síncrona, sem
+argumentos, só pro estado Visual/Sequential; `nas-commands` é
+invocável por nome com argumentos explícitos, hoje só por um agente
+via MCP (§3). As duas tabelas de nomes (`docs/keys.md [commands]` e
+`nas-commands`) continuam independentes por agora; nada nesta etapa
+renomeia uma pra bater com a outra.
+
+**O objetivo é unificar os dois**, não deixá-los divergir pra sempre:
+cada capacidade do nas vira **um** comando no registro
+(`nas-commands`), do qual nascem, automaticamente, tanto o atalho pro
+usuário (via `nas-keys`) quanto a ferramenta pra IA (via MCP, §3) — o
+inverso de hoje, em que `nas-keys` despacha pra código Rust direto
+(`machine.rs`/`App::apply_action`) sem passar pelo registro. Isso só
+faz sentido **depois** que o núcleo em segundo plano (§2) e o MCP
+(§3) já estiverem rodando de verdade e tiverem mostrado, na prática,
+que forma de comando serve pros dois lados (a navegação por
+caractere, por exemplo, não precisa de aprovação nem de esquema JSON
+— só uma IA raramente chamaria "mover um caractere" como ferramenta
+própria) — por isso não entra nas etapas 3a-3f. Fica registrada como
+uma etapa própria, **3g — unificação do despacho de comandos**, a ser
+detalhada (o que migra, o que nas-keys continua resolvendo sozinho)
+quando a fase 3 chegar lá; até então, viver com os dois sistemas
+separados é aceitável.
 
 Os nove comandos iniciais (§3) e seu efeito, usando o que
 `nas-editor::Document` já expõe:
@@ -95,7 +118,7 @@ Os nove comandos iniciais (§3) e seu efeito, usando o que
 | `edit` | `WriteBuffer` | busca por texto exato + `Document::delete_region`/inserção — semântica detalhada em §3 |
 | `show_diff` | `ReadFile` | `nas_history::diff` (lê `objects/` em disco) |
 | `create_file` | `WriteFile` | novo: cria um arquivo vazio no disco (e abre como buffer) |
-| `checkpoint_create` | `WriteFile` | o checkpoint automático de uma sessão de IA (§6) reaproveita este mesmo comando |
+| `checkpoint_create` | `WriteHistory` | o checkpoint automático de uma sessão de IA (§6) reaproveita este mesmo comando |
 | `checkpoint_restore` | `WriteFile` | `nas_history::restore` |
 
 `edit` é `WriteBuffer`, não `WriteFile`: muda o texto em memória (como
@@ -305,19 +328,24 @@ não-`Pure`, a aprovação é por **risco real**, não só pela classe —
 e só quando o autor é `Author::Ai` (um humano nunca precisa aprovar a
 própria tecla).
 
-- **Liberados por padrão**: `Pure`, `ReadFile` e **`WriteBuffer`**.
-  `WriteBuffer` entra aqui de propósito — é reversível pelo histórico
-  (`u`, journal) e, numa sessão de IA, já está coberto pelo checkpoint
-  automático do início da sessão (§6): desfazer qualquer coisa que
-  `edit` fez é sempre possível, com ou sem aprovação prévia. Pedir
-  aprovação pra cada edição de buffer tornaria o fluxo comum (abrir,
-  ler, editar, repetir) tão lento quanto sem o nas — o próprio
-  propósito do benchmark do §7.
+- **Liberados por padrão**: `Pure`, `ReadFile`, **`WriteBuffer`** e
+  **`WriteHistory`**. `WriteBuffer` entra aqui de propósito — é
+  reversível pelo histórico (`u`, journal) e, numa sessão de IA, já
+  está coberto pelo checkpoint automático do início da sessão (§6):
+  desfazer qualquer coisa que `edit` fez é sempre possível, com ou
+  sem aprovação prévia. Pedir aprovação pra cada edição de buffer
+  tornaria o fluxo comum (abrir, ler, editar, repetir) tão lento
+  quanto sem o nas — o próprio propósito do benchmark do §7.
+  `WriteHistory` entra pelo mesmo motivo que `WriteBuffer`, por um
+  caminho diferente: `checkpoint_create` só acrescenta um snapshot ao
+  armazenamento do histórico (`~/.local/state/nas/`) — nunca toca o
+  arquivo do projeto, então não há nada ali pro usuário aprovar
+  contra; é puro ganho de segurança (mais um ponto pra restaurar),
+  nunca um risco.
 - **Pedem aprovação**: `WriteFile`, `Shell` e `Network` — tocam o
-  disco de verdade (fora do checkpoint automático, que só cobre o que
-  passa por `Document`/`nas-history`) ou saem do projeto. Isso cobre
-  `create_file`, `checkpoint_create` e `checkpoint_restore` entre os
-  nove comandos de §1.
+  disco de verdade (fora do armazenamento do histórico) ou saem do
+  projeto. Isso cobre `create_file` e `checkpoint_restore` entre os
+  nove comandos de §1 — `checkpoint_create` não, pela razão acima.
 - **Interface aberta**: o núcleo manda um pedido de permissão pra todo
   cliente `nas-term` conectado e **bloqueia** aquele comando até
   decidir (com um tempo limite — alguns minutos — que nega
@@ -454,6 +482,12 @@ Divisão em PRs pequenos, mesmo espírito da fase 2 (2a–2d):
 - **3f** — benchmark comparativo: rodar as cinco tarefas, três vezes
   por lado, em ordem alternada (§7), escrever
   `docs/benchmark-fase3.md`.
+- **3g** — unificação do despacho de comandos (§1): depois que 3a-3f
+  provarem o formato do registro na prática, decidir e implementar
+  como `nas-keys` passa a resolver (pelo menos parte das) suas ações
+  através de `nas-commands`, em vez de despachar pra `machine.rs`/
+  `App::apply_action` direto — detalhada quando chegar lá, não nesta
+  ADR.
 
 ACP (§4) fica de fora desta lista de propósito.
 
