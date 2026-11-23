@@ -1,0 +1,14 @@
+[package]
+name = "nas-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nas-keys = { path = "../nas-keys" }
+toml = "1.2.1"
+toml_edit = "0.22"
+
+[dev-dependencies]
+tempfile = "3.27.0"

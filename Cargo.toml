@@ -6,6 +6,7 @@ members = [
     "crates/nas-keys",
     "crates/nas-history",
     "crates/nas-commands",
+    "crates/nas-config",
 ]
 
 [workspace.package]
