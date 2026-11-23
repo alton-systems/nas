@@ -14,60 +14,81 @@ use crate::effect::Effect;
 use crate::error::CommandError;
 use crate::registry::{Registry, typed_command};
 
+/// Os dez comandos: todos marcados `exposed_to_ai: true` nesta etapa
+/// — a marcação já existe (ADR 0006 §5/ADR 0007 §5: "estar no
+/// registro não basta"), mas nenhum comando nativo tem razão pra
+/// ficar de fora ainda. Um comando de usuário (quando o Steel
+/// chegar) é que nasce privado por padrão.
 pub fn register_all(registry: &mut Registry) {
     registry.register(typed_command(
         "open_file",
         "Abre um arquivo do projeto (cria o buffer se ainda não estiver aberto).",
         Effect::ReadFile,
+        true,
         open_file,
     ));
     registry.register(typed_command(
         "read",
         "Lê o conteúdo de um arquivo já aberto, com números de linha.",
         Effect::Pure,
+        true,
         read,
     ));
     registry.register(typed_command(
         "search",
         "Busca um texto literal num arquivo já aberto, devolvendo a linha de cada ocorrência.",
         Effect::Pure,
+        true,
         search,
     ));
     registry.register(typed_command(
         "list_files",
         "Lista os arquivos do projeto, respeitando .gitignore.",
         Effect::ReadFile,
+        true,
         list_files,
     ));
     registry.register(typed_command(
         "edit",
         "Substitui um texto antigo exato por um novo texto num arquivo já aberto; recusa se o texto antigo não for encontrado ou aparecer mais de uma vez (use line_range pra desambiguar).",
         Effect::WriteBuffer,
+        true,
         edit,
     ));
     registry.register(typed_command(
         "show_diff",
         "Mostra o diff de texto entre dois checkpoints do projeto.",
         Effect::ReadFile,
+        true,
         show_diff,
     ));
     registry.register(typed_command(
         "create_file",
         "Cria um arquivo novo no projeto (recusa se já existir).",
         Effect::WriteFile,
+        true,
         create_file,
     ));
     registry.register(typed_command(
         "checkpoint_create",
         "Cria um checkpoint nomeado com o conteúdo atual de todo arquivo rastreado do projeto.",
         Effect::WriteHistory,
+        true,
         checkpoint_create,
     ));
     registry.register(typed_command(
         "checkpoint_restore",
         "Restaura o projeto inteiro para o estado de um checkpoint.",
         Effect::WriteFile,
+        true,
         checkpoint_restore,
+    ));
+    registry.register(typed_command(
+        "save_file",
+        "Grava no disco as alterações já feitas num arquivo aberto; recusa se o arquivo mudou no disco desde a última leitura.",
+        Effect::WriteFile,
+        true,
+        save_file,
     ));
 }
 
@@ -143,13 +164,20 @@ pub struct ReadResult {
     /// O texto do arquivo, uma linha por linha do original, cada uma
     /// prefixada pelo seu número (1-indexado).
     pub text: String,
+    /// Presente se o arquivo mudou no disco desde a última leitura
+    /// e este buffer tem alterações ainda não salvas — o texto acima
+    /// ainda é o do buffer, não o do disco (`Workspace::sync_with_disk`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 fn read(ctx: &mut CommandContext, args: ReadArgs) -> Result<ReadResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
+    let warning = ctx.workspace.sync_with_disk(&path)?;
     let document = ctx.workspace.document(&path)?;
     Ok(ReadResult {
         text: with_line_numbers(&document.full_text()),
+        warning,
     })
 }
 
@@ -170,10 +198,14 @@ pub struct SearchMatch {
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     pub matches: Vec<SearchMatch>,
+    /// Mesmo aviso de `ReadResult::warning`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 fn search(ctx: &mut CommandContext, args: SearchArgs) -> Result<SearchResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
+    let warning = ctx.workspace.sync_with_disk(&path)?;
     let document = ctx.workspace.document(&path)?;
     let text = document.full_text();
     let mut matches = Vec::new();
@@ -187,7 +219,7 @@ fn search(ctx: &mut CommandContext, args: SearchArgs) -> Result<SearchResult, Co
             }
         }
     }
-    Ok(SearchResult { matches })
+    Ok(SearchResult { matches, warning })
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -248,10 +280,16 @@ pub struct EditArgs {
 pub struct EditResult {
     pub from: usize,
     pub to: usize,
+    /// Mesmo aviso de `ReadResult::warning` — se presente, a busca
+    /// por `old_text` abaixo ainda rodou contra o buffer (não contra
+    /// o disco mudado), pra nunca descartar a edição pendente.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
+    let warning = ctx.workspace.sync_with_disk(&path)?;
     let document = ctx.workspace.document(&path)?;
     let text = document.full_text();
 
@@ -290,7 +328,7 @@ fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandE
     ctx.workspace
         .record_change(ctx.author.clone(), "edit", &path, &change)?;
 
-    Ok(EditResult { from, to })
+    Ok(EditResult { from, to, warning })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -361,6 +399,47 @@ fn create_file(
             .record_change(ctx.author.clone(), "create-file", &path, &change)?;
     }
     Ok(CreateFileResult {
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SaveFileArgs {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SaveFileResult {
+    pub path: String,
+}
+
+/// Grava no disco o que `edit` já mudou em memória — nunca aplica
+/// nenhuma mudança de texto por conta própria. Recusa com
+/// `DiskChanged` se o arquivo mudou no disco desde a última leitura
+/// (`Workspace::sync_with_disk` devolvendo um aviso, não `None`):
+/// salvar por cima perderia o que mudou por fora — nunca sobrescreve
+/// trabalho de outro processo (revisão da etapa 3c). Quem chama
+/// precisa reabrir com `open_file` pra decidir o que fazer com as
+/// duas versões.
+///
+/// Depois de salvar, força o flush do journal — mesmo momento que
+/// `App::save` já usa em `nas-term`. Não há nenhuma mudança de texto
+/// nova pra journalar aqui (editar já journala na hora, ADR 0005
+/// §1); isto só garante que o que já foi registrado por este autor
+/// não fique só na fila em memória.
+fn save_file(
+    ctx: &mut CommandContext,
+    args: SaveFileArgs,
+) -> Result<SaveFileResult, CommandError> {
+    let path = ctx.workspace.resolve(&args.path)?;
+    if ctx.workspace.sync_with_disk(&path)?.is_some() {
+        return Err(CommandError::DiskChanged(path.display().to_string()));
+    }
+    ctx.workspace.save(&path)?;
+    if let Some(journal) = ctx.workspace.journal_mut() {
+        let _ = journal.flush(nas_history::now_unix());
+    }
+    Ok(SaveFileResult {
         path: path.to_string_lossy().into_owned(),
     })
 }
@@ -501,7 +580,11 @@ mod tests {
     }
 
     fn ctx<'a>(workspace: &'a mut Workspace, author: Author) -> CommandContext<'a> {
-        CommandContext { workspace, author }
+        CommandContext {
+            workspace,
+            author,
+            approved_effects: std::collections::HashSet::new(),
+        }
     }
 
     fn write(dir: &std::path::Path, name: &str, content: &str) -> PathBuf {
@@ -859,14 +942,162 @@ mod tests {
     }
 
     #[test]
+    fn buffer_limpo_recarrega_do_disco_antes_de_ler() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "original");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+        open_file(
+            &mut context,
+            OpenFileArgs {
+                path: path_str.clone(),
+            },
+        )
+        .expect("abrir");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, "mudou por fora").expect("simular mudança externa");
+
+        let result = read(&mut context, ReadArgs { path: path_str }).expect("ler");
+        assert_eq!(result.text, "1 mudou por fora");
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn buffer_com_alteracoes_avisa_em_vez_de_recarregar() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "original");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+        open_file(
+            &mut context,
+            OpenFileArgs {
+                path: path_str.clone(),
+            },
+        )
+        .expect("abrir");
+        edit(
+            &mut context,
+            EditArgs {
+                path: path_str.clone(),
+                old_text: "original".to_string(),
+                new_text: "original editado".to_string(),
+                line_range: None,
+            },
+        )
+        .expect("editar");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, "mudou por fora").expect("simular mudança externa");
+
+        let result = read(&mut context, ReadArgs { path: path_str }).expect("ler");
+        assert_eq!(
+            result.text, "1 original editado",
+            "o buffer com alterações não deveria ter sido descartado"
+        );
+        assert!(result.warning.is_some());
+    }
+
+    #[test]
+    fn save_file_recusado_sem_aprovacao_e_aceito_com_ela() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+
+        let path_str = path.to_string_lossy().into_owned();
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+
+        let err = registry
+            .run(
+                "save_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect_err("devia recusar sem aprovação");
+        assert!(matches!(err, CommandError::NeedsApproval { .. }));
+
+        context.approved_effects.insert(Effect::WriteFile);
+        registry
+            .run(
+                "save_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("devia aceitar com a aprovação concedida");
+    }
+
+    #[test]
+    fn save_file_recusa_quando_o_disco_mudou_desde_a_ultima_leitura() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        context.approved_effects.insert(Effect::WriteFile);
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+
+        let path_str = path.to_string_lossy().into_owned();
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({
+                    "path": path_str,
+                    "old_text": "ola",
+                    "new_text": "ola editado",
+                }),
+            )
+            .expect("editar");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, "mudou por fora").expect("simular mudança externa");
+
+        let err = registry
+            .run(
+                "save_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::DiskChanged(_)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mudou por fora",
+            "nunca deveria ter sobrescrito a mudança externa"
+        );
+    }
+
+    #[test]
     fn registry_expoe_os_nove_comandos_com_efeito() {
         let mut registry = Registry::new();
         register_all(&mut registry);
 
-        assert_eq!(registry.specs().len(), 9);
+        assert_eq!(registry.specs().len(), 10);
         let edit_spec = registry.get("edit").expect("edit deveria existir");
         assert_eq!(edit_spec.effect, Effect::WriteBuffer);
         assert!(registry.get("comando-que-nao-existe").is_none());
+        assert!(
+            registry.specs().iter().all(|spec| spec.exposed_to_ai),
+            "os dez comandos deveriam estar marcados como expostos à IA"
+        );
     }
 
     #[test]
