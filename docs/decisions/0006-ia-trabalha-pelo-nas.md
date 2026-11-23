@@ -106,7 +106,7 @@ detalhada (o que migra, o que nas-keys continua resolvendo sozinho)
 quando a fase 3 chegar lá; até então, viver com os dois sistemas
 separados é aceitável.
 
-Os nove comandos iniciais (§3) e seu efeito, usando o que
+Os dez comandos iniciais (§3) e seu efeito, usando o que
 `nas-editor::Document` já expõe:
 
 | Comando | Efeito | Base em `Document`/`nas-history` |
@@ -120,6 +120,7 @@ Os nove comandos iniciais (§3) e seu efeito, usando o que
 | `create_file` | `WriteFile` | novo: cria um arquivo vazio no disco (e abre como buffer) |
 | `checkpoint_create` | `WriteHistory` | o checkpoint automático de uma sessão de IA (§6) reaproveita este mesmo comando |
 | `checkpoint_restore` | `WriteFile` | `nas_history::restore` |
+| `save_file` | `WriteFile` | grava no disco o que `edit` só mudou em memória — detalhado em §3 |
 
 `edit` é `WriteBuffer`, não `WriteFile`: muda o texto em memória (como
 qualquer tecla do usuário), não salva no disco por conta própria —
@@ -264,24 +265,31 @@ que o núcleo recebe.
 
 ### 3. Servidor MCP
 
-Uma crate nova, `nas-mcp` (binário), usando a crate
-[`rmcp`](https://docs.rs/rmcp) — isolada atrás do nosso próprio
+Uma crate nova, `nas-mcp` — **biblioteca**, não um binário próprio
+(revisão da etapa 3c: a entrada é `nas --mcp`, no mesmo binário que já
+existe, não um segundo executável) — usando a crate
+[`rmcp`](https://docs.rs/rmcp) isolada atrás do nosso próprio
 adaptador, mesmo princípio já usado pro helix (decisão 0001: "isolar o
 uso dessas crates atrás dos nossos módulos, a API delas não é
 estável"). `nas-mcp` só sabe traduzir: uma chamada de ferramenta MCP
-vira uma chamada ao `Registry` (§1) através do núcleo (§2); nada de
-`rmcp` aparece em `nas-commands`, `nas-editor` ou `nas-history`.
+vira uma chamada ao `Registry` (§1); nada de `rmcp` aparece em
+`nas-commands`, `nas-editor` ou `nas-history`.
 
 - **Transporte**: stdio — o jeito que o Claude Code (e a maioria dos
-  clientes MCP) espera, lançando `nas-mcp` como subprocesso.
-  `nas-mcp` conecta no socket do núcleo do projeto corrente (§2),
-  subindo um núcleo novo se precisar — por isso um agente funciona sem
-  o `nas-term` jamais ter sido aberto.
-- **Ferramentas**: exatamente os nove comandos de §1,
-  `registry.specs()` convertido 1:1 em `rmcp::Tool` (nome, descrição,
+  clientes MCP) espera, lançando `nas --mcp` como subprocesso.
+  **Revisão da etapa 3c (§2/§8)**: até a decisão pós-benchmark sobre o
+  núcleo em segundo plano (3b), não há socket nenhum pra conectar —
+  `nas --mcp` mantém seu próprio `Workspace` dentro do processo, do
+  mesmo jeito que `nas-term`. A frase original desta seção ("conecta
+  no socket do núcleo do projeto corrente, subindo um núcleo novo se
+  precisar") só passa a valer quando 3b existir.
+- **Ferramentas**: exatamente os dez comandos de §1,
+  `registry.specs()` filtrado por `exposed_to_ai` (cada `CommandSpec`
+  marca explicitamente se aparece pra IA — estar no registro não
+  basta, §5) e convertido 1:1 em `rmcp::Tool` (nome, descrição,
   `input_schema` = o `args_schema` do `schemars`) — a lista de
-  ferramentas que a IA vê **é** o registro; não existe uma segunda
-  lista pra manter sincronizada.
+  ferramentas que a IA vê **é** o registro já filtrado; não existe uma
+  segunda lista pra manter sincronizada.
 - **`edit` é "texto antigo exato → texto novo", nunca intervalo de
   caracteres.** Argumentos: `{ path, old_text, new_text, line_range?:
   [de, até] }`. O comando busca `old_text` literal no conteúdo atual
@@ -301,6 +309,19 @@ vira uma chamada ao `Registry` (§1) através do núcleo (§2); nada de
   leitura da IA e este `edit` não faz a edição cair no lugar errado
   — ou o texto antigo ainda está lá (edita certo) ou não está mais
   (recusa, nunca corrompe outro trecho).
+- **`edit` muda só o buffer do processo MCP; nada vai pro disco sem
+  `save_file`** (revisão da etapa 3c). Até lá, o arquivo no disco e o
+  que a IA vê podem divergir — por isso toda leitura/edição começa
+  reaproveitando a mesma detecção de mudança externa do `Document`
+  (ADR 0005 §1): se o buffer da IA está limpo e o disco mudou,
+  recarrega sozinho antes de continuar; se o buffer tem alterações e o
+  disco mudou, avisa no resultado do comando em vez de recarregar (nunca
+  descarta trabalho silenciosamente). `save_file` (`WriteFile`, pede
+  aprovação — abaixo) grava o buffer no disco, confere o caminho
+  contra a raiz do projeto e recusa — com um erro pedindo pra reabrir
+  via `open_file` — se o disco mudou desde a última leitura; nunca
+  sobrescreve o trabalho de outro processo (o `nas-term` do usuário,
+  por exemplo).
 - **`create_file`**: cria um arquivo novo (vazio, ou com um conteúdo
   inicial opcional) e já abre como buffer — `WriteFile`, pede
   aprovação (§5).
@@ -351,8 +372,17 @@ própria tecla).
   nunca um risco.
 - **Pedem aprovação**: `WriteFile`, `Shell` e `Network` — tocam o
   disco de verdade (fora do armazenamento do histórico) ou saem do
-  projeto. Isso cobre `create_file` e `checkpoint_restore` entre os
-  nove comandos de §1 — `checkpoint_create` não, pela razão acima.
+  projeto. Isso cobre `create_file`, `checkpoint_restore` e
+  `save_file` entre os dez comandos de §1 — `checkpoint_create` não,
+  pela razão acima.
+  **`--approve-writes` (revisão da etapa 3c, temporário)**: até esta
+  etapa existir de verdade, `nas --mcp --approve-writes` é o único
+  jeito de liberar `WriteFile` (nunca `Shell`/`Network`, que não têm
+  comando nenhum ainda) — pensada só pra testar o resto do fluxo
+  (`save_file` incluído) antes de 3d existir; desligada por padrão, e
+  este parágrafo marca que a flag **deve ser removida ou substituída**
+  pela interface de aprovação de verdade quando 3d for implementada,
+  nunca conviver com ela como uma segunda porta.
 - **Interface aberta**: o núcleo manda um pedido de permissão pra todo
   cliente `nas-term` conectado e **bloqueia** aquele comando até
   decidir (com um tempo limite — alguns minutos — que nega
@@ -505,7 +535,9 @@ pena *antes* de pagar o custo do núcleo em segundo plano, não depois.
   na sessão), o arquivo de configuração pro caso sem interface (§5).
   Sem o núcleo em segundo plano ainda, o bloqueio é dentro do próprio
   processo `nas --mcp` (síncrono com a chamada MCP), não num núcleo
-  compartilhado — mesma ressalva de 3c.
+  compartilhado — mesma ressalva de 3c. **Remove ou substitui
+  `--approve-writes`** (a flag temporária de 3c, §5) pela interface de
+  aprovação de verdade — a flag não sobrevive a esta etapa.
 - **3e** — autoria de sessão: o checkpoint automático por
   `(agent, session)`, um teste de ponta a ponta provando que `Ctrl+t
   r` nesse checkpoint desfaz a sessão inteira.
@@ -560,9 +592,10 @@ ACP (§4) fica de fora desta lista de propósito.
   desta ADR): `nas-commands` deixa de estar reservada pro "marco 3" —
   nasce agora; o roteiro do README também precisa registrar a
   inversão descrita no Contexto.
-- Dois binários novos a partir do mesmo workspace: `nas --daemon`
-  (modo do binário já existente) e `nas-mcp` (crate/binário novo) —
-  nenhuma crate nova além de `nas-commands` e `nas-mcp`.
+- Dois modos novos no mesmo binário (`nas --daemon`, `nas --mcp`),
+  nenhum binário extra — `nas-mcp` (revisão da etapa 3c) é biblioteca,
+  chamada de dentro de `nas-term`; nenhuma crate nova além de
+  `nas-commands` e `nas-mcp`.
 - A UI de permissão (§5) reaproveita Prompt/Overlay/echo area que já
   existem (inclusive o acabamento which-key desta própria PR) — risco
   baixo sobre o código de interface já estável.
