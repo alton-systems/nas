@@ -413,6 +413,15 @@ impl Machine {
         self.state
     }
 
+    /// Troca o keymap em uso — ADR 0007-configuracao-em-camadas.md,
+    /// Parte 2, "Recarregar": depois de validar um `keymap.toml`
+    /// novo por completo, a troca é só isto, sem reconstruir a
+    /// `Machine` (que perderia o estado modal atual, a sequência
+    /// pendente, etc.).
+    pub fn set_keymap(&mut self, keymap: Keymap) {
+        self.keymap = keymap;
+    }
+
     /// As teclas acumuladas no estado Sequential (vazio em qualquer outro
     /// estado).
     pub fn pending_sequence(&self) -> &[Key] {
