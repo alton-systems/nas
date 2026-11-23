@@ -281,8 +281,15 @@ impl Keymap {
     }
 }
 
+/// `deny_unknown_fields`: um atalho com campos de mais de uma forma
+/// ao mesmo tempo (ex.: `{ prefix = "go", verb = "delete" }`) é um
+/// erro de verdade, não um dos dois campos lido e o outro ignorado
+/// em silêncio — `#[serde(untagged)]` tenta cada variante em ordem,
+/// e sem isto a primeira que bater parcialmente venceria, mascarando
+/// um `keymap.toml` malformado (ADR 0007-configuracao-em-camadas.md,
+/// revisão do PR).
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 enum RawBinding {
     Named(String),
     Prefix { prefix: String },
@@ -294,7 +301,7 @@ enum RawBinding {
 /// (`"save"`), ou entra num prefixo nomeado (`{ prefix = "tempo" }`)
 /// que espera mais uma tecla, resolvida em `[system-prefixes.<nome>]`.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 enum RawSystemBinding {
     Named(String),
     Prefix { prefix: String },
@@ -306,7 +313,7 @@ enum RawSystemBinding {
 /// uma ação destrutiva sempre aparece por último, na própria linha,
 /// na dica which-key (ver `ui::which_key_lines` em `nas-term`).
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 enum RawSystemPrefixEntry {
     Named(String),
     Detailed {
@@ -634,6 +641,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, KeymapError::InvalidKey(_)));
+    }
+
+    #[test]
+    fn rejeita_atalho_com_campos_misturados() {
+        // `{ prefix = "go", verb = "delete" }` não é nem um prefixo
+        // puro nem um verbo puro — `deny_unknown_fields` faz isto
+        // virar um erro de TOML, em vez de silenciosamente bater
+        // com a primeira variante (`Prefix`) e descartar `verb`.
+        let err = Keymap::from_toml_str(
+            r#"[visual]
+g = { prefix = "go", verb = "delete" }
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, KeymapError::Toml(_)));
     }
 
     #[test]

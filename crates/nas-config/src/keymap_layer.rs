@@ -30,7 +30,7 @@ pub(crate) fn load_keymap(file: &Path, user_source: Option<&str>) -> Result<Keym
     let user_value: toml::Value = toml::from_str(user_source)
         .map_err(|err| ConfigError::new(file, format!("TOML inválido: {err}")))?;
 
-    let merged = merge(default_value, user_value);
+    let merged = merge_root(default_value, user_value);
     let merged_source = toml::to_string(&merged).map_err(|err| {
         ConfigError::new(file, format!("erro interno ao combinar o keymap: {err}"))
     })?;
@@ -38,31 +38,80 @@ pub(crate) fn load_keymap(file: &Path, user_source: Option<&str>) -> Result<Keym
     Keymap::from_toml_str(&merged_source).map_err(|err| ConfigError::new(file, err.to_string()))
 }
 
-/// Merge genérico por valor TOML: tabelas se mesclam recursivamente
-/// (cobre `[visual]`, `[prefixes.go]`, `[system_prefixes.tempo]`,
-/// ... sem precisar listar cada seção); dentro de uma tabela, uma
-/// chave cujo valor em `over` é `false` é **removida** de `base` em
-/// vez de inserida — é como um atalho do padrão deixa de existir.
-/// Fora de uma tabela (um valor escalar substituindo outro), `over`
-/// sempre vence.
-fn merge(base: toml::Value, over: toml::Value) -> toml::Value {
-    match (base, over) {
-        (toml::Value::Table(mut base), toml::Value::Table(over)) => {
-            for (key, value) in over {
-                if is_removal(&value) {
-                    base.remove(&key);
-                    continue;
-                }
-                let merged = match base.remove(&key) {
-                    Some(existing) => merge(existing, value),
-                    None => value,
-                };
-                base.insert(key, merged);
-            }
-            toml::Value::Table(base)
-        }
-        (_, over) => over,
+/// Mescla a raiz do keymap — conhece as seções de
+/// `default.toml`/`docs/keys.md` por nome, pra saber até que
+/// profundidade mesclar tabela por tabela antes de parar e
+/// substituir por inteiro (ver `merge_bindings`). Não é um merge
+/// genérico de qualquer árvore TOML — um keymap tem uma forma fixa.
+fn merge_root(base: toml::Value, over: toml::Value) -> toml::Value {
+    let (mut base, over) = match (base, over) {
+        (toml::Value::Table(base), toml::Value::Table(over)) => (base, over),
+        (_, over) => return over,
+    };
+
+    for (section, over_value) in over {
+        let merged = match section.as_str() {
+            // Tabelas de grupos nomeados (`prefixes.go`,
+            // `objects.word`, `system_prefixes.tempo`) — mais um
+            // nível antes de chegar numa tecla de verdade.
+            "prefixes" | "objects" | "system_prefixes" => match base.remove(&section) {
+                Some(existing) => merge_group_of_groups(existing, over_value),
+                None => over_value,
+            },
+            // `[insert]`/`[visual]`/`[system]`/`[commands]` — tecla
+            // (ou nome de comando) direto pra um valor-folha.
+            _ => match base.remove(&section) {
+                Some(existing) => merge_bindings(existing, over_value),
+                None => over_value,
+            },
+        };
+        base.insert(section, merged);
     }
+    toml::Value::Table(base)
+}
+
+/// Uma tabela de grupos nomeados — `[prefixes]` (`go`, `leader`),
+/// `[objects]` (`word`, `paragraph`, `whole`), `[system_prefixes]`
+/// (`tempo`). Cada grupo, por sua vez, é uma tabela de tecla →
+/// valor-folha, mesclada por [`merge_bindings`].
+fn merge_group_of_groups(base: toml::Value, over: toml::Value) -> toml::Value {
+    let (mut base, over) = match (base, over) {
+        (toml::Value::Table(base), toml::Value::Table(over)) => (base, over),
+        (_, over) => return over,
+    };
+    for (group, over_value) in over {
+        let merged = match base.remove(&group) {
+            Some(existing) => merge_bindings(existing, over_value),
+            None => over_value,
+        };
+        base.insert(group, merged);
+    }
+    toml::Value::Table(base)
+}
+
+/// Uma tabela de tecla → valor-folha (um atalho: `"move-right"`,
+/// `{ prefix = "go" }`, `{ verb = "delete" }`, `{ action = ...,
+/// destructive = ... }`; ou, em `[commands]`, nome de comando →
+/// descrição). **Cada valor é substituído por inteiro, nunca
+/// mesclado campo a campo** — um atalho não é um objeto aberto pra
+/// combinar com outro; `g = { verb = "delete" }` por cima de
+/// `g = { prefix = "go" }` apaga o `prefix` e fica só com o `verb`,
+/// nunca os dois juntos. Uma chave cujo valor em `over` é `false` é
+/// **removida** de `base`, em vez de inserida — é como um atalho do
+/// padrão deixa de existir (ver `docs/config.md`).
+fn merge_bindings(base: toml::Value, over: toml::Value) -> toml::Value {
+    let (mut base, over) = match (base, over) {
+        (toml::Value::Table(base), toml::Value::Table(over)) => (base, over),
+        (_, over) => return over,
+    };
+    for (key, value) in over {
+        if is_removal(&value) {
+            base.remove(&key);
+            continue;
+        }
+        base.insert(key, value);
+    }
+    toml::Value::Table(base)
 }
 
 #[cfg(test)]
@@ -125,5 +174,24 @@ mod tests {
             load_keymap(&file(), Some("[prefixes.go]\ng = false\n")).expect("deveria carregar");
         let go = keymap.prefixes.get("go").expect("prefixo go");
         assert!(!go.contains_key(&Key::char('g')));
+    }
+
+    #[test]
+    fn atalho_e_substituido_por_inteiro_nunca_mesclado_campo_a_campo() {
+        // No padrão, "g" é { prefix = "go" }. O usuário redefine
+        // como { verb = "delete" } — deveria virar só o verbo, sem
+        // nenhum traço do "prefix" original sobrevivendo junto.
+        let padrao = Keymap::default_keymap();
+        assert_eq!(
+            padrao.visual.get(&Key::char('g')),
+            Some(&Binding::Prefix("go".to_string()))
+        );
+
+        let keymap = load_keymap(&file(), Some("[visual]\ng = { verb = \"delete\" }\n"))
+            .expect("deveria carregar");
+        assert_eq!(
+            keymap.visual.get(&Key::char('g')),
+            Some(&Binding::Verb(nas_keys::Verb::Delete))
+        );
     }
 }
