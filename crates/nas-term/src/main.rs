@@ -42,6 +42,12 @@ const EXTERNAL_CHANGE_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
+    // Verificado antes de qualquer outra coisa — `--check-config`
+    // nunca abre terminal nenhum (docs/decisions/0007 §3, Parte 2).
+    if std::env::args().any(|arg| arg == "--check-config") {
+        return check_config();
+    }
+
     // Criado antes de qualquer outra coisa (até do log) pra que o
     // panic hook, instalado logo abaixo, já tenha o mesmo `Arc` que
     // `app` vai usar — um pânico em qualquer ponto depois daqui força
@@ -58,10 +64,36 @@ async fn main() -> io::Result<()> {
         *history.lock().unwrap() = open_project_journal(project, state_home);
     }
 
-    let mut app = App::with_layout(open_document_from_args()?, keyboard_layout());
+    // Configuração em camadas (docs/decisions/0007): lida e validada
+    // por completo antes de qualquer coisa ser aplicada (§3) — um
+    // erro aqui nunca impede o nas de abrir, só mantém o padrão
+    // embutido e avisa na echo area assim que a tela existir.
+    let project_root = project.as_ref().map(|(p, _)| p.root().to_path_buf());
+    let user_config_dir = nas_config::user_config_dir().ok();
+    let loaded_config = nas_config::load(user_config_dir.as_deref(), project_root.as_deref());
+    let (config, config_error_message) = match &loaded_config {
+        Ok(loaded) => (loaded.config, None),
+        Err(errors) => (
+            nas_config::Config::default(),
+            Some(format!(
+                "Configuração inválida, usando o padrão — {}",
+                nas_config::format_errors(errors)
+            )),
+        ),
+    };
+
+    let layout = keyboard_layout(config.keyboard_layout);
+    let mut app = App::with_layout(open_document_from_args()?, layout);
     app.attach_history(history);
+    app.attach_config(config, user_config_dir, project_root);
+    if let Ok(loaded) = loaded_config {
+        app.modal.set_keymap(loaded.keymap);
+    }
     if let Some((project, state_home)) = project {
         app.attach_project(project, state_home);
+    }
+    if let Some(message) = config_error_message {
+        app.show_startup_message(message);
     }
 
     let mut terminal = setup_terminal()?;
@@ -72,6 +104,24 @@ async fn main() -> io::Result<()> {
         tracing::error!(error = %err, "nas terminou com erro");
     }
     result
+}
+
+/// `nas --check-config`: valida as duas camadas de dados
+/// (docs/decisions/0007) sem abrir nenhum terminal — imprime os
+/// erros (se houver) e sai com código diferente de zero.
+fn check_config() -> io::Result<()> {
+    let project_root = discover_project().map(|(project, _)| project.root().to_path_buf());
+    let user_config_dir = nas_config::user_config_dir().ok();
+    match nas_config::load(user_config_dir.as_deref(), project_root.as_deref()) {
+        Ok(_) => {
+            println!("Configuração válida.");
+            Ok(())
+        }
+        Err(errors) => {
+            eprintln!("{}", nas_config::format_errors(&errors));
+            Err(io::Error::other("configuração inválida"))
+        }
+    }
 }
 
 /// Abre o documento passado na linha de comando. Um arquivo que não é
@@ -120,16 +170,21 @@ fn open_project_journal(
     }
 }
 
-/// Layout físico de teclado, escolhido por `NAS_KEYBOARD_LAYOUT`
-/// ("qwerty" ou "qwerty-abnt"). Sem a variável, ou com um nome
-/// desconhecido, usa qwerty (o padrão do próprio nas-keys).
-fn keyboard_layout() -> Layout {
+/// Layout físico de teclado: `NAS_KEYBOARD_LAYOUT` ("qwerty" ou
+/// "qwerty-abnt"), se definida e válida — vence por ser uma troca
+/// rápida, de uma sessão só, sem precisar editar um arquivo; senão
+/// `keyboard_layout` de `config.toml` (docs/decisions/0007), que já
+/// chega resolvido em `config_layout`.
+fn keyboard_layout(config_layout: Layout) -> Layout {
     let Ok(name) = std::env::var("NAS_KEYBOARD_LAYOUT") else {
-        return Layout::Qwerty;
+        return config_layout;
     };
     Layout::from_name(&name).unwrap_or_else(|| {
-        tracing::warn!(name, "NAS_KEYBOARD_LAYOUT desconhecida; usando qwerty");
-        Layout::Qwerty
+        tracing::warn!(
+            name,
+            "NAS_KEYBOARD_LAYOUT desconhecida; usando a configuração"
+        );
+        config_layout
     })
 }
 

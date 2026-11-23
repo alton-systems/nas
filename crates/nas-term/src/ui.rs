@@ -44,7 +44,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let status_area = rows[1];
     let echo_area = rows[2];
 
-    let gutter_width = number_width(app.document().len_lines().max(1)) + 1;
+    // ADR 0007-configuracao-em-camadas.md, Parte 2: `line_numbers`
+    // desliga a régua — largura zero, todo o resto do layout segue
+    // igual, só sem a coluna.
+    let gutter_width = if app.config().line_numbers {
+        number_width(app.document().len_lines().max(1)) + 1
+    } else {
+        0
+    };
     let cols = Layout::horizontal([Constraint::Length(gutter_width as u16), Constraint::Min(1)])
         .split(text_area);
     let gutter_area = cols[0];
@@ -52,7 +59,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     app.ensure_cursor_visible(content_area.width as usize, content_area.height as usize);
 
-    draw_gutter(frame, gutter_area, app, gutter_width);
+    if app.config().line_numbers {
+        draw_gutter(frame, gutter_area, app, gutter_width);
+    }
     draw_content(frame, content_area, app);
     draw_status(frame, status_area, app);
     draw_echo_area(frame, echo_area, &echo_lines);
@@ -609,5 +618,35 @@ mod tests {
                 if is_selected { "" } else { " não" }
             );
         }
+    }
+
+    #[test]
+    fn line_numbers_desligado_remove_a_coluna_da_regua() {
+        let mut document = Document::empty();
+        for ch in "ola".chars() {
+            document.insert_char(ch);
+        }
+        let mut app = App::with_layout(document, Layout::Qwerty);
+        app.attach_config(
+            nas_config::Config {
+                line_numbers: false,
+                ..nas_config::Config::default()
+            },
+            None,
+            None,
+        );
+
+        let backend = TestBackend::new(30, 3);
+        let mut terminal = Terminal::new(backend).expect("terminal de teste");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("desenhar");
+        let buffer = terminal.backend().buffer();
+
+        // sem régua, "ola" começa direto na coluna 0.
+        let line: String = (0..3u16)
+            .map(|col| buffer[(col, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(line, "ola");
     }
 }
