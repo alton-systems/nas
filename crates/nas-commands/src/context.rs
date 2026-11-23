@@ -184,6 +184,34 @@ impl Workspace {
         std::fs::read(path).ok()
     }
 
+    /// Antes de qualquer comando que opera sobre um documento já
+    /// aberto (`read`, `search`, `edit`, `save_file`): confere se o
+    /// arquivo mudou no disco desde a última leitura/escrita, via a
+    /// mesma detecção de mudança externa que `nas-term` já usa
+    /// (`nas_editor::Document::check_external_change`, ADR 0005 §1).
+    ///
+    /// Buffer sem alterações deste processo: nada a perder —
+    /// recarrega sozinho, devolve `None` (nada a avisar). Buffer com
+    /// alterações ainda não salvas: não descarta nada — devolve uma
+    /// mensagem pra o comando incluir no resultado (`save_file` trata
+    /// isto como erro, os demais só avisam).
+    pub fn sync_with_disk(&mut self, path: &Path) -> Result<Option<String>, CommandError> {
+        let Some(document) = self.documents.get_mut(path) else {
+            return Ok(None);
+        };
+        let Some(_change) = document.check_external_change()? else {
+            return Ok(None);
+        };
+        if document.is_modified() {
+            return Ok(Some(format!(
+                "{} mudou no disco desde a última leitura — este buffer tem alterações ainda não salvas, nada foi recarregado",
+                path.display()
+            )));
+        }
+        document.reload()?;
+        Ok(None)
+    }
+
     /// Escreve `content` em `path`: se já há um documento aberto pra
     /// esse caminho, substitui o conteúdo dele (`replace_all`, que
     /// entra no desfazer por tecla) e salva; senão, abre um documento
@@ -202,6 +230,17 @@ impl Workspace {
         document.save()?;
         self.documents.insert(PathBuf::from(path), document);
         Ok(change)
+    }
+
+    /// Grava no disco o conteúdo que já está no documento aberto em
+    /// `path` (as edições que `edit` já fez em memória) — pra
+    /// `save_file`. Diferente de `write_file`: não substitui o
+    /// conteúdo por nada antes, só persiste o que já está lá. `path`
+    /// já deve ser o resultado de `resolve`, e já deve estar aberto
+    /// (`document_mut` erra com `NotOpen` senão).
+    pub fn save(&mut self, path: &Path) -> Result<(), CommandError> {
+        self.document_mut(path)?.save()?;
+        Ok(())
     }
 }
 
@@ -247,4 +286,12 @@ fn canonicalize_lenient(path: &Path) -> io::Result<PathBuf> {
 pub struct CommandContext<'a> {
     pub workspace: &'a mut Workspace,
     pub author: Author,
+    /// Efeitos que já têm aprovação pra esta chamada — vazio por
+    /// padrão, porque a aprovação de verdade só chega na etapa 3d
+    /// (ADR 0006 §5): até lá, `Registry::run` recusa qualquer
+    /// comando com efeito `WriteFile`/`Shell`/`Network` a menos que
+    /// o efeito esteja aqui. `nas --mcp --approve-writes`
+    /// (temporário, só pra testar enquanto 3d não existe) é o único
+    /// jeito de colocar `WriteFile` aqui — nunca `Shell`/`Network`.
+    pub approved_effects: std::collections::HashSet<crate::effect::Effect>,
 }

@@ -1,6 +1,8 @@
 use std::fmt;
 use std::io;
 
+use crate::effect::Effect;
+
 /// Por que um comando falhou — nunca aplica parcialmente nem finge
 /// sucesso (mesmo princípio de `nas-history`, ADR 0005 §5).
 #[derive(Debug)]
@@ -31,6 +33,17 @@ pub enum CommandError {
     /// mensagem — só o que foi pedido, pra não dar a quem pediu uma
     /// pista do layout de fora da raiz.
     OutsideRoot(String),
+    /// `save_file`: o arquivo mudou no disco desde a última leitura
+    /// — nunca sobrescreve um trabalho que não é deste `Workspace`
+    /// (ADR 0006, revisão da etapa 3c). Quem chama precisa reabrir
+    /// com `open_file` antes de tentar salvar de novo.
+    DiskChanged(String),
+    /// O comando declara um efeito que ainda pede aprovação (ADR
+    /// 0006 §5: `WriteFile`, `Shell`, `Network`) e esta etapa (3c)
+    /// ainda não tem onde pedir — a aprovação de verdade chega na
+    /// etapa 3d. Sem a flag `--approve-writes` (que só libera
+    /// `WriteFile`, nunca `Shell`/`Network`), o comando é recusado.
+    NeedsApproval { command: String, effect: Effect },
 }
 
 impl fmt::Display for CommandError {
@@ -54,6 +67,16 @@ impl fmt::Display for CommandError {
             CommandError::OutsideRoot(path) => {
                 write!(f, "{path:?} está fora da raiz do projeto")
             }
+            CommandError::DiskChanged(path) => {
+                write!(
+                    f,
+                    "{path:?} mudou no disco desde a última leitura — reabra com open_file antes de salvar"
+                )
+            }
+            CommandError::NeedsApproval { command, effect } => write!(
+                f,
+                "{command:?} tem efeito {effect:?}, que pede aprovação — a aprovação chega na etapa 3d; rode com --approve-writes (só libera WriteFile, nunca Shell/Network) pra testar enquanto isso"
+            ),
         }
     }
 }

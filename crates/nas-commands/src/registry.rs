@@ -18,6 +18,13 @@ pub struct CommandSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub effect: Effect,
+    /// Se este comando aparece como ferramenta pra um agente de IA
+    /// (ADR 0006 §5/ADR 0007-configuracao-em-camadas.md §5): estar
+    /// no registro **não basta** — cada comando precisa marcar isto
+    /// explicitamente, por isso `typed_command` exige o valor, nunca
+    /// um padrão. `nas-mcp` (etapa 3c) filtra por aqui pra montar a
+    /// lista de ferramentas; nunca mantém uma segunda lista.
+    pub exposed_to_ai: bool,
     pub args_schema: schemars::Schema,
     run: RunFn,
 }
@@ -41,6 +48,7 @@ pub fn typed_command<A, R, F>(
     name: &'static str,
     description: &'static str,
     effect: Effect,
+    exposed_to_ai: bool,
     f: F,
 ) -> CommandSpec
 where
@@ -52,6 +60,7 @@ where
         name,
         description,
         effect,
+        exposed_to_ai,
         args_schema: schemars::schema_for!(A),
         run: Box::new(move |ctx, value| {
             let args: A = serde_json::from_value(value).map_err(CommandError::InvalidArgs)?;
@@ -93,6 +102,23 @@ impl Registry {
         let spec = self
             .get(name)
             .ok_or_else(|| CommandError::UnknownCommand(name.to_string()))?;
+        if needs_approval(spec.effect) && !ctx.approved_effects.contains(&spec.effect) {
+            return Err(CommandError::NeedsApproval {
+                command: name.to_string(),
+                effect: spec.effect,
+            });
+        }
         spec.run(ctx, args)
     }
+}
+
+/// Efeitos que pedem aprovação pelo risco real (ADR 0006 §5):
+/// `Pure`, `ReadFile`, `WriteBuffer` e `WriteHistory` rodam direto —
+/// só `WriteFile`, `Shell` e `Network` tocam o disco de verdade ou
+/// saem do projeto. A aprovação de verdade (prompt na echo area,
+/// "uma vez"/"sempre") é a etapa 3d; até lá, este é o único jeito de
+/// um comando desses dois rodar — `ctx.approved_effects` precisa já
+/// ter o efeito (ver `CommandContext`).
+fn needs_approval(effect: Effect) -> bool {
+    matches!(effect, Effect::WriteFile | Effect::Shell | Effect::Network)
 }
