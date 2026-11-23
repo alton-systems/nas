@@ -29,6 +29,7 @@ mod checkpoint;
 mod journal;
 mod originals;
 mod project;
+mod restore;
 mod trash;
 
 pub use author::Author;
@@ -41,4 +42,5 @@ pub use checkpoint::{
 pub use journal::{Journal, JournalEntry, file_history, journal_path, now_unix, read_entries};
 pub use originals::{OriginalEntry, ensure_tracked, get as get_tracked, list as list_tracked};
 pub use project::{ProjectId, delete_project_history, state_home};
+pub use restore::{RestoreReport, RestoreTarget, restore};
 pub use trash::move_to_trash;
