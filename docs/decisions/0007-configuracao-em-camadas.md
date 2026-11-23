@@ -69,6 +69,16 @@ configuração nunca é a razão de não abrir:
 - **Um erro de configuração nunca impede o nas de abrir** — mesmo
   comportamento que um arquivo não-UTF8 já tem hoje (`Document::open`
   recusa e abre vazio, nunca recusa o processo inteiro).
+- **Camadas isoladas: cada uma é validada por inteiro e
+  separadamente** — um erro numa camada nunca descarta outra já
+  válida. Em particular, `.nas/config.toml` (projeto) é a única
+  camada que não é fatal: se ele tiver um erro, só a camada de
+  projeto é ignorada — padrão e usuário continuam aplicados, o erro
+  aparece na echo area, e o nas abre com a configuração do usuário
+  intacta. `config.toml`/`keymap.toml` do usuário, por outro lado,
+  continuam fatais como no parágrafo anterior: é a única camada de
+  verdade que a abertura normal tem, e aplicar metade dela seria
+  pior que cair no padrão embutido.
 
 ### 4. Projeto é restrito
 
