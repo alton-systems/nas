@@ -4,7 +4,6 @@
 //! (etapa 3a): chamam `Document`/`nas-history` direto, através do
 //! `Workspace`.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use schemars::JsonSchema;
@@ -61,7 +60,7 @@ pub fn register_all(registry: &mut Registry) {
     registry.register(typed_command(
         "checkpoint_create",
         "Cria um checkpoint nomeado com o conteúdo atual de todo arquivo rastreado do projeto.",
-        Effect::WriteFile,
+        Effect::WriteHistory,
         checkpoint_create,
     ));
     registry.register(typed_command(
@@ -127,8 +126,11 @@ pub struct OpenFileResult {
 }
 
 fn open_file(ctx: &mut CommandContext, args: OpenFileArgs) -> Result<OpenFileResult, CommandError> {
-    ctx.workspace.open(&args.path)?;
-    Ok(OpenFileResult { path: args.path })
+    let path = ctx.workspace.resolve(&args.path)?;
+    ctx.workspace.open(&path)?;
+    Ok(OpenFileResult {
+        path: path.to_string_lossy().into_owned(),
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -144,10 +146,8 @@ pub struct ReadResult {
 }
 
 fn read(ctx: &mut CommandContext, args: ReadArgs) -> Result<ReadResult, CommandError> {
-    let document = ctx
-        .workspace
-        .document(Path::new(&args.path))
-        .ok_or_else(|| CommandError::NotOpen(args.path.clone()))?;
+    let path = ctx.workspace.resolve(&args.path)?;
+    let document = ctx.workspace.document(&path)?;
     Ok(ReadResult {
         text: with_line_numbers(&document.full_text()),
     })
@@ -173,10 +173,8 @@ pub struct SearchResult {
 }
 
 fn search(ctx: &mut CommandContext, args: SearchArgs) -> Result<SearchResult, CommandError> {
-    let document = ctx
-        .workspace
-        .document(Path::new(&args.path))
-        .ok_or_else(|| CommandError::NotOpen(args.path.clone()))?;
+    let path = ctx.workspace.resolve(&args.path)?;
+    let document = ctx.workspace.document(&path)?;
     let text = document.full_text();
     let mut matches = Vec::new();
     if !args.query.is_empty() {
@@ -212,7 +210,7 @@ fn list_files(
 ) -> Result<ListFilesResult, CommandError> {
     let root = ctx.workspace.root().to_path_buf();
     let start = match &args.dir {
-        Some(dir) => root.join(dir),
+        Some(dir) => ctx.workspace.resolve(dir)?,
         None => root.clone(),
     };
     let mut files = Vec::new();
@@ -253,10 +251,8 @@ pub struct EditResult {
 }
 
 fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandError> {
-    let document = ctx
-        .workspace
-        .document(Path::new(&args.path))
-        .ok_or_else(|| CommandError::NotOpen(args.path.clone()))?;
+    let path = ctx.workspace.resolve(&args.path)?;
+    let document = ctx.workspace.document(&path)?;
     let text = document.full_text();
 
     let bounds = match args.line_range {
@@ -289,13 +285,10 @@ fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandE
     };
     let to = from + needle.len();
 
-    let document = ctx
-        .workspace
-        .document_mut(Path::new(&args.path))
-        .expect("checado acima");
+    let document = ctx.workspace.document_mut(&path).expect("checado acima");
     let change = document.replace_region(from, to, &args.new_text);
     ctx.workspace
-        .record_change(ctx.author.clone(), "edit", &args.path, &change)?;
+        .record_change(ctx.author.clone(), "edit", &path, &change)?;
 
     Ok(EditResult { from, to })
 }
@@ -353,20 +346,23 @@ fn create_file(
     ctx: &mut CommandContext,
     args: CreateFileArgs,
 ) -> Result<CreateFileResult, CommandError> {
-    ctx.workspace.create(&args.path)?;
+    let path = ctx.workspace.resolve(&args.path)?;
+    ctx.workspace.create(&path)?;
     if let Some(content) = &args.content
         && !content.is_empty()
     {
         let document = ctx
             .workspace
-            .document_mut(Path::new(&args.path))
+            .document_mut(&path)
             .expect("acabou de ser criado");
         let change = document.replace_all(content);
         document.save()?;
         ctx.workspace
-            .record_change(ctx.author.clone(), "create-file", &args.path, &change)?;
+            .record_change(ctx.author.clone(), "create-file", &path, &change)?;
     }
-    Ok(CreateFileResult { path: args.path })
+    Ok(CreateFileResult {
+        path: path.to_string_lossy().into_owned(),
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -418,44 +414,43 @@ pub struct CheckpointRestoreArgs {
     pub id: String,
 }
 
-#[derive(Debug, Default, Serialize)]
-pub struct CheckpointRestoreResult {
-    pub restored: Vec<String>,
-    pub trashed: Vec<String>,
-    pub skipped: Vec<String>,
-    pub failed: Vec<String>,
+/// Como `checkpoint_restore` escreve de verdade — a mesma trait que
+/// `nas-term::App` implementa pra `Ctrl+t r` (docs/decisions/0006,
+/// "restaurar sem duplicação": a orquestração em si
+/// (`nas_history::restore`) é uma função só, compartilhada; só isto
+/// muda entre os dois lados). `current_content`/`write` reaproveitam
+/// os métodos que `edit`/`create_file` já usam.
+impl nas_history::RestoreTarget for CommandContext<'_> {
+    fn current_content(&self, path: &str) -> Option<Vec<u8>> {
+        self.workspace.current_content_for(path)
+    }
+
+    fn write(&mut self, path: &str, content: &str) -> std::io::Result<()> {
+        self.workspace
+            .write_file(path, content)
+            .and_then(|change| {
+                self.workspace.record_change(
+                    self.author.clone(),
+                    "restore-checkpoint",
+                    Path::new(path),
+                    &change,
+                )
+            })
+            .map_err(command_error_to_io)
+    }
 }
 
-/// Restaura `path` pra `content`: escreve no documento aberto (se
-/// houver) ou direto no disco, e journala como `"restore-checkpoint"`
-/// — igual a `App::restore_file`/`App::perform_restore` em
-/// `nas-term`, que faz a mesma coisa pra `Ctrl+t r`; aqui é a mesma
-/// lógica, só que sobre o `Workspace` em vez de `App::buffers`.
-fn restore_one(ctx: &mut CommandContext, path: &str, content: &str) -> Result<(), CommandError> {
-    let change = ctx.workspace.write_file(path, content)?;
-    ctx.workspace
-        .record_change(ctx.author.clone(), "restore-checkpoint", path, &change)
+fn command_error_to_io(err: CommandError) -> std::io::Error {
+    match err {
+        CommandError::Io(err) => err,
+        other => std::io::Error::other(other.to_string()),
+    }
 }
 
-fn read_object_as_text(history_dir: &Path, hash: &str) -> Option<String> {
-    nas_history::read_object(history_dir, hash)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-}
-
-/// Restaura o **projeto inteiro** pro estado de um checkpoint, não só
-/// os arquivos que ele lista (docs/decisions/0005 §4/§7): primeiro
-/// cria um checkpoint automático "antes de restaurar" com o estado
-/// atual de todo arquivo rastreado (o que torna esta própria
-/// restauração desfazível — restaurar esse automático desfaz tudo,
-/// sem nenhum código separado); depois, pra cada arquivo rastreado
-/// que o checkpoint sendo restaurado não lista, reverte ao original
-/// (se existia) ou joga na lixeira (se não existia ainda); por fim,
-/// escreve os arquivos que o checkpoint lista com o conteúdo dele.
 fn checkpoint_restore(
     ctx: &mut CommandContext,
     args: CheckpointRestoreArgs,
-) -> Result<CheckpointRestoreResult, CommandError> {
+) -> Result<nas_history::RestoreReport, CommandError> {
     let history_dir = ctx
         .workspace
         .history_dir()
@@ -473,69 +468,15 @@ fn checkpoint_restore(
             ))
         })?;
 
-    let tracked = nas_history::list_tracked(&history_dir)?;
-
-    let pre_restore_files: Vec<(String, Vec<u8>)> = tracked
-        .iter()
-        .filter_map(|entry| {
-            let content = ctx.workspace.current_content_for(&entry.path)?;
-            Some((entry.path.clone(), content))
-        })
-        .collect();
-    if !pre_restore_files.is_empty() {
-        let name = format!("antes de restaurar {}", checkpoint.name);
-        nas_history::create_checkpoint(
-            &history_dir,
-            &name,
-            ctx.author.clone(),
-            nas_history::now_unix(),
-            true,
-            &pre_restore_files,
-        )?;
-    }
-
-    let mut result = CheckpointRestoreResult::default();
-    let in_checkpoint: HashSet<&str> = checkpoint.files.iter().map(|f| f.path.as_str()).collect();
-
-    for entry in tracked
-        .iter()
-        .filter(|entry| !in_checkpoint.contains(entry.path.as_str()))
-    {
-        if !entry.existed {
-            match nas_history::move_to_trash(Path::new(&entry.path)) {
-                Ok(()) => result.trashed.push(entry.path.clone()),
-                Err(err) => result.failed.push(format!("{}: {err}", entry.path)),
-            }
-            continue;
-        }
-        let Some(hash) = &entry.content_hash else {
-            result.skipped.push(entry.path.clone());
-            continue;
-        };
-        match read_object_as_text(&history_dir, hash) {
-            Some(content) => match restore_one(ctx, &entry.path, &content) {
-                Ok(()) => result.restored.push(entry.path.clone()),
-                Err(err) => result.failed.push(format!("{}: {err}", entry.path)),
-            },
-            None => result.skipped.push(entry.path.clone()),
-        }
-    }
-
-    for file in &checkpoint.files {
-        let Some(hash) = &file.content_hash else {
-            result.skipped.push(file.path.clone());
-            continue;
-        };
-        match read_object_as_text(&history_dir, hash) {
-            Some(content) => match restore_one(ctx, &file.path, &content) {
-                Ok(()) => result.restored.push(file.path.clone()),
-                Err(err) => result.failed.push(format!("{}: {err}", file.path)),
-            },
-            None => result.skipped.push(file.path.clone()),
-        }
-    }
-
-    Ok(result)
+    let author = ctx.author.clone();
+    let report = nas_history::restore(
+        &history_dir,
+        &checkpoint,
+        author,
+        nas_history::now_unix(),
+        ctx,
+    )?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -958,5 +899,138 @@ mod tests {
             .run("inexistente", &mut context, serde_json::json!({}))
             .expect_err("devia recusar comando desconhecido");
         assert!(matches!(err, CommandError::UnknownCommand(_)));
+    }
+
+    /// A raiz de um `Workspace` de teste, numa subpasta de um
+    /// `TempDir` — não o `TempDir` em si, pra ter um nível acima
+    /// (fora da raiz, mas ainda dentro do `TempDir` que será limpo
+    /// ao sair de escopo) onde `../` e um symlink possam apontar.
+    fn project_root(dir: &std::path::Path) -> PathBuf {
+        let root = dir.join("projeto");
+        std::fs::create_dir_all(&root).expect("criar raiz do projeto de teste");
+        root
+    }
+
+    #[test]
+    fn open_file_recusa_caminho_que_sai_da_raiz_com_ponto_ponto() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let root = project_root(dir.path());
+        write(dir.path(), "fora.txt", "fora da raiz");
+        let mut ws = workspace(&root);
+        let mut context = ctx(&mut ws, Author::User);
+
+        let err = open_file(
+            &mut context,
+            OpenFileArgs {
+                path: "../fora.txt".to_string(),
+            },
+        )
+        .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::OutsideRoot(_)));
+    }
+
+    #[test]
+    fn read_recusa_caminho_absoluto_fora_da_raiz() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let root = project_root(dir.path());
+        let outside = write(dir.path(), "fora.txt", "fora da raiz");
+        let mut ws = workspace(&root);
+        let mut context = ctx(&mut ws, Author::User);
+
+        let err = read(
+            &mut context,
+            ReadArgs {
+                path: outside.to_string_lossy().into_owned(),
+            },
+        )
+        .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::OutsideRoot(_)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_file_recusa_symlink_dentro_do_projeto_apontando_pra_fora() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let root = project_root(dir.path());
+        let outside = write(dir.path(), "secreto.txt", "fora da raiz");
+        std::os::unix::fs::symlink(&outside, root.join("link.txt")).expect("criar symlink");
+        let mut ws = workspace(&root);
+        let mut context = ctx(&mut ws, Author::User);
+
+        let err = open_file(
+            &mut context,
+            OpenFileArgs {
+                path: "link.txt".to_string(),
+            },
+        )
+        .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::OutsideRoot(_)));
+    }
+
+    #[test]
+    fn create_file_recusa_caminho_que_sai_da_raiz_com_ponto_ponto() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let root = project_root(dir.path());
+        let mut ws = workspace(&root);
+        let mut context = ctx(&mut ws, Author::User);
+
+        let err = create_file(
+            &mut context,
+            CreateFileArgs {
+                path: "../fora.txt".to_string(),
+                content: None,
+            },
+        )
+        .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::OutsideRoot(_)));
+        assert!(!dir.path().join("fora.txt").exists());
+    }
+
+    #[test]
+    fn create_file_recusa_caminho_absoluto_fora_da_raiz() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let root = project_root(dir.path());
+        let outside_dir = tempfile::tempdir().expect("outro diretório temporário");
+        let outside_path = outside_dir.path().join("fora.txt");
+        let mut ws = workspace(&root);
+        let mut context = ctx(&mut ws, Author::User);
+
+        let err = create_file(
+            &mut context,
+            CreateFileArgs {
+                path: outside_path.to_string_lossy().into_owned(),
+                content: Some("conteudo".to_string()),
+            },
+        )
+        .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::OutsideRoot(_)));
+        assert!(!outside_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_file_recusa_symlink_pendurado_dentro_do_projeto_apontando_pra_fora() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let root = project_root(dir.path());
+        let outside_dir = tempfile::tempdir().expect("outro diretório temporário");
+        // o destino do link nunca é criado — testa que um link
+        // *pendurado* (sem `exists() == true`) também é recusado,
+        // não só um que já aponta pra um arquivo existente.
+        let outside_target = outside_dir.path().join("nunca-criado.txt");
+        std::os::unix::fs::symlink(&outside_target, root.join("link.txt"))
+            .expect("criar symlink pendurado");
+        let mut ws = workspace(&root);
+        let mut context = ctx(&mut ws, Author::User);
+
+        let err = create_file(
+            &mut context,
+            CreateFileArgs {
+                path: "link.txt".to_string(),
+                content: Some("conteudo".to_string()),
+            },
+        )
+        .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::Io(_)));
+        assert!(!outside_target.exists());
     }
 }
