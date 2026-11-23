@@ -129,6 +129,13 @@ pelo risco real de cada um, não só pela classe; ver §5.
 
 ### 2. Núcleo em segundo plano
 
+**Revisão da ordem (§8): isto é a etapa 3b, agora depois do benchmark
+(3f), não logo depois de 3a.** Até lá, `nas --mcp` (§3) mantém seu
+próprio núcleo dentro do processo, igual ao `nas-term` — os dois não
+compartilham memória nenhuma; uma mudança da IA só chega ao
+`nas-term` pelo disco. O design abaixo é o que esta etapa implementa
+quando (e se) a decisão pós-benchmark for seguir adiante.
+
 O núcleo (conjunto de buffers abertos num projeto, o registro de
 comandos, e o `Journal` do projeto) passa a poder viver **fora** do
 processo do `nas-term`, pra que um agente funcione com a interface
@@ -408,6 +415,14 @@ já tratam `Author::Ai` igual a qualquer outro autor.
 
 ### 7. Teste comparativo
 
+**O relatório precisa registrar a ressalva de 3c** (§2/§8): até a
+decisão pós-benchmark sobre o núcleo em segundo plano (3b), `nas-mcp`
+não compartilha buffer com um `nas-term` eventualmente aberto no
+mesmo arquivo — a sincronização é só por disco. Qualquer lentidão ou
+atraso em perceber uma mudança observado durante o benchmark deve ser
+atribuído a essa limitação conhecida da etapa, nunca lido como um
+problema da integração MCP em si.
+
 **A comparação é nas contra o Claude Code no seu modo normal** — com
 as próprias ferramentas de ler, editar e buscar, além do shell — não
 contra "só shell". É a comparação justa: o Claude Code já lê/edita
@@ -457,37 +472,64 @@ usada durante o benchmark (§5) fica documentada no topo do próprio
 
 ### 8. Etapas
 
-Divisão em PRs pequenos, mesmo espírito da fase 2 (2a–2d):
+Divisão em PRs pequenos, mesmo espírito da fase 2 (2a–2d). **Os
+nomes (3a, 3b, ...) identificam a etapa, não a ordem de execução** —
+a ordem real, revisada, é **3a → 3c → 3d → 3e → 3f (benchmark) →
+decisão → 3b (núcleo em segundo plano) → 3g**. O daemon (3b) virou a
+penúltima, não a segunda: é a etapa mais cara desta fase (processo
+novo, protocolo entre processos, autostart, remapeamento de cursor
+entre clientes) e nada que o benchmark do §7 mede depende dela —
+`nas-mcp` já funciona sem ela (ver a ressalva em 3c, abaixo). Melhor
+descobrir com o benchmark se este caminho (registro + MCP) vale a
+pena *antes* de pagar o custo do núcleo em segundo plano, não depois.
 
-- **3a** — `nas-commands`: `Effect`, `CommandSpec`/`Registry`,
-  `schemars` para o esquema, os nove comandos (§1/§3) chamando direto
-  um `Document`/`Journal` em processo (sem núcleo em segundo plano
-  ainda) — testável isolado.
-- **3b** — núcleo em segundo plano: `nas --daemon`, o socket por
-  projeto em `$XDG_RUNTIME_DIR` (0600), o protocolo mínimo, múltiplos
-  clientes, autostart/encerramento por inatividade/recuperação de
-  socket órfão (§2), e o remapeamento de cursor entre clientes (§2.1,
-  com seu teste de aceite); `nas-term` passa a tentar conectar antes
-  de criar seu próprio núcleo em processo.
-- **3c** — `nas-mcp`: adaptador `rmcp` sobre os nove comandos
+- **3a** (pronta) — `nas-commands`: `Effect`, `CommandSpec`/
+  `Registry`, `schemars` para o esquema, os comandos do registro
+  (§1/§3) chamando direto um `Document`/`Journal` em processo (sem
+  núcleo em segundo plano ainda) — testável isolado.
+- **3c** — `nas-mcp`: adaptador `rmcp` sobre os comandos do registro
   (incluindo a semântica de `edit` por texto exato, §3), transporte
-  stdio, conectando no núcleo; teste manual com o Claude Code
-  configurado contra ele.
-- **3d** — permissões pelo risco real: o bloqueio no núcleo pra
+  stdio, `nas --mcp`. **Sem o núcleo em segundo plano (3b) ainda**:
+  `nas --mcp` mantém seu próprio núcleo dentro do processo, do mesmo
+  jeito que `nas-term` mantém o dele — os dois não compartilham
+  memória. Uma mudança da IA chega ao `nas-term` (se ele estiver
+  aberto no mesmo arquivo) só pelo disco, pela mesma detecção de
+  mudança externa que já existe (ADR 0005 §1) — nunca ao vivo, num
+  buffer compartilhado. **Isto precisa constar no relatório do
+  benchmark (3f)**: uma eventual lentidão ou atraso em perceber a
+  mudança é uma limitação desta etapa, não da integração MCP em si —
+  sem essa ressalva, o benchmark mediria o núcleo que ainda não
+  existe, não o que 3c de fato entrega.
+- **3d** — permissões pelo risco real: o bloqueio pra
   `WriteFile`/`Shell`/`Network`, o prompt na echo area (uma vez/sempre
   na sessão), o arquivo de configuração pro caso sem interface (§5).
+  Sem o núcleo em segundo plano ainda, o bloqueio é dentro do próprio
+  processo `nas --mcp` (síncrono com a chamada MCP), não num núcleo
+  compartilhado — mesma ressalva de 3c.
 - **3e** — autoria de sessão: o checkpoint automático por
   `(agent, session)`, um teste de ponta a ponta provando que `Ctrl+t
   r` nesse checkpoint desfaz a sessão inteira.
 - **3f** — benchmark comparativo: rodar as cinco tarefas, três vezes
   por lado, em ordem alternada (§7), escrever
-  `docs/benchmark-fase3.md`.
-- **3g** — unificação do despacho de comandos (§1): depois que 3a-3f
-  provarem o formato do registro na prática, decidir e implementar
-  como `nas-keys` passa a resolver (pelo menos parte das) suas ações
-  através de `nas-commands`, em vez de despachar pra `machine.rs`/
-  `App::apply_action` direto — detalhada quando chegar lá, não nesta
-  ADR.
+  `docs/benchmark-fase3.md` — **incluindo a ressalva de 3c** sobre a
+  ausência de buffer compartilhado.
+- **Decisão** — com o benchmark em mãos, decidir se vale seguir pra
+  3b (o núcleo compartilhado) ou se o caminho de 3c-3e já basta por
+  agora. Não é uma etapa de código; é o ponto em que a fase 3 para e
+  reavalia, com dados, antes do passo mais caro.
+- **3b** — núcleo em segundo plano: `nas --daemon`, o socket por
+  projeto em `$XDG_RUNTIME_DIR` (0600), o protocolo mínimo, múltiplos
+  clientes, autostart/encerramento por inatividade/recuperação de
+  socket órfão (§2), e o remapeamento de cursor entre clientes (§2.1,
+  com seu teste de aceite); `nas-term` e `nas-mcp` passam a tentar
+  conectar antes de cada um criar seu próprio núcleo em processo —
+  é aqui que a ressalva de 3c deixa de valer.
+- **3g** — unificação do despacho de comandos (§1): depois que as
+  etapas acima provarem o formato do registro na prática, decidir e
+  implementar como `nas-keys` passa a resolver (pelo menos parte das)
+  suas ações através de `nas-commands`, em vez de despachar pra
+  `machine.rs`/`App::apply_action` direto — detalhada quando chegar
+  lá, não nesta ADR.
 
 ACP (§4) fica de fora desta lista de propósito.
 
