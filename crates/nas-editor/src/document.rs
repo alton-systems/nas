@@ -820,6 +820,32 @@ impl Document {
         }
     }
 
+    /// Como `replace_all`, mas restrito à região entre `from` e `to`
+    /// (em caracteres) — usado por comandos que editam por busca de
+    /// texto exato em vez de reescrever o buffer inteiro
+    /// (docs/decisions/0006-ia-trabalha-pelo-nas.md §3).
+    pub fn replace_region(&mut self, from: usize, to: usize, new_text: &str) -> TextChange {
+        let old_text = self.rope.slice(from..to).to_string();
+
+        let selection = Selection::point(self.cursor);
+        let original = history::State {
+            doc: self.rope.clone(),
+            selection: selection.clone(),
+        };
+        let tendril: Tendril = new_text.into();
+        let transaction =
+            Transaction::change(&self.rope, std::iter::once((from, to, Some(tendril))));
+        self.apply(transaction, original);
+        self.cursor = self.cursor.min(self.rope.len_chars());
+
+        TextChange {
+            from,
+            to,
+            removed: old_text,
+            inserted: new_text.to_string(),
+        }
+    }
+
     /// Desfaz a última edição, devolvendo o que mudou (pra journalar) —
     /// `None` se não havia nada a desfazer.
     pub fn undo(&mut self) -> Option<TextChange> {
@@ -1506,6 +1532,35 @@ mod tests {
         assert_eq!(removed, "ola mundo");
         assert_eq!(doc_text(&doc), "");
         assert_eq!(doc.cursor_offset(), 0);
+    }
+
+    #[test]
+    fn replace_region_substitui_so_a_regiao_e_devolve_o_text_change() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        let change = doc.replace_region(4, 9, "terra");
+        assert_eq!(change.from, 4);
+        assert_eq!(change.to, 9);
+        assert_eq!(change.removed, "mundo");
+        assert_eq!(change.inserted, "terra");
+        assert_eq!(doc_text(&doc), "ola terra");
+    }
+
+    #[test]
+    fn replace_region_entra_no_desfazer_por_tecla() {
+        let mut doc = Document::empty();
+        for ch in "ola mundo".chars() {
+            doc.insert_char(ch);
+        }
+        doc.move_to_buffer_start();
+        doc.replace_region(4, 9, "terra");
+        let change = doc.undo().expect("deveria ter algo pra desfazer");
+        assert_eq!(change.removed, "terra");
+        assert_eq!(change.inserted, "mundo");
+        assert_eq!(doc_text(&doc), "ola mundo");
     }
 
     #[test]
