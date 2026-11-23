@@ -135,6 +135,20 @@ impl McpProcess {
         (is_error, text)
     }
 
+    /// O texto de cada bloco de conteúdo, em ordem — pra ferramentas
+    /// que devolvem texto puro (`read`/`search`/`list_files`/
+    /// `show_diff`), onde um aviso vira um segundo bloco, nunca
+    /// misturado ao primeiro.
+    fn call_tool_content_texts(&mut self, name: &str, arguments: Value) -> Vec<String> {
+        let result = self.call_tool(name, arguments);
+        result["content"]
+            .as_array()
+            .expect("content é uma lista")
+            .iter()
+            .map(|block| block["text"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
     fn kill(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -239,6 +253,53 @@ fn entry_session(entry: &nas_history::JournalEntry) -> String {
 }
 
 #[test]
+fn journal_sobrevive_a_um_encerramento_a_forca_depois_de_cada_chamada() {
+    let project_dir = tempfile::tempdir().expect("diretório do projeto");
+    let state_home = tempfile::tempdir().expect("diretório de estado");
+    std::fs::write(project_dir.path().join("foo.txt"), "ola mundo\n").expect("escrever foo.txt");
+
+    let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), false);
+    mcp.initialize("agente-forca-bruta");
+
+    mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
+    mcp.call_tool_text(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "primeira"}),
+    );
+    // Duas chamadas em sequência rápida, bem dentro da mesma janela
+    // de lote do journal (`BATCH_INTERVAL_SECONDS`) — sem o flush
+    // incondicional ao fim de cada chamada (`Registry::run`), a
+    // entrada desta segunda edição ficaria só na fila em memória,
+    // vulnerável a um `kill -9` como o de `mcp.kill()` abaixo (nunca
+    // roda `Drop`, que é só melhor esforço mesmo quando roda).
+    let (is_error, _) = mcp.call_tool_text(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "mundo", "new_text": "segunda"}),
+    );
+    assert!(!is_error, "a segunda edição devia funcionar");
+
+    // `kill`, não um encerramento gracioso — é exatamente o cenário
+    // que preocupa: o processo nunca chega a rodar `Drop::drop` do
+    // `Journal`.
+    mcp.kill();
+
+    let history_dir = history_dir_for(project_dir.path(), state_home.path());
+    let canonical_project = project_dir.path().canonicalize().unwrap();
+    let expected_file = canonical_project
+        .join("foo.txt")
+        .to_string_lossy()
+        .into_owned();
+    let entries =
+        nas_history::file_history(&history_dir, &expected_file).expect("entradas não encontradas");
+    let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+    assert_eq!(
+        commands,
+        vec!["edit", "edit"],
+        "as duas edições deviam estar no journal em disco, não só em memória: {entries:?}"
+    );
+}
+
+#[test]
 fn save_file_recusado_sem_approve_writes() {
     let project_dir = tempfile::tempdir().expect("diretório do projeto");
     let state_home = tempfile::tempdir().expect("diretório de estado");
@@ -306,6 +367,58 @@ fn save_file_recusa_quando_o_disco_mudou() {
         "save_file nunca deve sobrescrever trabalho de outro processo"
     );
 
+    // De novo, sem nenhuma escrita nova no meio: continua recusando —
+    // a primeira tentativa não pode ter "resolvido" a pendência só
+    // por ter conferido o disco.
+    let (is_error, text) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
+    assert!(
+        is_error,
+        "save_file deveria recusar de novo, sem nenhuma escrita nova no meio: {text}"
+    );
+    let disk_content = std::fs::read_to_string(&file_path).expect("ler foo.txt do disco");
+    assert_eq!(
+        disk_content, "mudou por fora\n",
+        "a segunda tentativa também não pode sobrescrever a mudança externa"
+    );
+
+    // `open_file` é a saída que a mensagem de erro indica: traz o
+    // conteúdo do disco, descartando a edição não salva da IA, e diz
+    // isso no resultado.
+    let (is_error, text) = mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
+    assert!(!is_error, "reabrir devia funcionar: {text}");
+    assert!(
+        text.to_lowercase().contains("descart"),
+        "reabrir devia avisar que descartou a edição não salva: {text}"
+    );
+    let read_texts = mcp.call_tool_content_texts("read", json!({"path": "foo.txt"}));
+    assert_eq!(read_texts, vec!["1 mudou por fora".to_string()]);
+
+    // Com o buffer resincronizado, editar e salvar funcionam — e
+    // preservam o que o outro processo escreveu.
+    let (is_error, text) = mcp.call_tool_text(
+        "edit",
+        json!({
+            "path": "foo.txt",
+            "old_text": "mudou por fora",
+            "new_text": "mudou por fora, e a IA editou por cima"
+        }),
+    );
+    assert!(
+        !is_error,
+        "editar devia funcionar depois de reabrir: {text}"
+    );
+    let (is_error, text) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
+    assert!(
+        !is_error,
+        "salvar devia funcionar depois de reabrir e editar: {text}"
+    );
+
+    let disk_content = std::fs::read_to_string(&file_path).expect("ler foo.txt do disco");
+    assert_eq!(
+        disk_content, "mudou por fora, e a IA editou por cima\n",
+        "o conteúdo do outro processo devia continuar na base do arquivo final"
+    );
+
     mcp.kill();
 }
 
@@ -325,19 +438,65 @@ fn buffer_limpo_recarrega_do_disco_antes_de_ler() {
     // externa deve recarregar sozinha, sem aviso nenhum.
     std::fs::write(&file_path, "mudou por fora\n").expect("simular mudança externa");
 
-    let result = mcp.call_tool("read", json!({"path": "foo.txt"}));
-    let text = result["content"][0]["text"].as_str().unwrap_or_default();
-    let parsed: Value = serde_json::from_str(text).expect("resultado de read é JSON");
-    assert!(
-        parsed.get("warning").is_none(),
-        "buffer limpo não deveria avisar, só recarregar: {parsed}"
+    let texts = mcp.call_tool_content_texts("read", json!({"path": "foo.txt"}));
+    assert_eq!(
+        texts,
+        vec!["1 mudou por fora".to_string()],
+        "buffer limpo não deveria avisar (um bloco só), e o texto já deveria vir do disco recarregado"
+    );
+
+    mcp.kill();
+}
+
+#[test]
+fn leituras_devolvem_texto_puro_e_aviso_num_segundo_bloco() {
+    let project_dir = tempfile::tempdir().expect("diretório do projeto");
+    let state_home = tempfile::tempdir().expect("diretório de estado");
+    let file_path = project_dir.path().join("foo.txt");
+    std::fs::write(&file_path, "linha um\nlinha dois\nlinha tres\n").expect("escrever foo.txt");
+
+    let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), false);
+    mcp.initialize("teste-texto-puro");
+
+    mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
+
+    // `read`/`search`/`list_files` devolvem texto puro, linhas
+    // numeradas quando fizer sentido — nunca JSON com `\n` escapado.
+    let read_texts = mcp.call_tool_content_texts("read", json!({"path": "foo.txt"}));
+    assert_eq!(
+        read_texts,
+        vec!["1 linha um\n2 linha dois\n3 linha tres".to_string()]
+    );
+
+    let search_texts =
+        mcp.call_tool_content_texts("search", json!({"path": "foo.txt", "query": "dois"}));
+    assert_eq!(search_texts, vec!["2 linha dois".to_string()]);
+
+    let list_texts = mcp.call_tool_content_texts("list_files", json!({}));
+    assert_eq!(list_texts, vec!["foo.txt".to_string()]);
+
+    // Edita sem salvar, deixa o disco mudar por fora, e confere que
+    // o aviso chega como um **segundo** bloco de conteúdo — nunca
+    // misturado ao texto (que continua sendo o do buffer, intacto).
+    mcp.call_tool_text(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "linha um", "new_text": "linha um editada"}),
+    );
+    std::fs::write(&file_path, "mudou por fora\n").expect("simular mudança externa");
+
+    let read_texts = mcp.call_tool_content_texts("read", json!({"path": "foo.txt"}));
+    assert_eq!(
+        read_texts.len(),
+        2,
+        "buffer com alterações + disco mudado: texto e aviso em blocos separados — {read_texts:?}"
+    );
+    assert_eq!(
+        read_texts[0],
+        "1 linha um editada\n2 linha dois\n3 linha tres"
     );
     assert!(
-        parsed["text"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("mudou por fora"),
-        "read deveria refletir o conteúdo recarregado do disco: {parsed}"
+        read_texts[1].to_lowercase().contains("mudou"),
+        "segundo bloco devia ser o aviso: {read_texts:?}"
     );
 
     mcp.kill();
