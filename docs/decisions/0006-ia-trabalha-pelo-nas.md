@@ -453,6 +453,14 @@ atraso em perceber uma mudança observado durante o benchmark deve ser
 atribuído a essa limitação conhecida da etapa, nunca lido como um
 problema da integração MCP em si.
 
+**Hipótese**: o nas oferece mais rastreabilidade, controle e
+reversibilidade, mantendo eficiência e custo competitivos em relação
+ao uso direto do agente. Não é "o nas é mais rápido ou mais barato" —
+é que o ganho em controle/reversibilidade que só o nas oferece
+(checkpoint automático de sessão, diff e desfazer por autor, §6) vale
+a pena mesmo sem perder em eficiência de forma relevante. O critério
+de decisão abaixo fixa o que conta como "relevante" antes de rodar.
+
 **A comparação é nas contra o Claude Code no seu modo normal** — com
 as próprias ferramentas de ler, editar e buscar, além do shell — não
 contra "só shell". É a comparação justa: o Claude Code já lê/edita
@@ -474,27 +482,66 @@ tarefa, não as três do mesmo lado em sequência) — pra não deixar
 aquecimento de contexto ou ordem de execução favorecer um lado só
 porque rodou primeiro ou por último.
 
-Medidas por rodada:
+**Condições**, fixadas pra que a comparação seja justa nos dois
+lados:
 
-- **Acerto**: testes do nas passando depois da mudança (`cargo test
+- mesmo modelo, mesma versão do modelo e as mesmas cinco tarefas
+  (mesmo texto de prompt) nos dois lados;
+- no lado nas, as ferramentas de edição/leitura próprias do agente
+  (Read/Edit/Write nativas do Claude Code) ficam **desligadas** — a
+  única forma de tocar o arquivo é pelas ferramentas do `nas-mcp`
+  (§3); sem isso, o agente poderia contornar o nas e a comparação não
+  testaria nada;
+- **coleta automatizada**, não transcrita à mão — por exemplo
+  `claude -p --output-format json`, que já devolve tokens, custo e
+  chamadas de ferramenta por sessão, reduzindo erro de transcrição e
+  viés de quem está rodando o benchmark.
+
+**Métricas por execução** (mesma unidade nos dois lados, direto
+comparáveis):
+
+- tokens de entrada e tokens de saída;
+- custo (em dólares, pelo preço do modelo usado);
+- chamadas de ferramenta (contagem);
+- tempo de parede;
+- **sucesso**: testes do nas passando depois da mudança (`cargo test
   --workspace`), não só revisão humana — as cinco tarefas são
   escolhidas, de propósito, entre as que admitem essa verificação
-  objetiva.
-- **Tokens** e **tempo de parede**: o próprio resumo de custo/duração
-  do Claude Code já reporta por sessão.
-- **Custo de revisar e desfazer**: depois de cada rodada, quanto
-  trabalho dá pra revisar a mudança e desfazê-la por completo, nos
-  dois lados — do lado do nas, isso é `Ctrl+t e`/`Ctrl+t r` no
-  checkpoint automático da sessão (§6), medido em teclas/comandos; do
-  lado do Claude Code normal, é o que ele mesmo oferece pra isso (seu
-  próprio diff de sessão, `git diff`/`git checkout` manual no
-  repositório, o que for o caminho real). A pergunta que essa medida
-  responde é se o checkpoint automático de sessão realmente economiza
-  esse trabalho, não só se a edição em si foi mais rápida.
+  objetiva;
+- **retrabalho**: edições recusadas (ex.: `edit` que não achou o
+  texto antigo, ou achou mais de uma vez), correções (uma segunda
+  tentativa pra mesma mudança) e releituras (ler de novo um trecho já
+  lido antes, nas ferramentas de qualquer um dos lados).
+
+**Integridade e rastreabilidade** ficam num quadro separado, não
+misturadas às métricas acima: o lado sem nas não tem o recurso
+equivalente, então não é uma comparação simétrica como as de cima —
+é um registro só do lado nas, documentando o que o benchmark não
+precisaria "vencer" pra já valer, por não ter contraparte do outro
+lado. Reaproveita a mesma medida que já estava aqui: depois de cada
+rodada, quanto trabalho dá pra revisar a mudança e desfazê-la por
+completo — do lado do nas, `Ctrl+t e`/`Ctrl+t r` no checkpoint
+automático da sessão (§6), medido em teclas/comandos; do lado do
+Claude Code normal, o que ele mesmo oferece pra isso (diff de sessão
+próprio, `git diff`/`git checkout` manual, o que for o caminho real,
+anotado como referência, não como "perda" dele no placar).
+
+**Critério de decisão, fixado antes de rodar** (pra não racionalizar
+o resultado depois de ver os números): taxa de sucesso igual ou maior
+que o lado sem nas, **e** no máximo 25% a mais de tokens no total
+(entrada + saída, somadas as três rodadas de cada tarefa) do lado
+nas. Passou
+nos dois: o nas segue como editor, fase 3 continua pelas etapas
+seguintes (§8). Falhou em qualquer um dos dois: pivô — o nas deixa de
+perseguir ser um editor de propósito geral competitivo em eficiência
+de edição, e passa a focar em histórico e supervisão sobre o que a IA
+já faz direto, em vez de MCP de edição (ver Visão e plano).
 
 Registro: uma tabela em `docs/benchmark-fase3.md`, uma linha por
 (tarefa, lado, rodada) — dezoito linhas no total (cinco tarefas × dois
-lados × três rodadas) — rodada manual registrada à mão, não um
+lados × três rodadas) — mais o quadro separado de integridade e
+rastreabilidade acima — rodada manual registrada à mão (com coleta
+automatizada por sessão, como descrito nas condições), não um
 benchmark automatizado de CI; o objetivo é um retrato antes de
 investir mais, não uma suíte de regressão. A política de permissão
 usada durante o benchmark (§5) fica documentada no topo do próprio
@@ -504,14 +551,17 @@ usada durante o benchmark (§5) fica documentada no topo do próprio
 
 Divisão em PRs pequenos, mesmo espírito da fase 2 (2a–2d). **Os
 nomes (3a, 3b, ...) identificam a etapa, não a ordem de execução** —
-a ordem real, revisada, é **3a → 3c → 3d → 3e → 3f (benchmark) →
-decisão → 3b (núcleo em segundo plano) → 3g**. O daemon (3b) virou a
-penúltima, não a segunda: é a etapa mais cara desta fase (processo
-novo, protocolo entre processos, autostart, remapeamento de cursor
-entre clientes) e nada que o benchmark do §7 mede depende dela —
-`nas-mcp` já funciona sem ela (ver a ressalva em 3c, abaixo). Melhor
-descobrir com o benchmark se este caminho (registro + MCP) vale a
-pena *antes* de pagar o custo do núcleo em segundo plano, não depois.
+a ordem real, revisada, é **3a → 3c → paleta de comandos (fora da
+fase 3) → 3d → 3e → 3f-prep → 3f (benchmark) → decisão → 3b (núcleo
+em segundo plano) → 3g**, com janelas e modo de notas — também fora
+da fase 3 — só depois do ponto de decisão (ver abaixo). O daemon (3b)
+virou a penúltima, não a segunda: é a etapa mais cara desta fase
+(processo novo, protocolo entre processos, autostart, remapeamento
+de cursor entre clientes) e nada que o benchmark do §7 mede depende
+dela — `nas-mcp` já funciona sem ela (ver a ressalva em 3c, abaixo).
+Melhor descobrir com o benchmark se este caminho (registro + MCP)
+vale a pena *antes* de pagar o custo do núcleo em segundo plano, não
+depois.
 
 - **3a** (pronta) — `nas-commands`: `Effect`, `CommandSpec`/
   `Registry`, `schemars` para o esquema, os comandos do registro
@@ -530,6 +580,12 @@ pena *antes* de pagar o custo do núcleo em segundo plano, não depois.
   mudança é uma limitação desta etapa, não da integração MCP em si —
   sem essa ressalva, o benchmark mediria o núcleo que ainda não
   existe, não o que 3c de fato entrega.
+- **paleta de comandos** (fora da fase 3) — item do roadmap mais
+  amplo do nas, não desta ADR (`Shift+Espaço`, já reservado em
+  `docs/keys.md`, depende do protocolo de teclado do Kitty). Entra
+  nesta lista só pra marcar a ordem real entre entregas do projeto —
+  fica entre 3c e 3d no calendário, sem ganhar uma etapa "3-algo"
+  nova nem escopo detalhado aqui.
 - **3d** — permissões pelo risco real: o bloqueio pra
   `WriteFile`/`Shell`/`Network`, o prompt na echo area (uma vez/sempre
   na sessão), o arquivo de configuração pro caso sem interface (§5).
@@ -541,6 +597,25 @@ pena *antes* de pagar o custo do núcleo em segundo plano, não depois.
 - **3e** — autoria de sessão: o checkpoint automático por
   `(agent, session)`, um teste de ponta a ponta provando que `Ctrl+t
   r` nesse checkpoint desfaz a sessão inteira.
+- **3f-prep** — eficiência das ferramentas do MCP (§3): ajustes nas
+  ferramentas existentes antes de medi-las no benchmark (3f), porque
+  cada ferramenta nova ocupa contexto em toda mensagem — por isso o
+  princípio desta etapa é **preferir parâmetro novo a ferramenta
+  nova**, sempre que der. Escopo fechado:
+  - `read` ganha um intervalo de linhas opcional, em vez de sempre
+    devolver o arquivo inteiro;
+  - `edit` ganha uma opção pra já salvar no disco depois de editar,
+    sem precisar de uma segunda chamada a `save_file`;
+  - `read`, `edit` e `save_file` abrem o arquivo por conta própria se
+    ele ainda não estiver aberto como buffer — hoje dependem de um
+    `open_file` anterior;
+  - `edit` devolve, no resultado, o trecho alterado com algumas
+    linhas de contexto ao redor, em vez de só confirmar sucesso — pra
+    a IA conferir o efeito sem precisar de um `read` extra;
+  - duas ferramentas novas — única exceção ao princípio acima, por
+    não existir parâmetro equivalente nas ferramentas de hoje:
+    `list_symbols` e `read_symbol`, via Tree-sitter, começando por
+    poucas linguagens (não todas de uma vez).
 - **3f** — benchmark comparativo: rodar as cinco tarefas, três vezes
   por lado, em ordem alternada (§7), escrever
   `docs/benchmark-fase3.md` — **incluindo a ressalva de 3c** sobre a
@@ -548,7 +623,10 @@ pena *antes* de pagar o custo do núcleo em segundo plano, não depois.
 - **Decisão** — com o benchmark em mãos, decidir se vale seguir pra
   3b (o núcleo compartilhado) ou se o caminho de 3c-3e já basta por
   agora. Não é uma etapa de código; é o ponto em que a fase 3 para e
-  reavalia, com dados, antes do passo mais caro.
+  reavalia, com dados, antes do passo mais caro. **Janelas e modo de
+  notas** — ambos fora da fase 3 e sem ADR própria ainda — só entram
+  no roadmap depois deste ponto, nunca antes: nenhum dos dois ajuda a
+  responder a pergunta que o benchmark faz.
 - **3b** — núcleo em segundo plano: `nas --daemon`, o socket por
   projeto em `$XDG_RUNTIME_DIR` (0600), o protocolo mínimo, múltiplos
   clientes, autostart/encerramento por inatividade/recuperação de
