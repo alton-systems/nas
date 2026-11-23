@@ -68,31 +68,52 @@ async fn main() -> io::Result<()> {
     // por completo antes de qualquer coisa ser aplicada (§3) — um
     // erro aqui nunca impede o nas de abrir, só mantém o padrão
     // embutido e avisa na echo area assim que a tela existir.
+    // `--no-config` ignora as duas camadas de propósito — a saída
+    // pra quando a própria configuração deixa o nas inutilizável
+    // (docs/config.md).
+    let no_config = std::env::args().any(|arg| arg == "--no-config");
     let project_root = project.as_ref().map(|(p, _)| p.root().to_path_buf());
     let user_config_dir = nas_config::user_config_dir().ok();
-    let loaded_config = nas_config::load(user_config_dir.as_deref(), project_root.as_deref());
-    let (config, config_error_message) = match &loaded_config {
-        Ok(loaded) => (loaded.config, None),
-        Err(errors) => (
-            nas_config::Config::default(),
-            Some(format!(
-                "Configuração inválida, usando o padrão — {}",
-                nas_config::format_errors(errors)
-            )),
-        ),
+
+    let (config, keymap, startup_message) = if no_config {
+        (nas_config::Config::default(), None, None)
+    } else {
+        match nas_config::load(user_config_dir.as_deref(), project_root.as_deref()) {
+            Ok(loaded) => {
+                let message = (!loaded.warnings.is_empty()).then(|| {
+                    format!(
+                        "Aviso(s) na configuração do projeto, ignorada — {}",
+                        nas_config::format_errors(&loaded.warnings)
+                    )
+                });
+                (loaded.config, Some(loaded.keymap), message)
+            }
+            Err(errors) => (
+                nas_config::Config::default(),
+                None,
+                Some(format!(
+                    "Configuração inválida, usando o padrão — {}",
+                    nas_config::format_errors(&errors)
+                )),
+            ),
+        }
     };
 
     let layout = keyboard_layout(config.keyboard_layout);
     let mut app = App::with_layout(open_document_from_args()?, layout);
     app.attach_history(history);
-    app.attach_config(config, user_config_dir, project_root);
-    if let Ok(loaded) = loaded_config {
-        app.modal.set_keymap(loaded.keymap);
+    if no_config {
+        app.attach_config(config, None, None);
+    } else {
+        app.attach_config(config, user_config_dir, project_root);
+    }
+    if let Some(keymap) = keymap {
+        app.modal.set_keymap(keymap);
     }
     if let Some((project, state_home)) = project {
         app.attach_project(project, state_home);
     }
-    if let Some(message) = config_error_message {
+    if let Some(message) = startup_message {
         app.show_startup_message(message);
     }
 
@@ -124,11 +145,14 @@ fn check_config() -> io::Result<()> {
     }
 }
 
-/// Abre o documento passado na linha de comando. Um arquivo que não é
-/// UTF-8 válido não é carregado: a aplicação abre com um buffer vazio e
-/// uma mensagem na barra de status, para nunca sobrescrever o original.
+/// Abre o documento passado na linha de comando — o primeiro
+/// argumento que não comece com `--` (pra `--check-config`/
+/// `--no-config` nunca serem lidos como nome de arquivo). Um arquivo
+/// que não é UTF-8 válido não é carregado: a aplicação abre com um
+/// buffer vazio e uma mensagem na barra de status, para nunca
+/// sobrescrever o original.
 fn open_document_from_args() -> io::Result<Document> {
-    let Some(path) = std::env::args().nth(1) else {
+    let Some(path) = std::env::args().skip(1).find(|arg| !arg.starts_with("--")) else {
         return Ok(Document::empty());
     };
     match Document::open(&path) {
@@ -175,7 +199,7 @@ fn open_project_journal(
 /// rápida, de uma sessão só, sem precisar editar um arquivo; senão
 /// `keyboard_layout` de `config.toml` (docs/decisions/0007), que já
 /// chega resolvido em `config_layout`.
-fn keyboard_layout(config_layout: Layout) -> Layout {
+pub(crate) fn keyboard_layout(config_layout: Layout) -> Layout {
     let Ok(name) = std::env::var("NAS_KEYBOARD_LAYOUT") else {
         return config_layout;
     };

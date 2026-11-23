@@ -422,6 +422,14 @@ impl Machine {
         self.keymap = keymap;
     }
 
+    /// Troca o layout físico de teclado em uso — mesma ideia de
+    /// `set_keymap`, pro `keyboard_layout` de `config.toml`
+    /// (ADR 0007-configuracao-em-camadas.md) também valer sem
+    /// reconstruir a `Machine` ao recarregar.
+    pub fn set_layout(&mut self, layout: Layout) {
+        self.layout_table = layout.translation_table();
+    }
+
     /// As teclas acumuladas no estado Sequential (vazio em qualquer outro
     /// estado).
     pub fn pending_sequence(&self) -> &[Key] {
