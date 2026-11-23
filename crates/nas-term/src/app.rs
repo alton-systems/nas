@@ -1174,7 +1174,25 @@ impl App {
             .check_external_change()
             .ok()??;
         self.journal_record_external(file.clone(), change);
-        Some(format!("{file} mudou no disco — Ctrl+R recarrega"))
+
+        if self.buffers[index].document.is_modified() {
+            return Some(format!("{file} mudou no disco — Ctrl+R recarrega"));
+        }
+
+        // Buffer limpo: não há edição local pra perder, então
+        // recarrega sozinho em vez de só avisar e esperar `Ctrl+R`
+        // (revisão da etapa 3c) — o evento em si já foi journalado
+        // acima como `Author::External`; isto só sincroniza a
+        // memória com o que `check_external_change` já confirmou que
+        // o disco tem.
+        match self.buffers[index].document.reload() {
+            Ok(_) => Some(format!(
+                "{file} mudou no disco e foi recarregado automaticamente"
+            )),
+            Err(err) => Some(format!(
+                "{file} mudou no disco, mas não foi possível recarregar: {err}"
+            )),
+        }
     }
 
     /// Registra uma mudança externa no journal — como `journal_record`,
@@ -3046,7 +3064,7 @@ mod tests {
     }
 
     #[test]
-    fn trocar_de_buffer_detecta_mudanca_externa_e_avisa() {
+    fn buffer_limpo_recarrega_automaticamente_ao_detectar_mudanca_externa() {
         let project_dir = tempfile::tempdir().expect("diretório temporário");
         let state_home = tempfile::tempdir().expect("diretório temporário");
         let a_path = project_dir.path().join("a.txt");
@@ -3067,16 +3085,68 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         fs::write(&a_path, "a mudou por fora").unwrap();
 
+        // "a.txt" está limpo (nenhuma edição local) — trocar pra ele
+        // deveria recarregar sozinho, não só avisar (revisão da etapa
+        // 3c: buffer limpo nunca precisa de confirmação pra perder
+        // nada, porque não há nada a perder).
         app.handle_key(ctrl_key(KeyCode::Char('b'))); // Ctrl+b: trocar de buffer
         type_str(&mut app, "a.txt");
         app.handle_key(key(KeyCode::Enter));
 
-        assert!(app.document().external_change_pending());
+        assert!(
+            !app.document().external_change_pending(),
+            "já deveria ter sido resolvido pelo recarregamento automático"
+        );
+        assert_eq!(text(&app), "a mudou por fora");
+        assert!(!app.document().is_modified());
         assert!(
             app.status_message
                 .as_ref()
                 .unwrap()
-                .contains("mudou no disco"),
+                .contains("recarregado automaticamente"),
+            "{:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn buffer_com_alteracoes_mantem_o_aviso_sem_recarregar_automaticamente() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let a_path = project_dir.path().join("a.txt");
+        let b_path = project_dir.path().join("b.txt");
+        fs::write(&a_path, "a original").unwrap();
+        fs::write(&b_path, "b original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, a_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('K'))); // fim do buffer
+        type_text(&mut app, " editado"); // edição local não salva
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, b_path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&a_path, "a mudou por fora").unwrap();
+
+        // "a.txt" tem edição local não salva — trocar pra ele
+        // continua só avisando, nunca descartando a edição sozinho.
+        app.handle_key(ctrl_key(KeyCode::Char('b')));
+        type_str(&mut app, "a.txt");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.document().external_change_pending());
+        assert!(app.document().is_modified());
+        assert_eq!(text(&app), "a original editado");
+        assert!(
+            app.status_message
+                .as_ref()
+                .unwrap()
+                .contains("Ctrl+R recarrega"),
             "{:?}",
             app.status_message
         );
@@ -3180,12 +3250,15 @@ mod tests {
 
         app.handle_focus_gained();
 
-        assert!(app.document().external_change_pending());
+        // Buffer limpo — recarrega sozinho (revisão da etapa 3c),
+        // mesma regra de `buffer_limpo_recarrega_automaticamente_...`.
+        assert!(!app.document().external_change_pending());
+        assert_eq!(text(&app), "mudou por fora");
         assert!(
             app.status_message
                 .as_ref()
                 .unwrap()
-                .contains("mudou no disco")
+                .contains("recarregado automaticamente")
         );
     }
 
