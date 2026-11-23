@@ -166,6 +166,28 @@ pub struct App {
     /// Uma visualização somente-leitura ativa (diff, lista de
     /// checkpoints, autoria) — ver [`Overlay`].
     pub overlay: Option<Overlay>,
+    /// A configuração resolvida (ADR 0007) — `Default` sem nenhum
+    /// arquivo de configuração, exatamente o comportamento de antes
+    /// desta etapa. `ui::draw` lê `line_numbers`; `apply_action` lê
+    /// `tab_width`/`indent_with_spaces` ao tratar `Tab`.
+    config: nas_config::Config,
+    /// Os caminhos de `config.toml`/`keymap.toml` (usuário e
+    /// projeto) que, se salvos de dentro do nas, disparam um
+    /// recarregamento automático — ver `reload_config_if_relevant`.
+    /// `None` quando `main.rs` não ligou nenhuma configuração
+    /// (como em todos os testes deste módulo).
+    config_paths: Option<ConfigPaths>,
+}
+
+/// Os caminhos efetivos de uma carga de configuração — guardados só
+/// pra saber, depois de um `Ctrl+s`, se o arquivo salvo era um dos
+/// de configuração (ADR 0007, Parte 2, "Recarregar"). A raiz do
+/// projeto fica aqui também, porque recarregar precisa saber de novo
+/// onde fica `.nas/config.toml`.
+#[derive(Clone)]
+struct ConfigPaths {
+    user_dir: Option<PathBuf>,
+    project_root: Option<PathBuf>,
 }
 
 impl App {
@@ -194,6 +216,76 @@ impl App {
             external_overwrite_confirm_pending: false,
             reload_confirm_pending: false,
             overlay: None,
+            config: nas_config::Config::default(),
+            config_paths: None,
+        }
+    }
+
+    /// Liga a configuração já carregada (ADR 0007) e os caminhos que
+    /// a produziram, pra recarregar automaticamente quando um deles
+    /// for salvo de dentro do nas. Sem chamar isto (como em todos os
+    /// testes deste módulo), vale `Config::default()` — exatamente o
+    /// comportamento de antes desta etapa.
+    pub fn attach_config(
+        &mut self,
+        config: nas_config::Config,
+        user_dir: Option<PathBuf>,
+        project_root: Option<PathBuf>,
+    ) {
+        self.config = config;
+        self.config_paths = Some(ConfigPaths {
+            user_dir,
+            project_root,
+        });
+    }
+
+    pub fn config(&self) -> &nas_config::Config {
+        &self.config
+    }
+
+    /// Mostra uma mensagem na echo area já na abertura (ADR 0007 §3:
+    /// um erro de configuração "aparece na echo area — nunca só no
+    /// log") — a única razão de existir é que `set_status_message`
+    /// é privado; `main.rs` é o único chamador de fora deste módulo.
+    pub fn show_startup_message(&mut self, message: impl Into<String>) {
+        self.set_status_message(message);
+    }
+
+    /// Depois de salvar `path`: se for um dos arquivos de
+    /// configuração ligados por `attach_config`, recarrega as duas
+    /// camadas de dados por completo — tudo ou nada (ADR 0007 §3):
+    /// com erro, a configuração em uso continua a mesma (devolve a
+    /// mensagem de erro, pra quem chama mostrar em vez de "Salvo.");
+    /// sem erro, `self.config`/`self.modal` (o keymap) são trocados
+    /// de uma vez. `None` quando `path` não é nenhum dos arquivos de
+    /// configuração — o `save()` comum, sem nada especial.
+    fn reload_config_if_relevant(&mut self, path: &str) -> Option<String> {
+        let paths = self.config_paths.clone()?;
+        let is_config_file = [
+            paths.user_dir.as_ref().map(|dir| dir.join("config.toml")),
+            paths.user_dir.as_ref().map(|dir| dir.join("keymap.toml")),
+            paths
+                .project_root
+                .as_ref()
+                .map(|root| nas_config::project_config_path(root)),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|config_path| config_path.to_string_lossy() == path);
+        if !is_config_file {
+            return None;
+        }
+
+        match nas_config::load(paths.user_dir.as_deref(), paths.project_root.as_deref()) {
+            Ok(loaded) => {
+                self.config = loaded.config;
+                self.modal.set_keymap(loaded.keymap);
+                Some("Salvo e configuração recarregada.".to_string())
+            }
+            Err(errors) => Some(format!(
+                "Salvo, mas a configuração não foi recarregada — {}",
+                nas_config::format_errors(&errors)
+            )),
         }
     }
 
@@ -472,8 +564,20 @@ impl App {
             Action::Undo => self.undo(),
             Action::InsertChar(c) => {
                 let from = self.document().cursor_offset();
-                self.document_mut().insert_char(c);
-                self.journal_record("insert", from, from, String::new(), c.to_string());
+                if c == '\t' && self.config.indent_with_spaces {
+                    // ADR 0007-configuracao-em-camadas.md, Parte 2:
+                    // `tab_width`/`indent_with_spaces` parametrizam o
+                    // que `Tab` já faz hoje (inserir algo) — nunca
+                    // uma tecla ou ação nova.
+                    let spaces = " ".repeat(self.config.tab_width);
+                    for space in spaces.chars() {
+                        self.document_mut().insert_char(space);
+                    }
+                    self.journal_record("insert", from, from, String::new(), spaces);
+                } else {
+                    self.document_mut().insert_char(c);
+                    self.journal_record("insert", from, from, String::new(), c.to_string());
+                }
             }
             Action::InsertNewline => {
                 let from = self.document().cursor_offset();
@@ -952,8 +1056,11 @@ impl App {
         }
         self.external_overwrite_confirm_pending = false;
 
+        let file = buffer_name(self.document());
         let message = match self.document_mut().save() {
-            Ok(true) => "Salvo.".to_string(),
+            Ok(true) => self
+                .reload_config_if_relevant(&file)
+                .unwrap_or_else(|| "Salvo.".to_string()),
             Ok(false) => "Sem nome de arquivo; nada para salvar.".to_string(),
             Err(err) => format!("Erro ao salvar: {err}"),
         };
@@ -3123,5 +3230,104 @@ mod tests {
             app.message_history(),
             &["primeira".to_string(), "segunda".to_string()]
         );
+    }
+
+    #[test]
+    fn tab_insere_caractere_de_tabulacao_por_padrao() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+
+        app.handle_key(key(KeyCode::Enter)); // Visual -> Insert
+        app.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(text(&app), "\t");
+    }
+
+    #[test]
+    fn tab_insere_tab_width_espacos_quando_configurado() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.config.indent_with_spaces = true;
+        app.config.tab_width = 2;
+
+        app.handle_key(key(KeyCode::Enter)); // Visual -> Insert
+        app.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(text(&app), "  ");
+    }
+
+    #[test]
+    fn salvar_config_toml_ligado_recarrega_configuracao_e_keymap() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "tab_width = 2\n").expect("escrever config.toml inicial");
+
+        let mut app = App::with_layout(
+            Document::open(&config_path).expect("abrir config.toml"),
+            Layout::Qwerty,
+        );
+        app.attach_config(
+            nas_config::Config::default(),
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+
+        app.document_mut().replace_all("tab_width = 8\n");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        assert_eq!(app.config().tab_width, 8);
+        assert_eq!(
+            app.status_message(),
+            Some("Salvo e configuração recarregada.")
+        );
+    }
+
+    #[test]
+    fn salvar_config_toml_invalido_mantem_a_configuracao_anterior() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "tab_width = 4\n").expect("criar config.toml inicial");
+
+        let mut app = App::with_layout(
+            Document::open(&config_path).expect("abrir config.toml"),
+            Layout::Qwerty,
+        );
+        let previous = nas_config::Config {
+            tab_width: 4,
+            ..nas_config::Config::default()
+        };
+        app.attach_config(previous, Some(dir.path().to_path_buf()), None);
+
+        app.document_mut().replace_all("tab_width = 999\n");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        assert_eq!(
+            app.config().tab_width,
+            4,
+            "configuração inválida não deveria ter sido aplicada"
+        );
+        assert!(
+            app.status_message()
+                .unwrap_or_default()
+                .contains("não foi recarregada")
+        );
+    }
+
+    #[test]
+    fn salvar_arquivo_qualquer_nao_tenta_recarregar_configuracao() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let config_dir = dir.path().join("config-dir");
+        fs::create_dir_all(&config_dir).expect("criar pasta de configuração");
+        let other_path = dir.path().join("outro.txt");
+        fs::write(&other_path, "").expect("criar outro.txt");
+
+        let mut app = App::with_layout(
+            Document::open(&other_path).expect("abrir outro.txt"),
+            Layout::Qwerty,
+        );
+        app.attach_config(nas_config::Config::default(), Some(config_dir), None);
+
+        type_text(&mut app, "ola");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        assert_eq!(app.status_message(), Some("Salvo."));
     }
 }

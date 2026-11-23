@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 arboard = { version = "3.7.0", default-features = false }
 base64 = "0.23.1"
+nas-config = { path = "../nas-config" }
 nas-editor = { path = "../nas-editor" }
 nas-history = { path = "../nas-history" }
 nas-keys = { path = "../nas-keys" }
