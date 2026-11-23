@@ -38,16 +38,21 @@ seu `~/.config/nas/config.toml` tenha definido continua valendo.
 
 ## Configuração recuperável
 
-Todo arquivo de toda camada é lido e validado **antes** de qualquer
-valor ser aplicado. Se algum arquivo tiver um erro:
+Cada camada é lida e validada **por inteiro e separadamente** antes
+de qualquer valor ser aplicado:
 
-- nada é aplicado — nem desse arquivo, nem de nenhum outro;
-- a configuração em uso continua a mesma de antes (na abertura, o
-  padrão embutido do nas);
-- o(s) erro(s) aparece(m) na echo area, com arquivo, linha e coluna
-  quando fizer sentido;
-- **o nas abre normalmente mesmo assim.** Um erro de configuração
-  nunca é motivo pra recusar abrir.
+- `config.toml`/`keymap.toml` do usuário são a única camada de
+  verdade que a abertura normal do nas tem. Se qualquer um dos dois
+  tiver um erro, **nada** é aplicado — a configuração em uso continua
+  a mesma de antes (na abertura, o padrão embutido do nas) — e o(s)
+  erro(s) aparece(m) na echo area, com arquivo, linha e coluna quando
+  fizer sentido.
+- `.nas/config.toml` (projeto) é **isolado**: um erro nele nunca
+  descarta a configuração do usuário. Só a camada de projeto é
+  ignorada (fica valendo padrão + usuário); o erro ainda aparece na
+  echo area, pra você saber que ela não foi aplicada.
+- **O nas abre normalmente mesmo assim**, nos dois casos. Um erro de
+  configuração nunca é motivo pra recusar abrir.
 
 ## `config.toml`
 
@@ -196,3 +201,19 @@ $ echo $?
 
 Útil pra checar antes de editar na mão (ou num hook de pre-commit,
 se você versiona sua configuração).
+
+## `nas --no-config`
+
+Abre ignorando `config.toml`, `keymap.toml` e `.nas/config.toml` por
+completo — só o padrão embutido do nas, como se nenhum arquivo de
+configuração existisse. Nenhum deles é lido, nem validado.
+
+É a saída pra quando a própria configuração deixa o nas inutilizável
+— um `keymap.toml` que desligou o atalho que você precisava pra
+corrigir o `keymap.toml`, por exemplo. Com `--no-config`, você abre
+no padrão, corrige o arquivo com os atalhos de sempre, e na próxima
+vez abre normalmente:
+
+```sh
+nas --no-config ~/.config/nas/keymap.toml
+```

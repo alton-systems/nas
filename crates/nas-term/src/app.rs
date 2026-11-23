@@ -261,6 +261,12 @@ impl App {
     /// configuração — o `save()` comum, sem nada especial.
     fn reload_config_if_relevant(&mut self, path: &str) -> Option<String> {
         let paths = self.config_paths.clone()?;
+        // Caminho **canônico** dos dois lados — `path` pode ter sido
+        // aberto relativo (ou com `.`/`..`), e os caminhos guardados
+        // em `ConfigPaths` são sempre absolutos; comparar como texto
+        // cru deixaria passar o mesmo arquivo de configuração aberto
+        // por um caminho diferente (revisão do PR #25).
+        let saved_canonical = std::fs::canonicalize(path).ok()?;
         let is_config_file = [
             paths.user_dir.as_ref().map(|dir| dir.join("config.toml")),
             paths.user_dir.as_ref().map(|dir| dir.join("keymap.toml")),
@@ -271,7 +277,8 @@ impl App {
         ]
         .into_iter()
         .flatten()
-        .any(|config_path| config_path.to_string_lossy() == path);
+        .filter_map(|config_path| std::fs::canonicalize(&config_path).ok())
+        .any(|config_path| config_path == saved_canonical);
         if !is_config_file {
             return None;
         }
@@ -280,7 +287,19 @@ impl App {
             Ok(loaded) => {
                 self.config = loaded.config;
                 self.modal.set_keymap(loaded.keymap);
-                Some("Salvo e configuração recarregada.".to_string())
+                // `keyboard_layout` precisa do mesmo tratamento que
+                // na abertura (`NAS_KEYBOARD_LAYOUT` continua
+                // vencendo, ADR 0007, Parte 2).
+                self.modal
+                    .set_layout(crate::keyboard_layout(self.config.keyboard_layout));
+                let mut message = "Salvo e configuração recarregada.".to_string();
+                if !loaded.warnings.is_empty() {
+                    message.push_str(&format!(
+                        " Aviso(s) — {}",
+                        nas_config::format_errors(&loaded.warnings)
+                    ));
+                }
+                Some(message)
             }
             Err(errors) => Some(format!(
                 "Salvo, mas a configuração não foi recarregada — {}",
@@ -568,11 +587,16 @@ impl App {
                     // ADR 0007-configuracao-em-camadas.md, Parte 2:
                     // `tab_width`/`indent_with_spaces` parametrizam o
                     // que `Tab` já faz hoje (inserir algo) — nunca
-                    // uma tecla ou ação nova.
+                    // uma tecla ou ação nova. `replace_region(from,
+                    // from, ...)` é uma inserção pura (nada é
+                    // removido) numa transação só — `u` desfaz os N
+                    // espaços de uma vez, não espaço por espaço
+                    // (revisão do PR #25); `insert_char` repetido N
+                    // vezes faria N transações.
                     let spaces = " ".repeat(self.config.tab_width);
-                    for space in spaces.chars() {
-                        self.document_mut().insert_char(space);
-                    }
+                    self.document_mut().replace_region(from, from, &spaces);
+                    self.document_mut()
+                        .set_cursor(from + spaces.chars().count());
                     self.journal_record("insert", from, from, String::new(), spaces);
                 } else {
                     self.document_mut().insert_char(c);
@@ -3255,6 +3279,27 @@ mod tests {
     }
 
     #[test]
+    fn tab_com_indent_with_spaces_e_uma_unica_etapa_de_desfazer() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.config.indent_with_spaces = true;
+        app.config.tab_width = 4;
+
+        app.handle_key(key(KeyCode::Enter)); // Visual -> Insert
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(text(&app), "    ");
+        assert_eq!(app.document().cursor_offset(), 4);
+
+        app.handle_key(alt_key(KeyCode::Char(' '))); // Insert -> Visual
+        app.handle_key(key(KeyCode::Char('u'))); // desfazer
+
+        assert_eq!(
+            text(&app),
+            "",
+            "um só 'u' deveria desfazer os quatro espaços de uma vez"
+        );
+    }
+
+    #[test]
     fn salvar_config_toml_ligado_recarrega_configuracao_e_keymap() {
         let dir = tempfile::tempdir().expect("diretório temporário");
         let config_path = dir.path().join("config.toml");
@@ -3277,6 +3322,113 @@ mod tests {
         assert_eq!(
             app.status_message(),
             Some("Salvo e configuração recarregada.")
+        );
+    }
+
+    #[test]
+    fn salvar_config_toml_aberto_por_caminho_relativo_ainda_recarrega() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        fs::write(dir.path().join("config.toml"), "tab_width = 2\n")
+            .expect("escrever config.toml inicial");
+
+        // Muda o cwd do processo pra abrir "config.toml" por um
+        // caminho relativo — o único jeito de provar que o
+        // recarregamento compara caminhos *canônicos*, não a string
+        // crua (revisão do PR #25). Seguro aqui: nenhum outro teste
+        // deste crate depende do cwd do processo.
+        let previous_cwd = std::env::current_dir().expect("cwd atual");
+        std::env::set_current_dir(dir.path()).expect("mudar cwd");
+
+        let mut app = App::with_layout(
+            Document::open("config.toml").expect("abrir config.toml"),
+            Layout::Qwerty,
+        );
+        app.attach_config(
+            nas_config::Config::default(),
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+
+        app.document_mut().replace_all("tab_width = 8\n");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        std::env::set_current_dir(previous_cwd).expect("restaurar cwd");
+
+        assert_eq!(app.config().tab_width, 8);
+        assert_eq!(
+            app.status_message(),
+            Some("Salvo e configuração recarregada.")
+        );
+    }
+
+    #[test]
+    fn recarregar_aplica_keyboard_layout_e_respeita_nas_keyboard_layout() {
+        // As duas metades deste teste (aplicar o layout novo, depois
+        // a variável de ambiente vencendo por cima dele) precisam
+        // ficar numa função só: `NAS_KEYBOARD_LAYOUT` é estado global
+        // do processo, e duas funções de teste separadas mexendo
+        // nela rodariam em threads diferentes ao mesmo tempo
+        // (`cargo test` é paralelo por padrão) — uma lendo a variável
+        // enquanto a outra a está trocando. Nenhum outro teste deste
+        // crate lê essa variável, então ficar só nesta função é
+        // seguro.
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "tab_width = 2\n").expect("escrever config.toml inicial");
+
+        let mut app = App::with_layout(
+            Document::open(&config_path).expect("abrir config.toml"),
+            Layout::Qwerty,
+        );
+        app.attach_config(
+            nas_config::Config::default(),
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+
+        let previous = std::env::var_os("NAS_KEYBOARD_LAYOUT");
+        unsafe {
+            std::env::remove_var("NAS_KEYBOARD_LAYOUT");
+        }
+
+        app.document_mut()
+            .replace_all("keyboard_layout = \"qwerty-abnt\"\n");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+        assert_eq!(app.config().keyboard_layout, nas_keys::Layout::QwertyAbnt);
+
+        // No ABNT2 a posição do ';' do qwerty produz 'ç' — só vale
+        // depois de `set_layout` ter trocado a tradução da `Machine`
+        // junto com a configuração.
+        app.document_mut().replace_all("ab");
+        app.document_mut().move_to_buffer_start();
+        app.handle_key(key(KeyCode::Char('ç')));
+        assert_eq!(
+            app.document().cursor_offset(),
+            1,
+            "'ç' deveria ter movido o cursor, traduzido como ';' sob ABNT"
+        );
+
+        // Agora a variável de ambiente entra em cena e deveria
+        // vencer o que `config.toml` diz, mesmo depois de recarregar.
+        unsafe {
+            std::env::set_var("NAS_KEYBOARD_LAYOUT", "qwerty");
+        }
+        app.document_mut()
+            .replace_all("keyboard_layout = \"qwerty-abnt\"\n");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("NAS_KEYBOARD_LAYOUT", value) },
+            None => unsafe { std::env::remove_var("NAS_KEYBOARD_LAYOUT") },
+        }
+
+        app.document_mut().replace_all("ab");
+        app.document_mut().move_to_buffer_start();
+        app.handle_key(key(KeyCode::Char('ç')));
+        assert_eq!(
+            app.document().cursor_offset(),
+            0,
+            "a variável de ambiente deveria ter vencido o config.toml"
         );
     }
 
