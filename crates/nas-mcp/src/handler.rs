@@ -10,7 +10,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, Implementation, ListToolsResult,
-    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 
@@ -82,6 +82,86 @@ fn session_id() -> String {
     format!("{}-{}", nas_history::now_unix(), std::process::id())
 }
 
+/// O resultado de sucesso de uma ferramenta, como blocos de conteúdo
+/// MCP — texto puro pra quem devolve texto de arquivo de verdade
+/// (`read`/`search`/`list_files`/`show_diff`: linhas numeradas, como
+/// a IA já vê em qualquer um desses), nunca esse texto dentro de um
+/// JSON com quebras de linha escapadas (`\n` literal na string, mais
+/// difícil de ler que o texto de verdade). Os outros comandos
+/// continuam como JSON — são metadados pequenos (`path`, `from`/`to`),
+/// sem motivo pra um formato especial. Um aviso (`sync_with_disk`/
+/// `open_or_resync`), quando presente, vai num segundo bloco de
+/// conteúdo, nunca misturado ao primeiro.
+fn render_success(name: &str, value: &serde_json::Value) -> Vec<Content> {
+    let mut blocks = match name {
+        "read" => vec![Content::text(text_field(value, "text"))],
+        "search" => vec![Content::text(render_matches(value))],
+        "list_files" => vec![Content::text(render_file_list(value))],
+        "show_diff" => vec![Content::text(render_diffs(value))],
+        _ => return vec![Content::text(value.to_string())],
+    };
+    if let Some(warning) = value["warning"].as_str() {
+        blocks.push(Content::text(warning.to_string()));
+    }
+    blocks
+}
+
+fn text_field(value: &serde_json::Value, field: &str) -> String {
+    value[field].as_str().unwrap_or_default().to_string()
+}
+
+fn render_matches(value: &serde_json::Value) -> String {
+    value["matches"]
+        .as_array()
+        .map(|matches| {
+            matches
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} {}",
+                        m["line"].as_u64().unwrap_or_default(),
+                        m["text"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn render_file_list(value: &serde_json::Value) -> String {
+    value["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn render_diffs(value: &serde_json::Value) -> String {
+    value["diffs"]
+        .as_array()
+        .map(|diffs| {
+            diffs
+                .iter()
+                .map(|d| {
+                    format!(
+                        "## {} ({})\n{}",
+                        d["path"].as_str().unwrap_or_default(),
+                        d["change"].as_str().unwrap_or_default(),
+                        d["unified"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
+}
+
 /// `nas-commands::CommandSpec` → `rmcp::model::Tool` — a lista de
 /// ferramentas **é** o registro filtrado por `exposed_to_ai` (ADR
 /// 0006 §5/ADR 0007-configuracao-em-camadas.md §5), nunca uma
@@ -92,7 +172,25 @@ fn spec_to_tool(spec: &CommandSpec) -> Tool {
         name: spec.name.into(),
         description: Some(spec.description.into()),
         input_schema: std::sync::Arc::new(input_schema),
-        annotations: None,
+        annotations: annotations_for(spec.effect),
+    }
+}
+
+/// Dica (nunca garantia — `ToolAnnotations` é só isso, uma dica pro
+/// cliente) derivada do mesmo `Effect` que já decide aprovação (ADR
+/// 0006 §5): `Pure`/`ReadFile` nunca mudam nada
+/// (`read_only_hint`); `WriteFile` toca o disco de verdade, o que
+/// `ToolAnnotations` chama de destrutivo (`destructive_hint`) — não
+/// porque apague algo sem avisar (`save_file` recusa antes disso,
+/// §5), mas porque sobrescreve o arquivo por completo. Os demais
+/// efeitos (`WriteBuffer`, `WriteHistory`, `Shell`, `Network`) não
+/// têm uma dica óbvia nenhuma das duas categorias, então ficam sem
+/// anotação — nenhuma lista paralela, direto do mesmo enum.
+fn annotations_for(effect: Effect) -> Option<ToolAnnotations> {
+    match effect {
+        Effect::Pure | Effect::ReadFile => Some(ToolAnnotations::new().read_only(true)),
+        Effect::WriteFile => Some(ToolAnnotations::new().destructive(true)),
+        Effect::WriteBuffer | Effect::WriteHistory | Effect::Shell | Effect::Network => None,
     }
 }
 
@@ -160,9 +258,10 @@ impl ServerHandler for NasMcpHandler {
         };
 
         match self.registry.run(&request.name, &mut ctx, args) {
-            Ok(value) => Ok(CallToolResult::success(vec![Content::text(
-                value.to_string(),
-            )])),
+            Ok(value) => Ok(CallToolResult::success(render_success(
+                request.name.as_ref(),
+                &value,
+            ))),
             Err(err) => Ok(CallToolResult::error(vec![Content::text(err.to_string())])),
         }
     }
