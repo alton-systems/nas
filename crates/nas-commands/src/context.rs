@@ -140,6 +140,38 @@ impl Workspace {
         Ok(self.documents.get(path).expect("acabou de ser inserido"))
     }
 
+    /// Como `open`, mas pra quem pede explicitamente pra (re)abrir um
+    /// arquivo (`open_file`) — diferente de `sync_with_disk`, usado
+    /// implicitamente por `read`/`search`/`edit`, que nunca descarta
+    /// uma alteração não salva da IA sem avisar e esperar uma decisão.
+    /// Pedir pra abrir de novo **é** a decisão: se o documento já
+    /// estava aberto e o disco mudou desde a última leitura, recarrega
+    /// — mesmo que haja alterações não salvas, que são descartadas —
+    /// e devolve um aviso dizendo isso, pra quem chamou saber que
+    /// precisa refazer a edição sobre o conteúdo atual (`save_file`
+    /// aponta exatamente aqui quando recusa por causa de uma mudança
+    /// externa, então esta é a rota que de fato resolve aquele
+    /// impasse). `path` já deve ser o resultado de `resolve`.
+    pub fn open_or_resync(&mut self, path: &Path) -> Result<Option<String>, CommandError> {
+        let Some(document) = self.documents.get_mut(path) else {
+            self.open(path)?;
+            return Ok(None);
+        };
+        document.check_external_change()?;
+        if !document.external_change_pending() {
+            return Ok(None);
+        }
+        let had_unsaved_changes = document.is_modified();
+        document.reload()?;
+        if had_unsaved_changes {
+            return Ok(Some(format!(
+                "{} mudou no disco — as alterações ainda não salvas deste buffer foram descartadas; releia antes de editar de novo",
+                path.display()
+            )));
+        }
+        Ok(None)
+    }
+
     /// Cria um documento novo, vazio, em `path` — pra `create_file`.
     /// Diferente de `open`: recusa se `path` já existir no disco ou
     /// já estiver aberto, pra `create_file` nunca sobrescrever algo
@@ -199,9 +231,17 @@ impl Workspace {
         let Some(document) = self.documents.get_mut(path) else {
             return Ok(None);
         };
-        let Some(_change) = document.check_external_change()? else {
+        document.check_external_change()?;
+        // `external_change_pending`, não o retorno de `check_external_change`
+        // acima: a primeira chamada já atualiza o mtime/tamanho conhecidos
+        // (pra não reportar a mesma mudança duas vezes como "nova"), então
+        // uma segunda chamada sem nenhuma escrita nova no meio veria `None`
+        // ali mesmo com a mudança anterior ainda sem resolver — é essa
+        // bandeira, não a detecção pontual, que diz se ainda há uma mudança
+        // pendente.
+        if !document.external_change_pending() {
             return Ok(None);
-        };
+        }
         if document.is_modified() {
             return Ok(Some(format!(
                 "{} mudou no disco desde a última leitura — este buffer tem alterações ainda não salvas, nada foi recarregado",
