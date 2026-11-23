@@ -56,6 +56,7 @@ pub fn now_unix() -> u64 {
 /// isso explicitamente, o que torna o agrupamento e os lotes
 /// determinísticos de testar, sem precisar esperar de verdade.
 pub struct Journal {
+    history_dir: PathBuf,
     writer: BufWriter<File>,
     open: Option<JournalEntry>,
     queue: Vec<JournalEntry>,
@@ -71,6 +72,7 @@ impl Journal {
             .append(true)
             .open(history_dir.join("journal.jsonl"))?;
         Ok(Self {
+            history_dir: history_dir.to_path_buf(),
             writer: BufWriter::new(file),
             open: None,
             queue: Vec::new(),
@@ -157,12 +159,20 @@ impl Journal {
     }
 
     fn flush_queue(&mut self, now: u64) -> io::Result<()> {
-        for entry in self.queue.drain(..) {
-            let line = serde_json::to_string(&entry)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            writeln!(self.writer, "{line}")?;
+        if !self.queue.is_empty() {
+            // Travada: dois processos (`nas-term`, `nas --mcp`) podem
+            // acrescentar ao mesmo `journal.jsonl` ao mesmo tempo (ADR
+            // 0006, revisão da etapa 3c) — sem a trava, a gravação em
+            // lote (várias linhas por `write`) de um poderia intercalar
+            // com a do outro no meio de uma linha.
+            let _lock = crate::lock::HistoryLock::acquire(&self.history_dir)?;
+            for entry in self.queue.drain(..) {
+                let line = serde_json::to_string(&entry)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                writeln!(self.writer, "{line}")?;
+            }
+            self.writer.flush()?;
         }
-        self.writer.flush()?;
         self.last_flush_at = now;
         Ok(())
     }
@@ -577,5 +587,71 @@ mod tests {
             result.is_err(),
             "uma linha corrompida que não é a última deveria ser um erro"
         );
+    }
+
+    #[test]
+    fn dois_processos_escrevendo_ao_mesmo_tempo_nao_perdem_nem_misturam_linhas() {
+        // Dois `Journal` independentes (cada um com seu próprio
+        // arquivo aberto — exatamente como dois processos de verdade
+        // teriam, cada um com seu próprio descritor) escrevendo no
+        // mesmo `journal.jsonl` ao mesmo tempo (ADR 0006, revisão da
+        // etapa 3c). Sem a trava em `flush_queue`, a gravação em lote
+        // de um poderia intercalar com a do outro no meio de uma
+        // linha — o que `read_entries` detectaria como JSON inválido.
+        let dir = tempfile::tempdir().unwrap();
+        let history_dir = dir.path().to_path_buf();
+        const ENTRIES_PER_WRITER: usize = 200;
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let run = |tag: &'static str, barrier: std::sync::Arc<std::sync::Barrier>| {
+            let history_dir = history_dir.clone();
+            std::thread::spawn(move || {
+                let mut journal = Journal::open(&history_dir).expect("abrir journal");
+                barrier.wait();
+                for i in 0..ENTRIES_PER_WRITER {
+                    // `command` muda a cada chamada — nunca agrupa
+                    // (ADR 0005 §2), garantindo uma linha por chamada.
+                    journal
+                        .record(
+                            now_unix(),
+                            Author::User,
+                            format!("insert-{i}"),
+                            format!("{tag}.txt"),
+                            i,
+                            i,
+                            "",
+                            format!("linha-{tag}-{i}"),
+                        )
+                        .expect("record");
+                    // Força o flush a cada volta — maximiza a chance
+                    // de uma gravação concorrente de verdade, em vez
+                    // de só um flush grande no final.
+                    journal.flush(now_unix()).expect("flush");
+                }
+            })
+        };
+
+        let a = run("a", barrier.clone());
+        let b = run("b", barrier);
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let entries = read_entries(&journal_path(&history_dir)).expect(
+            "o journal inteiro deveria continuar sendo um JSONL válido, sem linha misturada",
+        );
+        assert_eq!(
+            entries.len(),
+            ENTRIES_PER_WRITER * 2,
+            "nenhum evento deveria ter se perdido"
+        );
+
+        let count_for = |tag: &str| {
+            entries
+                .iter()
+                .filter(|e| e.file == format!("{tag}.txt"))
+                .count()
+        };
+        assert_eq!(count_for("a"), ENTRIES_PER_WRITER);
+        assert_eq!(count_for("b"), ENTRIES_PER_WRITER);
     }
 }

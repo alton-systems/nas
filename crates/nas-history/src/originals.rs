@@ -68,6 +68,13 @@ pub fn ensure_tracked(
     file: &str,
     disk_content: Option<&[u8]>,
 ) -> io::Result<()> {
+    // Travada: "ainda não rastreado? então capture" precisa ser
+    // atômico entre processos (ADR 0006, revisão da etapa 3c) — sem
+    // a trava, `nas-term` e `nas --mcp` editando o mesmo arquivo por
+    // primeira vez quase ao mesmo tempo poderiam capturar dois
+    // "originais" diferentes, cada um vencendo a corrida do outro.
+    let _lock = crate::lock::HistoryLock::acquire(history_dir)?;
+
     let path = entry_path(history_dir, file);
     if path.exists() {
         return Ok(());
@@ -96,7 +103,7 @@ pub fn ensure_tracked(
 
     let toml = toml::to_string_pretty(&entry)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    fs::write(&path, toml)
+    crate::atomic::write_atomic(&path, toml.as_bytes())
 }
 
 /// O registro original de `file`, se já estiver rastreado.

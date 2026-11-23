@@ -24,9 +24,11 @@
 //! `trash` move pra `~/.local/share/Trash` (nunca apaga de vez) um
 //! arquivo que um checkpoint sendo restaurado não conhece.
 
+mod atomic;
 mod author;
 mod checkpoint;
 mod journal;
+mod lock;
 mod originals;
 mod project;
 mod restore;

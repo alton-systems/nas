@@ -99,7 +99,12 @@ pub(crate) fn store_object(history_dir: &Path, content: &[u8]) -> io::Result<Str
     let hash = hash_bytes(content);
     let object_path = objects.join(&hash);
     if !object_path.exists() {
-        fs::write(&object_path, content)?;
+        // `write_atomic`, não `fs::write`: dois processos podem gravar
+        // o mesmo objeto ao mesmo tempo (ADR 0006, revisão da etapa
+        // 3c) — mesmo conteúdo (o hash garante isso), mas sem o
+        // tmpfile+rename um leitor concorrente poderia ver o arquivo
+        // pela metade enquanto o outro ainda escreve.
+        crate::atomic::write_atomic(&object_path, content)?;
     }
     Ok(hash)
 }
@@ -148,6 +153,11 @@ pub fn create(
     automatic: bool,
     files: &[(String, Vec<u8>)],
 ) -> io::Result<CreatedCheckpoint> {
+    // Travada do início ao fim: dois processos criando um checkpoint
+    // ao mesmo tempo (ADR 0006, revisão da etapa 3c) nunca intercalam
+    // a escrita dos objetos com a do manifesto um do outro.
+    let _lock = crate::lock::HistoryLock::acquire(history_dir)?;
+
     fs::create_dir_all(objects_dir(history_dir))?;
 
     let mut checkpoint_files = Vec::with_capacity(files.len());
@@ -202,7 +212,7 @@ pub fn create(
     };
     let toml = toml::to_string_pretty(&manifest)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    fs::write(dir.join("manifest.toml"), toml)?;
+    crate::atomic::write_atomic(&dir.join("manifest.toml"), toml.as_bytes())?;
 
     Ok(CreatedCheckpoint { manifest, excluded })
 }
@@ -377,6 +387,11 @@ pub fn prune_with_limits(
     max_automatic: usize,
     max_total_bytes: u64,
 ) -> io::Result<PruneReport> {
+    // Mesma trava de `create` — podar enquanto outro processo cria
+    // um checkpoint poderia remover objetos que o outro acabou de
+    // referenciar (ADR 0006, revisão da etapa 3c).
+    let _lock = crate::lock::HistoryLock::acquire(history_dir)?;
+
     let mut manifests = list(history_dir)?;
     let mut removed_checkpoints = Vec::new();
 
@@ -820,5 +835,62 @@ mod tests {
         let entries = read_entries(&journal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file, "b.txt");
+    }
+
+    #[test]
+    fn dois_processos_criando_checkpoints_ao_mesmo_tempo_nao_corrompem_nenhum() {
+        // Dois escritores (`nas-term`, `nas --mcp`) criando
+        // checkpoints nomeados diferentes ao mesmo tempo, no mesmo
+        // histórico (ADR 0006, revisão da etapa 3c) — cada um
+        // continua lendo de volta por inteiro, nunca pela metade.
+        let dir = tempfile::tempdir().unwrap();
+        let history_dir = dir.path().to_path_buf();
+        const CHECKPOINTS_PER_WRITER: usize = 20;
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let run = |tag: &'static str, barrier: std::sync::Arc<std::sync::Barrier>| {
+            let history_dir = history_dir.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..CHECKPOINTS_PER_WRITER {
+                    let files = [file(&format!("{tag}.txt"), &format!("conteudo-{tag}-{i}"))];
+                    create(
+                        &history_dir,
+                        &format!("{tag}-{i}"),
+                        Author::User,
+                        (i + 1) as u64,
+                        false,
+                        &files,
+                    )
+                    .unwrap_or_else(|err| panic!("criar checkpoint {tag}-{i}: {err}"));
+                }
+            })
+        };
+
+        let a = run("a", barrier.clone());
+        let b = run("b", barrier);
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let manifests = list(&history_dir).expect("listar checkpoints");
+        assert_eq!(
+            manifests.len(),
+            CHECKPOINTS_PER_WRITER * 2,
+            "nenhum checkpoint deveria ter sido perdido ou sobrescrito"
+        );
+
+        // Todo manifesto lido de volta é íntegro, e o objeto que ele
+        // referencia existe e tem o conteúdo certo — nenhum
+        // incompleto, nenhum pela metade.
+        for manifest in &manifests {
+            assert_eq!(manifest.files.len(), 1);
+            let file = &manifest.files[0];
+            let hash = file.content_hash.as_ref().expect("deveria ter hash");
+            let content = String::from_utf8(read_object(&history_dir, hash).unwrap()).unwrap();
+            // `manifest.name` é "{tag}-{i}" — o conteúdo esperado
+            // vem do próprio nome, nunca hardcoded.
+            let (tag, i) = manifest.name.split_once('-').expect("nome tag-i");
+            assert_eq!(content, format!("conteudo-{tag}-{i}"));
+        }
     }
 }
