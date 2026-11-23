@@ -1,0 +1,17 @@
+[package]
+name = "nas-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nas-commands = { path = "../nas-commands" }
+nas-history = { path = "../nas-history" }
+rmcp = { version = "0.3", features = ["transport-io"] }
+serde_json = "1"
+tokio = { version = "1.54.1", features = ["io-std"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
