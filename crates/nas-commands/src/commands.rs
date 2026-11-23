@@ -427,10 +427,7 @@ pub struct SaveFileResult {
 /// nova pra journalar aqui (editar já journala na hora, ADR 0005
 /// §1); isto só garante que o que já foi registrado por este autor
 /// não fique só na fila em memória.
-fn save_file(
-    ctx: &mut CommandContext,
-    args: SaveFileArgs,
-) -> Result<SaveFileResult, CommandError> {
+fn save_file(ctx: &mut CommandContext, args: SaveFileArgs) -> Result<SaveFileResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
     if ctx.workspace.sync_with_disk(&path)?.is_some() {
         return Err(CommandError::DiskChanged(path.display().to_string()));
@@ -1086,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_expoe_os_nove_comandos_com_efeito() {
+    fn registry_expoe_os_dez_comandos_com_efeito() {
         let mut registry = Registry::new();
         register_all(&mut registry);
 
