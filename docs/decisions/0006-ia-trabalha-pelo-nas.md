@@ -1,0 +1,473 @@
+# 0006 — a IA trabalha pelo nas
+
+## Status
+
+Proposta — aguardando aprovação. Nada implementado; nenhum PR de
+código abre a partir desta ADR até ela ser aceita.
+
+## Contexto
+
+O README lista quatro pilares e um roteiro em quatro marcos: Marco 1
+(editor básico + modal, em andamento), Marco 2 (Steel/Scheme embutido),
+Marco 3 (`defcommand` com esquema/docstring/efeitos, JSON Schema
+automático), Marco 4 (a IA propõe uma sequência de comandos, o usuário
+aprova no estilo Sequential). A ADR 0005 já adiantou, de propósito, a
+metade do pilar 3 que não depende de IA nenhuma: todo `Document::apply`
+já registra autor, comando e intervalo; `Author::Ai { agent, session }`
+já existe no tipo e já é testado com um autor simulado; checkpoint,
+diff e restauração já funcionam para qualquer autor. Essa fase 3 é
+sobre a outra metade: ligar um agente de IA de verdade a tudo isso.
+
+**Esta proposta muda o caminho até lá.** O roteiro original chega à IA
+via Lisp embutido primeiro (Marco 2) e só depois `defcommand`/esquema
+(Marco 3). Proponho inverter: um **registro de comandos nativo em
+Rust**, sem precisar de nenhum interpretador embutido, que já nasce
+gerando esquema JSON — e um agente de IA de verdade (Claude Code, hoje)
+chamando esses comandos via MCP, testável nesta fase, sem esperar o
+Steel. Lisp não é descartado: continua fazendo sentido como camada de
+*scripting* do usuário mais adiante (e pode, no futuro, chamar os
+mesmos comandos do registro) — só deixa de ser pré-requisito pra IA
+ser usuária do nas. `nas-commands` (hoje reservada pro Marco 3 em
+`CLAUDE.md`) passa a nascer agora, antes de `nas-lisp`. **Essa é a
+única decisão grande e não registrada desta proposta** — inversão de
+ordem do roteiro — e é por isso que esta ADR existe antes de qualquer
+código, seguindo a regra do `CLAUDE.md` de parar antes de decisões
+assim.
+
+## Decisão
+
+### 1. Registro de comandos tipados
+
+Uma crate nova, `nas-commands`, análoga a `nas-history` (ADR 0005 §9):
+não depende de `nas-keys` nem sabe de teclas — só dos tipos de
+domínio (`nas-editor::Document`, `nas-history::Journal`). Um comando é
+uma função Rust com uma assinatura fixa, mais os quatro metadados do
+pilar 1 do README:
+
+```rust
+pub enum Effect {
+    Pure,
+    ReadFile,
+    WriteBuffer,
+    WriteFile,
+    Shell,
+    Network,
+}
+
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub effect: Effect,
+    pub args_schema: schemars::Schema,
+    run: Box<dyn Fn(&mut CommandContext, serde_json::Value) -> Result<CommandOutput, CommandError>>,
+}
+
+pub struct Registry(Vec<CommandSpec>);
+```
+
+Cada comando declara seus argumentos como uma struct comum
+(`#[derive(Deserialize, schemars::JsonSchema)] struct EditArgs { path: String, from: usize, to: usize, text: String }`),
+e `args_schema` vem de `schemars::schema_for!` — sem escrever nenhum
+JSON Schema à mão. Registrar um comando é uma função livre
+(`fn register(registry: &mut Registry)`, chamada uma vez por comando
+dentro de um `register_all` central) — nada de macro (`defcommand` é
+Lisp, Marco 3 original; aqui ainda é só Rust simples, sem abstração
+antecipando o que ainda não existe, por `CLAUDE.md`).
+
+**Isto não substitui `nas-keys`/`[commands]`.** São camadas
+diferentes: `nas-keys` liga uma tecla a uma ação síncrona, sem
+argumentos, só pro estado Visual/Sequential. `nas-commands` é
+invocável por nome com argumentos explícitos — por um agente via MCP
+(§3), e no futuro pelo próprio Sequential do usuário (pilar 4) ou por
+Lisp. As duas tabelas de nomes (`docs/keys.md [commands]` e
+`nas-commands`) continuam independentes; nada aqui pede renomear uma
+pra bater com a outra.
+
+Os nove comandos iniciais (§3) e seu efeito, usando o que
+`nas-editor::Document` já expõe:
+
+| Comando | Efeito | Base em `Document`/`nas-history` |
+|---|---|---|
+| `open_file` | `ReadFile` | `Document::open` |
+| `read` | `Pure` | `Document::full_text`/`line` (buffer já aberto, só memória) — com números de linha, §3 |
+| `search` | `Pure` | `Document::find_from` (só memória) — resultados com números de linha, §3 |
+| `list_files` | `ReadFile` | novo: lista os arquivos do projeto |
+| `edit` | `WriteBuffer` | busca por texto exato + `Document::delete_region`/inserção — semântica detalhada em §3 |
+| `show_diff` | `ReadFile` | `nas_history::diff` (lê `objects/` em disco) |
+| `create_file` | `WriteFile` | novo: cria um arquivo vazio no disco (e abre como buffer) |
+| `checkpoint_create` | `WriteFile` | o checkpoint automático de uma sessão de IA (§6) reaproveita este mesmo comando |
+| `checkpoint_restore` | `WriteFile` | `nas_history::restore` |
+
+`edit` é `WriteBuffer`, não `WriteFile`: muda o texto em memória (como
+qualquer tecla do usuário), não salva no disco por conta própria —
+`Ctrl+s` continua sendo decisão do usuário, mesmo quando quem editou
+foi a IA. Qual desses efeitos pede aprovação — e qual não — é decidido
+pelo risco real de cada um, não só pela classe; ver §5.
+
+### 2. Núcleo em segundo plano
+
+O núcleo (conjunto de buffers abertos num projeto, o registro de
+comandos, e o `Journal` do projeto) passa a poder viver **fora** do
+processo do `nas-term`, pra que um agente funcione com a interface
+fechada. Em vez de uma crate/binário novo, o próprio binário do
+`nas-term` ganha um segundo modo de entrada: `nas --daemon` inicia só
+o núcleo, sem terminal, escutando num socket Unix — reaproveita o
+binário e o código que já existe, sem inflar o workspace com mais uma
+crate antes de precisar.
+
+- **Um núcleo por projeto**, identificado do mesmo jeito que o
+  histórico (ADR 0005 §6: raiz do Git, ou o diretório onde foi
+  iniciado). O socket vive em
+  `$XDG_RUNTIME_DIR/nas/<hash-do-projeto>/core.sock` (mesmo fallback
+  manual que `NAS_KEYBOARD_LAYOUT` e o `$XDG_STATE_HOME` do histórico
+  já usam quando a variável não existe), com permissão **`0600`** no
+  próprio arquivo do socket — não `~/.local/state`: aquele diretório é
+  pra estado que sobrevive a reiniciar a máquina (journal,
+  checkpoints); o socket é efêmero, do tempo de vida do daemon, e
+  `$XDG_RUNTIME_DIR` já é o lugar certo pra isso (também seguro por
+  padrão, geralmente `0700` do próprio usuário).
+- **Autostart**: tanto o `nas-term` normal quanto o `nas-mcp` (§3)
+  tentam conectar nesse socket primeiro; se não existir, sobem o
+  próprio `nas --daemon` como processo filho antes de continuar. Quem
+  abre o nas sem nenhum agente envolvido nunca percebe diferença —
+  mesmo fluxo de hoje, sem socket nenhum, se preferir não usar IA (o
+  autostart só acontece se algo tentar conectar).
+- **Encerramento**: o daemon sai sozinho depois de um período
+  (proponho 10 minutos) sem nenhum cliente conectado — checado por um
+  intervalo periódico (`tokio::time::interval`), não fica pendurado
+  pra sempre depois que o usuário fecha o `nas-term` e a sessão de IA
+  termina.
+- **Recuperação depois de uma queda**: se o processo do daemon morrer
+  sem remover o arquivo do socket (um `kill -9`, um pane morto), o
+  próximo cliente a tentar conectar recebe `ECONNREFUSED` (ninguém
+  escutando um socket Unix cujo arquivo ainda existe, mas sem
+  processo do outro lado) — nesse caso específico, remove o arquivo
+  velho e tenta subir um daemon novo. Pra dois clientes não subirem
+  dois daemons ao mesmo tempo nessa corrida, o autostart usa um
+  arquivo de lock ao lado do socket (`core.sock.lock`, criado com
+  `O_EXCL`): quem consegue criar o lock sobe o daemon; quem não
+  consegue só espera um instante e tenta conectar de novo.
+- **Vários clientes, um núcleo**: o núcleo serializa toda escrita (um
+  só `Document::apply` por vez, como já é dentro de um processo hoje)
+  e notifica todo cliente conectado quando algo muda — é assim que o
+  `nas-term` aberto redesenha quando a IA edita um arquivo que o
+  usuário está olhando, e é assim que dois agentes (ou um agente e o
+  usuário) nunca pisam um no outro. Ver §2.1 para o caso de um
+  `nas-term` e um agente terem o **mesmo** documento aberto ao mesmo
+  tempo.
+- Protocolo: mensagens JSON por linha sobre o socket (pedido/resposta
+  simples, mais um canal de eventos de mudança) — não é um protocolo
+  novo de propósito nenhum, só o suficiente pra ligar os dois lados;
+  tanto o `nas-term` quanto o `nas-mcp` falam esse protocolo interno,
+  nenhum dos dois expõe o socket diretamente pra fora.
+
+#### 2.1 Edição simultânea do mesmo documento
+
+Um `nas-term` aberto e um agente podem ter o mesmo arquivo aberto ao
+mesmo tempo. Como os dois são clientes do **mesmo** `Document` dentro
+do núcleo (não cada um com sua cópia local sincronizada depois), boa
+parte do problema de "mesclar duas edições" nem chega a existir: não
+há duas cópias pra reconciliar, há uma só, e cada transação (do
+usuário ou da IA) se aplica direto nela, uma de cada vez, na ordem em
+que o núcleo recebe.
+
+- **Posição do cursor do usuário**: é estado só da UI (vive em
+  `Buffer`/`App` do `nas-term`, nunca no `Document` compartilhado),
+  então uma transação da IA nunca a move por si só — mas o *offset*
+  numérico do cursor precisa ser remapeado através de toda transação
+  aplicada por **qualquer** autor, do mesmo jeito que já é remapeado
+  hoje através de um `undo`/`redo` locais. O núcleo guarda, por
+  cliente `nas-term` conectado, o offset do cursor e da seleção
+  daquele cliente, e os atualiza a cada transação usando a mesma
+  função de mapeamento de posição que o `helix-core` já expõe
+  (`ChangeSet`/`map_pos`) — nenhum algoritmo novo, só aplicá-lo também
+  às transações de outros autores, não só às locais.
+- **Alterações não salvas do usuário**: não existe um "local" separado
+  do "remoto" pra reconciliar — a edição do usuário **é** a transação
+  que chega ao `Document` compartilhado, no mesmo instante da tecla
+  (o `nas-term` não guarda um rascunho próprio antes de enviar).
+  `is_modified()` continua significando exatamente o que significa
+  hoje — "o `Document` difere do que está no disco" — e vale pro
+  documento como um todo, não por cliente.
+- **Ordem das transações**: estritamente a ordem de chegada ao
+  núcleo (FIFO por documento, §2) — cada transação se aplica por
+  completo antes da próxima começar, nunca duas em paralelo sobre o
+  mesmo `Document`. O `edit` da IA (§3) ajuda bastante aqui por
+  construção: como ele busca o texto antigo exato em vez de um
+  intervalo de caracteres fixo, mesmo que o usuário tenha editado
+  algo entre a última leitura da IA e este `edit`, a busca ainda acha
+  o texto certo (se ainda existir) ou recusa com um erro claro (se já
+  tiver sido alterado) — nunca aplica no deslocamento errado.
+- **Teste de aceite (parte do critério de pronto de 3b)**: com um
+  `Document` compartilhado, um cliente simulando o `nas-term` com o
+  cursor no meio do texto e uma edição pendente de não-salvo, e um
+  segundo cliente simulando a IA editando um trecho **antes** da
+  posição do cursor — depois da transação da IA, o offset do cursor
+  do primeiro cliente deve ter se deslocado exatamente pela diferença
+  de tamanho introduzida, e `is_modified()` deve continuar `true`
+  (nada se perdeu, nada precisou ser mesclado à mão).
+
+### 3. Servidor MCP
+
+Uma crate nova, `nas-mcp` (binário), usando a crate
+[`rmcp`](https://docs.rs/rmcp) — isolada atrás do nosso próprio
+adaptador, mesmo princípio já usado pro helix (decisão 0001: "isolar o
+uso dessas crates atrás dos nossos módulos, a API delas não é
+estável"). `nas-mcp` só sabe traduzir: uma chamada de ferramenta MCP
+vira uma chamada ao `Registry` (§1) através do núcleo (§2); nada de
+`rmcp` aparece em `nas-commands`, `nas-editor` ou `nas-history`.
+
+- **Transporte**: stdio — o jeito que o Claude Code (e a maioria dos
+  clientes MCP) espera, lançando `nas-mcp` como subprocesso.
+  `nas-mcp` conecta no socket do núcleo do projeto corrente (§2),
+  subindo um núcleo novo se precisar — por isso um agente funciona sem
+  o `nas-term` jamais ter sido aberto.
+- **Ferramentas**: exatamente os nove comandos de §1,
+  `registry.specs()` convertido 1:1 em `rmcp::Tool` (nome, descrição,
+  `input_schema` = o `args_schema` do `schemars`) — a lista de
+  ferramentas que a IA vê **é** o registro; não existe uma segunda
+  lista pra manter sincronizada.
+- **`edit` é "texto antigo exato → texto novo", nunca intervalo de
+  caracteres.** Argumentos: `{ path, old_text, new_text, line_range?:
+  [de, até] }`. O comando busca `old_text` literal no conteúdo atual
+  do buffer (não no que a IA leu por último — sempre o texto de
+  agora, já que o núcleo é a única fonte de verdade, §2) e:
+  - se não encontrar, recusa com um erro dizendo isso — nunca cria
+    texto novo do nada;
+  - se encontrar **mais de uma vez**, recusa pedindo pra desambiguar
+    com `line_range` (um intervalo de linhas que contém a ocorrência
+    certa) — nunca adivinha qual;
+  - se encontrar exatamente uma vez (direto, ou já restrito por
+    `line_range`), substitui por `new_text`.
+
+  Isso resolve por construção boa parte do risco de edição
+  simultânea (§2.1): como o `edit` nunca depende de um deslocamento
+  numérico calculado antes, um documento que mudou entre a última
+  leitura da IA e este `edit` não faz a edição cair no lugar errado
+  — ou o texto antigo ainda está lá (edita certo) ou não está mais
+  (recusa, nunca corrompe outro trecho).
+- **`create_file`**: cria um arquivo novo (vazio, ou com um conteúdo
+  inicial opcional) e já abre como buffer — `WriteFile`, pede
+  aprovação (§5).
+- **`list_files`**: lista os caminhos do projeto (respeitando
+  `.gitignore`, como os outros comandos que já leem do projeto) — sem
+  conteúdo, só os caminhos.
+- **Toda leitura devolve texto com números de linha** — `read`,
+  `search` (cada resultado com a linha onde apareceu) e `list_files`
+  onde aplicável. É o que permite à IA montar o `line_range` de um
+  `edit` subsequente sem precisar contar linhas por conta própria.
+
+### 4. ACP
+
+**Não entra nesta fase.** ACP (Agent Client Protocol, da Zed) é a
+direção contrária do MCP: em vez de "o agente chama ferramentas do
+nas", é "o nas embute a sessão de um agente e mostra o que ele propõe
+com UI própria" — o pilar 4 do README ("a IA propõe uma frase de
+comandos... o usuário lê antes de executar", estilo Sequential) é
+exatamente isso, só que hoje o Claude Code já tem sua própria UI de
+terminal pra mostrar diffs e pedir aprovação. MCP já resolve o
+objetivo central desta fase — um agente de verdade operando o nas,
+testável com o benchmark do §7 — sem exigir que o `nas-term` vire um
+cliente ACP. ACP é jovem (como o `rmcp`, cautela parecida à da decisão
+0001) e é trabalho de UI ortogonal ao núcleo/registro/permissões desta
+fase. Fica pra uma ADR própria, depois que o uso real via MCP mostrar
+se vale a pena uma UI nativa de sessão dentro do nas-term.
+
+### 5. Permissões pelo risco real
+
+Refino o pilar 2 do README: em vez da mesma barreira pra todo efeito
+não-`Pure`, a aprovação é por **risco real**, não só pela classe —
+e só quando o autor é `Author::Ai` (um humano nunca precisa aprovar a
+própria tecla).
+
+- **Liberados por padrão**: `Pure`, `ReadFile` e **`WriteBuffer`**.
+  `WriteBuffer` entra aqui de propósito — é reversível pelo histórico
+  (`u`, journal) e, numa sessão de IA, já está coberto pelo checkpoint
+  automático do início da sessão (§6): desfazer qualquer coisa que
+  `edit` fez é sempre possível, com ou sem aprovação prévia. Pedir
+  aprovação pra cada edição de buffer tornaria o fluxo comum (abrir,
+  ler, editar, repetir) tão lento quanto sem o nas — o próprio
+  propósito do benchmark do §7.
+- **Pedem aprovação**: `WriteFile`, `Shell` e `Network` — tocam o
+  disco de verdade (fora do checkpoint automático, que só cobre o que
+  passa por `Document`/`nas-history`) ou saem do projeto. Isso cobre
+  `create_file`, `checkpoint_create` e `checkpoint_restore` entre os
+  nove comandos de §1.
+- **Interface aberta**: o núcleo manda um pedido de permissão pra todo
+  cliente `nas-term` conectado e **bloqueia** aquele comando até
+  decidir (com um tempo limite — alguns minutos — que nega
+  automaticamente; nunca aplica por silêncio, nunca trava o agente pra
+  sempre). `nas-term` mostra isso na echo area, reaproveitando o
+  mesmo mecanismo which-key desta própria PR: um título com o agente e
+  o comando, e as opções **uma vez**, **sempre na sessão** e qualquer
+  outra tecla cancela (nega) — mesmo padrão de "qualquer tecla fecha"
+  que já existe pros overlays. "Sempre na sessão" vale só pelo resto
+  daquela sessão daquele agente (o par `agent`+`session` de
+  `Author::Ai`, §6) — nunca é escrito em disco automaticamente; uma
+  nova sessão de IA sempre pergunta de novo.
+- **Interface fechada**: não existe ninguém pra perguntar. O núcleo
+  consulta um arquivo de configuração por projeto
+  (`~/.local/state/nas/history/<hash>/permissions.toml` — ao lado do
+  `journal.jsonl` e dos `checkpoints/` já existentes da ADR 0005,
+  **não** em `$XDG_RUNTIME_DIR`: é configuração que precisa sobreviver
+  a reiniciar a máquina, diferente do socket do núcleo, §2), que o
+  usuário mantém manualmente de antemão, liberando os efeitos que
+  confia rodar sem supervisão (`write-file`, `shell`, `network`, algum
+  ou nenhum).
+  Um efeito sem entrada nesse arquivo é **negado direto**, com um erro
+  claro de volta pro agente — nunca aplica por padrão, nunca finge
+  sucesso. Persistir "sempre na sessão" de uma sessão atendida nesse
+  arquivo fica fora desta fase (ver "Fora de escopo") — por ora é só
+  leitura manual.
+- **O benchmark do §7 usa uma política explícita**: pra rodar as
+  tarefas sem travar em cada aprovação, o arquivo de configuração do
+  benchmark libera exatamente os efeitos que as tarefas escolhidas
+  precisam (tipicamente nenhum `Shell`/`Network`, já que são tarefas
+  de edição de código) — essa política fica documentada dentro do
+  próprio `docs/benchmark-fase3.md` (§7), não escondida numa
+  configuração solta.
+
+### 6. Autoria
+
+Nada muda no tipo (`Author::Ai { agent, session }` já existe e já é
+testado, ADR 0005 §1) — só passa a ser preenchido de verdade: `agent`
+vem do *handshake* de inicialização do MCP (o nome que o cliente se
+declara, com um padrão de configuração se o cliente não declarar
+nada); `session` é gerado uma vez por conexão ao núcleo.
+
+**Revisar e desfazer uma sessão inteira não precisa de mecanismo
+novo.** Na primeira mudança efetiva de um `(agent, session)`, o núcleo
+cria um checkpoint automático ("antes da sessão de `<agent>`") — o
+mesmo padrão que a restauração já usa pra se tornar desfazível (ADR
+0005 §7). Depois disso:
+
+- `Ctrl+t a` (autoria) já mostra, linha a linha, o que foi daquela
+  sessão.
+- `Ctrl+t e` entre o checkpoint automático e agora mostra o diff
+  inteiro da sessão.
+- `Ctrl+t r` nesse mesmo checkpoint desfaz a sessão inteira de uma vez
+  — a mesma composição que ADR 0005 §7 já usa ("desfazer uma
+  restauração é só restaurar o checkpoint automático que ela mesma
+  criou").
+
+Nenhuma dessas três teclas precisa saber que existe um agente — elas
+já tratam `Author::Ai` igual a qualquer outro autor.
+
+### 7. Teste comparativo
+
+**A comparação é nas contra o Claude Code no seu modo normal** — com
+as próprias ferramentas de ler, editar e buscar, além do shell — não
+contra "só shell". É a comparação justa: o Claude Code já lê/edita
+arquivos e roda comandos muito bem sem o nas; a pergunta que importa é
+se o `nas-mcp` (leitura com números de linha, `edit` por texto exato,
+checkpoint automático de sessão, §1/§3/§6) melhora sobre o que o
+Claude Code já faz por conta própria, não se "uma ferramenta" é melhor
+que "nenhuma".
+
+Cinco tarefas pequenas e reais, tiradas do backlog atual do próprio
+nas (não sintéticas) — por exemplo: corrigir um bug concreto já
+conhecido, adicionar um teste faltando pra uma função existente,
+renomear algo de forma consistente numa crate, explicar o que uma
+função faz, extrair uma pequena duplicação. Cada tarefa roda **três
+vezes em cada lado** (seis rodadas por tarefa) — mesmo modelo, mesmo
+pedido (o mesmo texto de prompt nas seis rodadas da mesma tarefa), em
+**ordem alternada** (lado A, lado B, lado A, lado B, ... tarefa a
+tarefa, não as três do mesmo lado em sequência) — pra não deixar
+aquecimento de contexto ou ordem de execução favorecer um lado só
+porque rodou primeiro ou por último.
+
+Medidas por rodada:
+
+- **Acerto**: testes do nas passando depois da mudança (`cargo test
+  --workspace`), não só revisão humana — as cinco tarefas são
+  escolhidas, de propósito, entre as que admitem essa verificação
+  objetiva.
+- **Tokens** e **tempo de parede**: o próprio resumo de custo/duração
+  do Claude Code já reporta por sessão.
+- **Custo de revisar e desfazer**: depois de cada rodada, quanto
+  trabalho dá pra revisar a mudança e desfazê-la por completo, nos
+  dois lados — do lado do nas, isso é `Ctrl+t e`/`Ctrl+t r` no
+  checkpoint automático da sessão (§6), medido em teclas/comandos; do
+  lado do Claude Code normal, é o que ele mesmo oferece pra isso (seu
+  próprio diff de sessão, `git diff`/`git checkout` manual no
+  repositório, o que for o caminho real). A pergunta que essa medida
+  responde é se o checkpoint automático de sessão realmente economiza
+  esse trabalho, não só se a edição em si foi mais rápida.
+
+Registro: uma tabela em `docs/benchmark-fase3.md`, uma linha por
+(tarefa, lado, rodada) — dezoito linhas no total (cinco tarefas × dois
+lados × três rodadas) — rodada manual registrada à mão, não um
+benchmark automatizado de CI; o objetivo é um retrato antes de
+investir mais, não uma suíte de regressão. A política de permissão
+usada durante o benchmark (§5) fica documentada no topo do próprio
+`docs/benchmark-fase3.md`.
+
+### 8. Etapas
+
+Divisão em PRs pequenos, mesmo espírito da fase 2 (2a–2d):
+
+- **3a** — `nas-commands`: `Effect`, `CommandSpec`/`Registry`,
+  `schemars` para o esquema, os nove comandos (§1/§3) chamando direto
+  um `Document`/`Journal` em processo (sem núcleo em segundo plano
+  ainda) — testável isolado.
+- **3b** — núcleo em segundo plano: `nas --daemon`, o socket por
+  projeto em `$XDG_RUNTIME_DIR` (0600), o protocolo mínimo, múltiplos
+  clientes, autostart/encerramento por inatividade/recuperação de
+  socket órfão (§2), e o remapeamento de cursor entre clientes (§2.1,
+  com seu teste de aceite); `nas-term` passa a tentar conectar antes
+  de criar seu próprio núcleo em processo.
+- **3c** — `nas-mcp`: adaptador `rmcp` sobre os nove comandos
+  (incluindo a semântica de `edit` por texto exato, §3), transporte
+  stdio, conectando no núcleo; teste manual com o Claude Code
+  configurado contra ele.
+- **3d** — permissões pelo risco real: o bloqueio no núcleo pra
+  `WriteFile`/`Shell`/`Network`, o prompt na echo area (uma vez/sempre
+  na sessão), o arquivo de configuração pro caso sem interface (§5).
+- **3e** — autoria de sessão: o checkpoint automático por
+  `(agent, session)`, um teste de ponta a ponta provando que `Ctrl+t
+  r` nesse checkpoint desfaz a sessão inteira.
+- **3f** — benchmark comparativo: rodar as cinco tarefas, três vezes
+  por lado, em ordem alternada (§7), escrever
+  `docs/benchmark-fase3.md`.
+
+ACP (§4) fica de fora desta lista de propósito.
+
+## Fora de escopo desta fase
+
+- **ACP** (§4) — ADR própria, depois.
+- **Lisp/Steel embutido** — adiado, não cancelado; o registro de
+  comandos desta fase é Rust puro, sem macro `defcommand`.
+- **Persistir "sempre na sessão" automaticamente** no arquivo de
+  configuração (§5) — por ora é só leitura manual do que o usuário
+  escreveu de antemão.
+- **Fusão inteligente de edições sobrepostas** — §2.1 já define
+  ordem estrita (FIFO) e remapeamento de posição (cursor, e o
+  `edit` por texto exato se protegendo sozinho contra deslocamento);
+  o que fica de fora é qualquer coisa além disso, como mesclar duas
+  edições que alteram exatamente o mesmo trecho ao mesmo tempo — a
+  segunda, nesse caso raro, ainda só se aplica sobre o resultado da
+  primeira, na ordem de chegada, sem tentativa de combinar as duas.
+
+## Consequências
+
+- `CLAUDE.md` precisa de uma atualização (parte do PR de 3a, não
+  desta ADR): `nas-commands` deixa de estar reservada pro "marco 3" —
+  nasce agora; o roteiro do README também precisa registrar a
+  inversão descrita no Contexto.
+- Dois binários novos a partir do mesmo workspace: `nas --daemon`
+  (modo do binário já existente) e `nas-mcp` (crate/binário novo) —
+  nenhuma crate nova além de `nas-commands` e `nas-mcp`.
+- A UI de permissão (§5) reaproveita Prompt/Overlay/echo area que já
+  existem (inclusive o acabamento which-key desta própria PR) — risco
+  baixo sobre o código de interface já estável.
+- Tudo que a ADR 0005 já construiu (checkpoint, diff, restauração,
+  blame, poda, formato em disco) permanece como está — a única
+  superfície nova é registro de comandos + núcleo em segundo plano +
+  MCP + permissões; autoria (§6) é composição do que já existe, não
+  mecanismo novo.
+- `schemars` e `rmcp` são as duas dependências novas desta fase (além
+  do que `nas-mcp`/`nas --daemon` precisarem para o transporte —
+  provavelmente `tokio` já workspace-presente para o lado do socket).
+- `~/.local/state/nas/history/<hash>/` ganha um arquivo novo
+  (`permissions.toml`, §5) — mesma pasta por projeto que a ADR 0005 já
+  criava, sem precisar de uma pasta nova pra configuração.
