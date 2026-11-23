@@ -25,6 +25,12 @@ pub enum CommandError {
     /// `history_dir`) — `show_diff`/`checkpoint_create`/
     /// `checkpoint_restore` precisam dele.
     HistoryUnavailable,
+    /// O caminho, depois de resolvido (`..`, absoluto, links
+    /// simbólicos — `Workspace::resolve`), cai fora da raiz do
+    /// projeto. Nunca revela o caminho resolvido de verdade na
+    /// mensagem — só o que foi pedido, pra não dar a quem pediu uma
+    /// pista do layout de fora da raiz.
+    OutsideRoot(String),
 }
 
 impl fmt::Display for CommandError {
@@ -45,6 +51,9 @@ impl fmt::Display for CommandError {
                 )
             }
             CommandError::HistoryUnavailable => write!(f, "histórico não disponível"),
+            CommandError::OutsideRoot(path) => {
+                write!(f, "{path:?} está fora da raiz do projeto")
+            }
         }
     }
 }
