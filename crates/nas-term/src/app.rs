@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nas_editor::{Document, OpenError, RegionObject};
-use nas_history::{
-    Author, CheckpointManifest, ExcludedReason, FileChange, Journal, OriginalEntry, ProjectId,
-};
+use nas_history::{Author, CheckpointManifest, ExcludedReason, FileChange, Journal, ProjectId};
 use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, SystemAction, Verb};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1337,94 +1335,30 @@ impl App {
     /// A restauração de verdade, depois de resolvida qualquer
     /// confirmação — restaura o **projeto inteiro** pro estado do
     /// checkpoint, não só os arquivos que ele lista
-    /// (docs/decisions/0005 §4, correção):
-    ///
-    /// 1. Cria primeiro um checkpoint automático "antes de restaurar"
-    ///    com o conteúdo atual de **todo arquivo rastreado** (o que
-    ///    torna a própria restauração desfazível por completo —
-    ///    restaurar esse automático desfaz tudo, inclusive os
-    ///    arquivos revertidos ou jogados na lixeira abaixo — sem
-    ///    nenhum código separado).
-    /// 2. Arquivos rastreados que o checkpoint sendo restaurado não
-    ///    lista (tocados pela primeira vez depois dele): revertidos
-    ///    ao conteúdo original, se existiam; jogados na lixeira
-    ///    (nunca apagados de vez), se não existiam ainda.
-    /// 3. Os arquivos que o checkpoint lista: escritos com o conteúdo
-    ///    guardado nele.
-    ///
-    /// Nenhum erro de gravação é ignorado — cada arquivo que falhar
-    /// aparece na mensagem final, com o motivo.
+    /// (docs/decisions/0005 §4/§7). O algoritmo em si (checkpoint
+    /// automático "antes de restaurar", original/lixeira pros
+    /// arquivos fora do checkpoint) é `nas_history::restore` — a
+    /// mesma função que `nas-commands::checkpoint_restore` usa
+    /// (docs/decisions/0006, "restaurar sem duplicação"); `App`
+    /// só sabe escrever num buffer aberto ou direto no disco, via
+    /// `RestoreTarget` (implementado abaixo).
     fn perform_restore(&mut self, history_dir: &Path, checkpoint: &CheckpointManifest) {
-        let tracked = nas_history::list_tracked(history_dir).unwrap_or_default();
-
-        let pre_restore_files: Vec<(String, Vec<u8>)> = tracked
-            .iter()
-            .filter_map(|e| {
-                let content = self.current_content_for(&e.path)?;
-                Some((e.path.clone(), content))
-            })
-            .collect();
-        if !pre_restore_files.is_empty() {
-            let name = format!("antes de restaurar {}", checkpoint.name);
-            let _ = nas_history::create_checkpoint(
-                history_dir,
-                &name,
-                Author::User,
-                nas_history::now_unix(),
-                true,
-                &pre_restore_files,
-            );
-        }
-
-        let mut restored = Vec::new();
-        let mut trashed = Vec::new();
-        let mut skipped = Vec::new();
-        let mut failed = Vec::new();
-
-        let in_checkpoint: HashSet<&str> =
-            checkpoint.files.iter().map(|f| f.path.as_str()).collect();
-        for entry in tracked
-            .iter()
-            .filter(|e| !in_checkpoint.contains(e.path.as_str()))
-        {
-            if !entry.existed {
-                match self.trash_file(&entry.path) {
-                    Ok(()) => trashed.push(entry.path.clone()),
-                    Err(err) => failed.push((entry.path.clone(), err.to_string())),
-                }
-                continue;
-            }
-            restore_tracked_entry(
-                self,
-                history_dir,
-                entry,
-                &mut restored,
-                &mut skipped,
-                &mut failed,
-            );
-        }
-
-        for file in &checkpoint.files {
-            let Some(hash) = &file.content_hash else {
-                skipped.push(file.path.clone());
-                continue;
-            };
-            match read_object_as_text(history_dir, hash) {
-                Some(content) => match self.restore_file(&file.path, &content) {
-                    Ok(()) => restored.push(file.path.clone()),
-                    Err(err) => failed.push((file.path.clone(), err.to_string())),
-                },
-                None => skipped.push(file.path.clone()),
-            }
-        }
+        let report = nas_history::restore(
+            history_dir,
+            checkpoint,
+            Author::User,
+            nas_history::now_unix(),
+            self,
+        )
+        .unwrap_or_default();
 
         self.flush_history();
         self.set_status_message(restore_summary_message(
             &checkpoint.name,
-            &restored,
-            &trashed,
-            &skipped,
-            &failed,
+            &report.restored,
+            &report.trashed,
+            &report.skipped,
+            &report.failed,
         ));
     }
 
@@ -1522,6 +1456,25 @@ impl App {
     }
 }
 
+/// Como `App` escreve durante uma restauração (`nas_history::restore`,
+/// docs/decisions/0006 "restaurar sem duplicação") — `current_content`
+/// e `write` só chamam os métodos que já existiam antes desta etapa
+/// (`current_content_for`/`restore_file`), e `trash` usa o padrão da
+/// trait (que já é `trash_file`, por coincidência de assinatura).
+impl nas_history::RestoreTarget for App {
+    fn current_content(&self, path: &str) -> Option<Vec<u8>> {
+        self.current_content_for(path)
+    }
+
+    fn write(&mut self, path: &str, content: &str) -> io::Result<()> {
+        self.restore_file(path, content)
+    }
+
+    fn trash(&self, path: &str) -> io::Result<()> {
+        self.trash_file(path)
+    }
+}
+
 /// Mensagem de status pra um checkpoint recém-criado — avisa quais
 /// arquivos ficaram de fora de `objects/` (grandes demais ou
 /// não-UTF8), se algum (docs/decisions/0005 §5: "nunca falha
@@ -1538,42 +1491,6 @@ fn files_not_in_checkpoint(history_dir: &Path, checkpoint: &CheckpointManifest) 
         .map(|e| e.path)
         .filter(|p| !in_checkpoint.contains(p.as_str()))
         .collect()
-}
-
-/// O conteúdo de um objeto do histórico como texto — `None` se não
-/// puder ser lido ou não for UTF-8 válido (não deveria acontecer:
-/// objetos só guardam conteúdo que já passou por esse mesmo crivo ao
-/// serem criados, mas um erro de E/S na leitura ainda é possível).
-fn read_object_as_text(history_dir: &Path, hash: &str) -> Option<String> {
-    nas_history::read_object(history_dir, hash)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-}
-
-/// Restaura um arquivo rastreado (não listado pelo checkpoint sendo
-/// restaurado) ao seu conteúdo original, acumulando o resultado num
-/// dos três baldes — usado só pelo caso "existia" de
-/// `App::perform_restore`, o caso "não existia" (lixeira) é tratado
-/// ali mesmo.
-fn restore_tracked_entry(
-    app: &mut App,
-    history_dir: &Path,
-    entry: &OriginalEntry,
-    restored: &mut Vec<String>,
-    skipped: &mut Vec<String>,
-    failed: &mut Vec<(String, String)>,
-) {
-    let Some(hash) = &entry.content_hash else {
-        skipped.push(entry.path.clone());
-        return;
-    };
-    match read_object_as_text(history_dir, hash) {
-        Some(content) => match app.restore_file(&entry.path, &content) {
-            Ok(()) => restored.push(entry.path.clone()),
-            Err(err) => failed.push((entry.path.clone(), err.to_string())),
-        },
-        None => skipped.push(entry.path.clone()),
-    }
 }
 
 /// Mensagem final de uma restauração — nunca esconde o que deu
