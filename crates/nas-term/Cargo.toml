@@ -16,6 +16,7 @@ nas-config = { path = "../nas-config" }
 nas-editor = { path = "../nas-editor" }
 nas-history = { path = "../nas-history" }
 nas-keys = { path = "../nas-keys" }
+nas-mcp = { path = "../nas-mcp" }
 ratatui = "0.29.0"
 tokio = { version = "1.54.1", features = ["rt", "macros"] }
 tracing = "0.1.44"
@@ -23,4 +24,6 @@ tracing-subscriber = "0.3.23"
 
 [dev-dependencies]
 insta = "1.49.0"
+nas-commands = { path = "../nas-commands" }
+serde_json = "1"
 tempfile = "3.27.0"
