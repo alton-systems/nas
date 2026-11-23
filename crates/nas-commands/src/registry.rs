@@ -6,8 +6,11 @@ use crate::context::CommandContext;
 use crate::effect::Effect;
 use crate::error::CommandError;
 
-type RunFn =
-    Box<dyn Fn(&mut CommandContext, serde_json::Value) -> Result<serde_json::Value, CommandError>>;
+type RunFn = Box<
+    dyn Fn(&mut CommandContext, serde_json::Value) -> Result<serde_json::Value, CommandError>
+        + Send
+        + Sync,
+>;
 
 /// Nome, descrição, efeito e esquema de argumentos de um comando —
 /// os quatro metadados do pilar 1 do README — mais a função que o
@@ -54,7 +57,7 @@ pub fn typed_command<A, R, F>(
 where
     A: DeserializeOwned + JsonSchema,
     R: Serialize,
-    F: Fn(&mut CommandContext, A) -> Result<R, CommandError> + 'static,
+    F: Fn(&mut CommandContext, A) -> Result<R, CommandError> + Send + Sync + 'static,
 {
     CommandSpec {
         name,
