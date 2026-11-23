@@ -8,9 +8,16 @@ Editor de texto de terminal em que a IA é um usuário de primeira classe: ela
 entende, usa e reescreve o próprio editor, com cada mudança tipada, permitida
 e reversível. Ver `README.md` para os quatro pilares e o roadmap completo.
 
-**Marco atual: Marco 1 — editor básico utilizável + modal do nas-keys. Sem IA,
-sem Lisp.** Não adiante trabalho dos marcos 2 a 4 (Steel, `defcommand`,
-permissões por efeito, propostas da IA) enquanto o marco 1 não estiver pronto.
+**Marco atual: fase 3 — "a IA trabalha pelo nas"
+(`docs/decisions/0006-ia-trabalha-pelo-nas.md`), em andamento pelas etapas
+3a-3f da própria ADR.** O marco 1 (editor básico + modal do nas-keys) e a
+fase 2 (histórico com autoria, `docs/decisions/0005`) estão prontos. A ADR
+0006 inverteu a ordem original do roteiro abaixo: um registro de comandos
+nativo em Rust (`nas-commands`) e um servidor MCP chegam antes de qualquer
+Lisp/Steel embutido — ver a ADR pelo porquê. Não adiante trabalho de Lisp
+embutido ou ACP (ambos adiados, não cancelados, pela própria ADR 0006)
+enquanto a fase 3 não estiver pronta, a menos que uma ADR própria decida o
+contrário.
 
 ## Decisões fixas (não reabrir sem discutir)
 
@@ -47,15 +54,18 @@ permissões por efeito, propostas da IA) enquanto o marco 1 não estiver pronto.
 
 ```
 crates/
-  nas-term/    # binário: interface ratatui/crossterm, loop de eventos
-  nas-editor/  # estado do editor: documentos, cursores, transações (usa helix-core)
-  nas-keys/    # máquina de estados modal e tradução de layout
+  nas-term/      # binário: interface ratatui/crossterm, loop de eventos
+  nas-editor/    # estado do editor: documentos, cursores, transações (usa helix-core)
+  nas-keys/      # máquina de estados modal e tradução de layout
+  nas-history/   # histórico com autoria, journal, checkpoints (ADR 0005)
+  nas-commands/  # registro de comandos tipados — nome, args, efeito (ADR 0006 §1)
 docs/decisions/  # ADRs — uma nota curta por decisão importante
 spikes/          # protótipos descartáveis, fora do workspace principal
 ```
 
-Crates futuras (não criar antes do marco correspondente): `nas-lisp`
-(marco 2), `nas-commands` (marco 3), `nas-ai` (marco 4).
+Crate futura: `nas-mcp` (etapa 3c, ADR 0006 §3) — servidor MCP sobre o
+registro de `nas-commands`. `nas-lisp`/`nas-ai`, do roteiro original do
+README, ficam sem data — a ADR 0006 adiou o Lisp embutido, não cancelou.
 
 ## Regras de trabalho
 

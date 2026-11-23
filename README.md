@@ -11,18 +11,22 @@ Um editor de texto para o terminal em que a IA é um usuário de primeira classe
 
 ## Roadmap
 
-- **Marco 1 (em andamento):** editor básico utilizável + modal do nas-keys. Sem IA, sem Lisp.
-- **Marco 2:** Steel (Scheme) embutido; uma primitiva do núcleo chamada a partir do Lisp.
-- **Marco 3:** `defcommand` com esquema, docstring e efeitos; geração automática de JSON Schema; atalhos e ajuda derivados do registro.
-- **Marco 4:** a IA propõe uma sequência de comandos, o usuário vê no estilo Sequential e aprova, a transação aplica e pode ser desfeita.
+- **Marco 1 (pronto):** editor básico utilizável + modal do nas-keys.
+- **Fase 2 (pronta):** histórico com autoria, journal e checkpoints nomeados — [`docs/decisions/0005-historico-com-autoria.md`](docs/decisions/0005-historico-com-autoria.md).
+- **Fase 3 (em andamento):** "a IA trabalha pelo nas" — [`docs/decisions/0006-ia-trabalha-pelo-nas.md`](docs/decisions/0006-ia-trabalha-pelo-nas.md). Essa ADR inverteu os marcos 2-4 originais abaixo: um registro de comandos tipados nativo em Rust e um servidor MCP chegam primeiro, sem esperar um interpretador embutido — ver a ADR pelo porquê.
+- ~~Marco 2: Steel (Scheme) embutido~~ — adiado pela ADR 0006, não cancelado; pode voltar como camada de *scripting* do usuário numa fase futura.
+- ~~Marco 3: `defcommand` com esquema, docstring e efeitos~~ — feito de outro jeito, sem Lisp, pela fase 3 (`nas-commands`).
+- ~~Marco 4: a IA propõe uma sequência de comandos~~ — é o que a fase 3 persegue, por MCP em vez de Lisp.
 
 ## Estrutura
 
 ```
 crates/
-  nas-term/    # binário: interface ratatui/crossterm, loop de eventos
-  nas-editor/  # estado do editor: documentos, cursores, transações (usa helix-core)
-  nas-keys/    # máquina de estados modal e tradução de layout
+  nas-term/      # binário: interface ratatui/crossterm, loop de eventos
+  nas-editor/    # estado do editor: documentos, cursores, transações (usa helix-core)
+  nas-keys/      # máquina de estados modal e tradução de layout
+  nas-history/   # histórico com autoria, journal, checkpoints
+  nas-commands/  # registro de comandos tipados — nome, args, efeito
 docs/decisions/  # ADRs
 ```
 
