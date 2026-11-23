@@ -48,6 +48,16 @@ async fn main() -> io::Result<()> {
         return check_config();
     }
 
+    // `--mcp` também sai antes de qualquer coisa que toque o
+    // terminal: sem isso, o panic hook normal (que restaura o
+    // terminal escrevendo códigos ANSI na stdout) e o próprio
+    // `setup_terminal` quebrariam a regra de nunca escrever nada na
+    // stdout além do protocolo MCP (ADR 0006-ia-trabalha-pelo-nas.md
+    // §3, etapa 3c).
+    if std::env::args().any(|arg| arg == "--mcp") {
+        return run_mcp().await;
+    }
+
     // Criado antes de qualquer outra coisa (até do log) pra que o
     // panic hook, instalado logo abaixo, já tenha o mesmo `Arc` que
     // `app` vai usar — um pânico em qualquer ponto depois daqui força
@@ -143,6 +153,42 @@ fn check_config() -> io::Result<()> {
             Err(io::Error::other("configuração inválida"))
         }
     }
+}
+
+/// `nas --mcp`: sobe o servidor MCP (`nas-mcp`) sobre stdio — nunca
+/// abre terminal, nunca instala o panic hook que restaura o
+/// terminal (ADR 0006-ia-trabalha-pelo-nas.md §3, etapa 3c). Logging
+/// continua só em arquivo (`logging::init`, igual ao modo normal); um
+/// pânico aqui só vai pro log, nunca pra stdout.
+///
+/// `--approve-writes` (temporário, só pra testar antes da aprovação
+/// de verdade na etapa 3d — ver a ADR) libera `save_file`
+/// (`Effect::WriteFile`); nunca `Shell`/`Network`, que não têm
+/// comando nenhum ainda.
+async fn run_mcp() -> io::Result<()> {
+    let log_path = logging::init()?;
+    tracing::info!(path = %log_path.display(), "nas --mcp iniciado");
+
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!(%info, "nas --mcp entrou em pânico");
+    }));
+
+    let approve_writes = std::env::args().any(|arg| arg == "--approve-writes");
+    let project = discover_project();
+    let project_root = match &project {
+        Some((project, _)) => project.root().to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let history_dir = project
+        .as_ref()
+        .and_then(|(project, state_home)| project.ensure_history_dir(state_home).ok());
+
+    let options = nas_mcp::McpOptions {
+        project_root,
+        history_dir,
+        approve_writes,
+    };
+    nas_mcp::run_stdio(options).await
 }
 
 /// Abre o documento passado na linha de comando — o primeiro
