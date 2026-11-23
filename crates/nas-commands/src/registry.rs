@@ -111,7 +111,18 @@ impl Registry {
                 effect: spec.effect,
             });
         }
-        spec.run(ctx, args)
+        let result = spec.run(ctx, args);
+        // Flush incondicional ao fim de toda chamada, aqui — um só
+        // lugar, nunca em cada comando que journala — pra que a
+        // autoria da IA nunca fique só na fila em memória se o
+        // processo (nas-mcp, hoje sem núcleo compartilhado) for
+        // encerrado à força entre uma chamada e a próxima. Sem custo
+        // quando não há journal (`journal_mut` devolve `None`) ou a
+        // fila está vazia (`Journal::flush` só escreve se tiver algo).
+        if let Some(journal) = ctx.workspace.journal_mut() {
+            let _ = journal.flush(nas_history::now_unix());
+        }
+        result
     }
 }
 

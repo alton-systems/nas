@@ -144,13 +144,19 @@ pub struct OpenFileArgs {
 #[derive(Debug, Serialize)]
 pub struct OpenFileResult {
     pub path: String,
+    /// Presente se o documento já estava aberto, o disco tinha
+    /// mudado desde a última leitura, e havia alterações não salvas
+    /// — foram descartadas ao recarregar (`Workspace::open_or_resync`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 fn open_file(ctx: &mut CommandContext, args: OpenFileArgs) -> Result<OpenFileResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
-    ctx.workspace.open(&path)?;
+    let warning = ctx.workspace.open_or_resync(&path)?;
     Ok(OpenFileResult {
         path: path.to_string_lossy().into_owned(),
+        warning,
     })
 }
 
@@ -416,26 +422,20 @@ pub struct SaveFileResult {
 /// Grava no disco o que `edit` já mudou em memória — nunca aplica
 /// nenhuma mudança de texto por conta própria. Recusa com
 /// `DiskChanged` se o arquivo mudou no disco desde a última leitura
-/// (`Workspace::sync_with_disk` devolvendo um aviso, não `None`):
-/// salvar por cima perderia o que mudou por fora — nunca sobrescreve
-/// trabalho de outro processo (revisão da etapa 3c). Quem chama
-/// precisa reabrir com `open_file` pra decidir o que fazer com as
-/// duas versões.
-///
-/// Depois de salvar, força o flush do journal — mesmo momento que
-/// `App::save` já usa em `nas-term`. Não há nenhuma mudança de texto
-/// nova pra journalar aqui (editar já journala na hora, ADR 0005
-/// §1); isto só garante que o que já foi registrado por este autor
-/// não fique só na fila em memória.
+/// (`Workspace::sync_with_disk` devolvendo um aviso, não `None`) —
+/// **continua recusando em qualquer tentativa seguinte**, enquanto a
+/// mudança externa não for resolvida (`external_change_pending`,
+/// dentro de `sync_with_disk`): salvar por cima perderia o que mudou
+/// por fora — nunca sobrescreve trabalho de outro processo (revisão
+/// da etapa 3c). Quem chama precisa reabrir com `open_file`
+/// (`Workspace::open_or_resync`, que de fato recarrega e resolve a
+/// pendência) antes de tentar salvar de novo.
 fn save_file(ctx: &mut CommandContext, args: SaveFileArgs) -> Result<SaveFileResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
     if ctx.workspace.sync_with_disk(&path)?.is_some() {
         return Err(CommandError::DiskChanged(path.display().to_string()));
     }
     ctx.workspace.save(&path)?;
-    if let Some(journal) = ctx.workspace.journal_mut() {
-        let _ = journal.flush(nas_history::now_unix());
-    }
     Ok(SaveFileResult {
         path: path.to_string_lossy().into_owned(),
     })
@@ -1079,6 +1079,75 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "mudou por fora",
             "nunca deveria ter sobrescrito a mudança externa"
+        );
+
+        // Tentar de novo, sem nenhuma escrita nova no meio: continua
+        // recusando — a primeira tentativa não pode ter "consumido" a
+        // pendência só por ter conferido o disco (o bug que motivou
+        // este teste: `check_external_change` já atualiza o
+        // mtime/tamanho conhecidos na primeira chamada, então uma
+        // segunda checagem sem mudança nova nenhuma via `None` ali
+        // mesmo com a mudança anterior ainda sem resolver).
+        let err = registry
+            .run(
+                "save_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect_err("devia recusar de novo, sem nenhuma escrita nova no meio");
+        assert!(matches!(err, CommandError::DiskChanged(_)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mudou por fora",
+            "a segunda tentativa também não pode sobrescrever a mudança externa"
+        );
+
+        // `open_file` é a saída que a mensagem de erro indica: traz o
+        // conteúdo do disco, descartando a edição não salva da IA.
+        let opened = registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("reabrir devia funcionar");
+        assert!(
+            opened["warning"].as_str().is_some_and(|w| !w.is_empty()),
+            "reabrir devia avisar que descartou a edição não salva: {opened}"
+        );
+        let read_result = registry
+            .run(
+                "read",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("ler devia funcionar");
+        assert_eq!(read_result["text"], "1 mudou por fora");
+
+        // Com o buffer resincronizado, editar e salvar funcionam —
+        // e preservam o que o outro processo escreveu.
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({
+                    "path": path_str,
+                    "old_text": "mudou por fora",
+                    "new_text": "mudou por fora, e a IA editou por cima",
+                }),
+            )
+            .expect("editar devia funcionar depois de reabrir");
+        registry
+            .run(
+                "save_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("salvar devia funcionar depois de reabrir e editar");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mudou por fora, e a IA editou por cima",
+            "o conteúdo do outro processo devia continuar na base do arquivo final"
         );
     }
 
