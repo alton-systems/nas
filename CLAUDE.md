@@ -59,13 +59,14 @@ crates/
   nas-keys/      # máquina de estados modal e tradução de layout
   nas-history/   # histórico com autoria, journal, checkpoints (ADR 0005)
   nas-commands/  # registro de comandos tipados — nome, args, efeito (ADR 0006 §1)
+  nas-config/    # configuração em camadas: config.toml, keymap.toml (ADR 0007)
+  nas-mcp/       # adaptador MCP (rmcp isolado) sobre nas-commands; nas --mcp (ADR 0006 §3)
 docs/decisions/  # ADRs — uma nota curta por decisão importante
 spikes/          # protótipos descartáveis, fora do workspace principal
 ```
 
-Crate futura: `nas-mcp` (etapa 3c, ADR 0006 §3) — servidor MCP sobre o
-registro de `nas-commands`. `nas-lisp`/`nas-ai`, do roteiro original do
-README, ficam sem data — a ADR 0006 adiou o Lisp embutido, não cancelou.
+`nas-lisp`/`nas-ai`, do roteiro original do README, ficam sem data —
+a ADR 0006 adiou o Lisp embutido, não cancelou.
 
 ## Regras de trabalho
 
