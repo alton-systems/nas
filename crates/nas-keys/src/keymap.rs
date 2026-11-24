@@ -13,7 +13,8 @@ use serde::Deserialize;
 
 use crate::key::Key;
 use crate::machine::{
-    Action, CatalogEntry, CommandTarget, Object, SystemAction, Unit, Verb, plain_motion_for,
+    Action, CatalogEntry, CommandTarget, ModalState, Object, SystemAction, Unit, Verb,
+    plain_motion_for,
 };
 
 /// O keymap embutido no binário — a única fonte de verdade para
@@ -68,10 +69,31 @@ pub enum Binding {
     Repeat,
 }
 
+/// O que [`Keymap::review_resolution`] decidiu sobre uma tecla dentro
+/// do estado `Review` — docs/decisions/0008-modo-de-revisao.md §4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyResolution {
+    /// Resolvida — direto em `[review]`, ou por queda em `[visual]`
+    /// (sem ser uma das ações bloqueadas).
+    Found(Binding),
+    /// A tecla resolveria, em `[visual]`, pra uma ação que não faz
+    /// sentido num buffer somente leitura — bloqueada pelo **nome**
+    /// da ação, não pela tecla.
+    Blocked,
+    /// Nem `[review]` nem `[visual]` têm nada pra esta tecla.
+    None,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Keymap {
     pub insert: HashMap<Key, Binding>,
     pub visual: HashMap<Key, Binding>,
+    /// `[review]` (docs/decisions/0008-modo-de-revisao.md §4): a
+    /// camada do estado `Review`, consultada **antes** de `visual` —
+    /// ver [`Keymap::review_resolution`]. Só declara o que é novo
+    /// (unidades "trecho"/"arquivo", aceitar, rejeitar); nunca uma
+    /// cópia de `visual`.
+    pub review: HashMap<Key, Binding>,
     pub prefixes: HashMap<String, HashMap<Key, Binding>>,
     /// Derivados do próprio `visual` (via
     /// `Action::as_horizontal_object`/`as_vertical_object`), não lidos
@@ -83,6 +105,10 @@ pub struct Keymap {
     objects_word: HashMap<Key, Object>,
     objects_paragraph: HashMap<Key, Object>,
     objects_whole: HashMap<Key, Object>,
+    /// `[objects.hunk]`/`[objects.file]` — a direção (`k`/`l`) que
+    /// completa as unidades "trecho"/"arquivo" de `[review]`.
+    objects_hunk: HashMap<Key, Object>,
+    objects_file: HashMap<Key, Object>,
     commands: HashMap<String, String>,
     system: HashMap<Key, SystemAction>,
     /// Teclas de `[system]` que entram num prefixo nomeado (`Ctrl+t`
@@ -138,7 +164,44 @@ impl Keymap {
         match unit {
             Unit::Word => &self.objects_word,
             Unit::Paragraph => &self.objects_paragraph,
+            Unit::Hunk => &self.objects_hunk,
+            Unit::File => &self.objects_file,
         }
+    }
+
+    /// O que a tecla `key` resolve dentro do estado `Review`
+    /// (docs/decisions/0008-modo-de-revisao.md §4): `[review]` é
+    /// consultada **primeiro**; se não houver nada lá, cai no
+    /// `[visual]` já resolvido — exceto se isso resolver pra um verbo
+    /// (apagar/copiar/recortar), `start-selection`, `select-all`,
+    /// `paste` ou `repeat`, bloqueados **por nome de ação, não por
+    /// tecla física**: um `keymap.toml` que remapeia o verbo "apagar"
+    /// pra outra tecla continua bloqueado em `Review`, porque é o
+    /// nome do comando resolvido que importa, nunca qual tecla o
+    /// usuário escolheu pra ele.
+    pub(crate) fn review_resolution(&self, key: &Key) -> KeyResolution {
+        if let Some(binding) = self.review.get(key) {
+            return KeyResolution::Found(binding.clone());
+        }
+        match self.visual.get(key) {
+            None => KeyResolution::None,
+            Some(Binding::Verb(_)) => KeyResolution::Blocked,
+            Some(Binding::Repeat) => KeyResolution::Blocked,
+            Some(Binding::Action(Action::StartSelection | Action::SelectAll | Action::Paste)) => {
+                KeyResolution::Blocked
+            }
+            Some(binding) => KeyResolution::Found(binding.clone()),
+        }
+    }
+
+    /// As teclas e descrições de `[review]` — a dica which-key
+    /// persistente do estado `Review` (ver
+    /// `Machine::review_hint`).
+    pub(crate) fn hint_for_review(&self) -> Vec<(Key, String)> {
+        self.review
+            .iter()
+            .map(|(key, binding)| (*key, self.describe_binding(binding)))
+            .collect()
     }
 
     /// O comando da classe sistema (Ctrl + tecla) ligado a `key`, se
@@ -297,11 +360,31 @@ impl Keymap {
     /// de virar mapa), depois percorre `self.commands` (a fonte de
     /// verdade de quais nomes existem) consultando esse mapa — nunca o
     /// inverso, que deixaria de fora qualquer nome sem tecla nenhuma.
-    pub(crate) fn catalog(&self) -> Vec<CatalogEntry> {
+    /// **Filtrado por `state`** desde a ADR 0008 §4: nomes que só
+    /// existem em `[review]` (e nas unidades "trecho"/"arquivo") só
+    /// entram quando `state` é `Review` — fora dela não há trecho
+    /// nenhum pra essas ações agirem sobre. Nomes alcançáveis também
+    /// por `[visual]`/sistema/`[prefixes.*]` (globais — ex.:
+    /// `goto-hunk`, em `[prefixes.go]`) continuam em qualquer estado.
+    pub(crate) fn catalog(&self, state: ModalState) -> Vec<CatalogEntry> {
         let mut raw = Vec::new();
         collect_modal_catalog(&self.visual, &[], self, &mut raw);
         collect_object_catalog(self, &mut raw);
         collect_system_catalog(self, &mut raw);
+        let global_names: HashSet<String> = raw.iter().map(|entry| entry.0.clone()).collect();
+
+        let mut review_raw = Vec::new();
+        collect_modal_catalog(&self.review, &[], self, &mut review_raw);
+        collect_review_object_catalog(self, &mut review_raw);
+        let review_only_names: HashSet<String> = review_raw
+            .iter()
+            .map(|entry| entry.0.clone())
+            .filter(|name| !global_names.contains(name))
+            .collect();
+
+        if state == ModalState::Review {
+            raw.extend(review_raw);
+        }
         let shortcuts = shortcut_map(raw);
 
         let prefix_names: HashSet<&str> = self
@@ -315,6 +398,9 @@ impl Keymap {
             .commands
             .keys()
             .filter(|name| !prefix_names.contains(name.as_str()))
+            .filter(|name| {
+                state == ModalState::Review || !review_only_names.contains(name.as_str())
+            })
             .collect();
         names.sort();
 
@@ -416,6 +502,22 @@ fn collect_object_catalog(keymap: &Keymap, out: &mut Vec<RawCatalogEntry>) {
         keymap.objects_whole(),
         keymap.objects_for_unit(Unit::Word),
         keymap.objects_for_unit(Unit::Paragraph),
+    ];
+    for table in tables {
+        for (key, object) in table {
+            out.push((object.command_name().to_string(), vec![*key], false, false));
+        }
+    }
+}
+
+/// Como [`collect_object_catalog`], só que pras unidades exclusivas
+/// de `[review]` ("trecho"/"arquivo") — nunca misturado ao catálogo
+/// global, porque essas direções só fazem sentido com o estado
+/// `Review` (ADR 0008 §4).
+fn collect_review_object_catalog(keymap: &Keymap, out: &mut Vec<RawCatalogEntry>) {
+    let tables = [
+        keymap.objects_for_unit(Unit::Hunk),
+        keymap.objects_for_unit(Unit::File),
     ];
     for table in tables {
         for (key, object) in table {
@@ -558,6 +660,9 @@ struct RawKeymap {
     insert: HashMap<String, RawBinding>,
     #[serde(default)]
     visual: HashMap<String, RawBinding>,
+    /// `[review]` — docs/decisions/0008-modo-de-revisao.md §4.
+    #[serde(default)]
+    review: HashMap<String, RawBinding>,
     #[serde(default)]
     prefixes: HashMap<String, HashMap<String, RawBinding>>,
     #[serde(default)]
@@ -582,6 +687,12 @@ struct RawObjects {
     paragraph: HashMap<String, String>,
     #[serde(default)]
     whole: HashMap<String, String>,
+    /// `[objects.hunk]`/`[objects.file]` — direção que completa as
+    /// unidades de `[review]` (ADR 0008 §4).
+    #[serde(default)]
+    hunk: HashMap<String, String>,
+    #[serde(default)]
+    file: HashMap<String, String>,
 }
 
 impl RawKeymap {
@@ -592,6 +703,7 @@ impl RawKeymap {
         Ok(Keymap {
             insert: resolve_bindings(self.insert)?,
             visual,
+            review: resolve_bindings(self.review)?,
             prefixes: self
                 .prefixes
                 .into_iter()
@@ -602,6 +714,8 @@ impl RawKeymap {
             objects_word: resolve_objects(self.objects.word)?,
             objects_paragraph: resolve_objects(self.objects.paragraph)?,
             objects_whole: resolve_objects(self.objects.whole)?,
+            objects_hunk: resolve_objects(self.objects.hunk)?,
+            objects_file: resolve_objects(self.objects.file)?,
             commands: self.commands,
             system,
             system_prefix_keys,
@@ -749,6 +863,8 @@ fn parse_system_action(name: &str) -> Result<SystemAction, KeymapError> {
         "checkpoint-blame" => SystemAction::CheckpointBlame,
         "history-delete" => SystemAction::HistoryDelete,
         "message-history" => SystemAction::MessageHistory,
+        "review-open" => SystemAction::ReviewOpen,
+        "review-open-picker" => SystemAction::ReviewOpenPicker,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
@@ -757,6 +873,8 @@ fn parse_unit(name: &str) -> Result<Unit, KeymapError> {
     Ok(match name {
         "word" => Unit::Word,
         "paragraph" => Unit::Paragraph,
+        "hunk" => Unit::Hunk,
+        "file" => Unit::File,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
@@ -776,6 +894,10 @@ fn parse_object(name: &str) -> Result<Object, KeymapError> {
         "paragraph-forward" => Object::ParagraphForward,
         "paragraph-backward" => Object::ParagraphBackward,
         "whole-buffer" => Object::WholeBuffer,
+        "hunk-forward" => Object::HunkForward,
+        "hunk-backward" => Object::HunkBackward,
+        "file-forward" => Object::FileForward,
+        "file-backward" => Object::FileBackward,
         _ => return Err(KeymapError::UnknownObject(name.to_string())),
     })
 }
@@ -797,6 +919,9 @@ fn parse_action(name: &str) -> Result<Action, KeymapError> {
         "select-all" => Action::SelectAll,
         "paste" => Action::Paste,
         "open-command-palette" => Action::OpenCommandPalette,
+        "review-accept" => Action::ReviewAccept,
+        "review-reject" => Action::ReviewReject,
+        "goto-hunk" => Action::GotoHunk,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
@@ -1000,7 +1125,7 @@ z = "move-right"
     #[test]
     fn catalogo_inclui_acao_direta_verbo_unidade_e_prefixo_resolvido() {
         let keymap = Keymap::default_keymap();
-        let catalog = keymap.catalog();
+        let catalog = keymap.catalog(ModalState::Visual);
 
         let find = |name: &str| catalog.iter().find(|entry| entry.name == name);
 
@@ -1037,7 +1162,7 @@ z = "move-right"
         // objeto) — exceto "current-line", que não tem tabela
         // nenhuma (é "o verbo repetido"), então aparece sem atalho.
         let keymap = Keymap::default_keymap();
-        let catalog = keymap.catalog();
+        let catalog = keymap.catalog(ModalState::Visual);
         let find = |name: &str| catalog.iter().find(|entry| entry.name == name);
         let names: Vec<&str> = catalog.iter().map(|entry| entry.name.as_str()).collect();
 
@@ -1066,7 +1191,7 @@ z = "move-right"
     #[test]
     fn catalogo_classe_sistema_ctrl_so_na_primeira_tecla() {
         let keymap = Keymap::default_keymap();
-        let catalog = keymap.catalog();
+        let catalog = keymap.catalog(ModalState::Visual);
 
         let save = catalog
             .iter()
@@ -1092,8 +1217,8 @@ z = "move-right"
     #[test]
     fn catalogo_e_deterministico_e_sem_nomes_duplicados() {
         let keymap = Keymap::default_keymap();
-        let first = keymap.catalog();
-        let second = keymap.catalog();
+        let first = keymap.catalog(ModalState::Visual);
+        let second = keymap.catalog(ModalState::Visual);
         assert_eq!(
             first, second,
             "duas chamadas deveriam devolver a mesma lista"
@@ -1129,7 +1254,7 @@ z = "move-right"
         .expect("keymap válido sem o 'z' de history-delete");
 
         let entry = keymap
-            .catalog()
+            .catalog(ModalState::Visual)
             .into_iter()
             .find(|entry| entry.name == "history-delete")
             .expect("history-delete deveria continuar no catálogo");

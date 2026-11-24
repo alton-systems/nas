@@ -94,7 +94,8 @@ pub fn read_marks(history_dir: &Path) -> io::Result<Vec<ReviewMark>> {
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            serde_json::from_str(line).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+            serde_json::from_str(line)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
         })
         .collect()
 }
@@ -102,7 +103,10 @@ pub fn read_marks(history_dir: &Path) -> io::Result<Vec<ReviewMark>> {
 /// As marcas já registradas para uma revisão específica (um
 /// `from_checkpoint`) — o que `Ctrl+t v`/`Ctrl+t V` cruzam contra os
 /// trechos recalculados ao reabrir (ADR 0008 §5).
-pub fn marks_for_checkpoint(history_dir: &Path, checkpoint_id: &str) -> io::Result<Vec<ReviewMark>> {
+pub fn marks_for_checkpoint(
+    history_dir: &Path,
+    checkpoint_id: &str,
+) -> io::Result<Vec<ReviewMark>> {
     Ok(read_marks(history_dir)?
         .into_iter()
         .filter(|mark| mark.from_checkpoint == checkpoint_id)
@@ -133,7 +137,8 @@ pub fn read_log_entries(history_dir: &Path) -> io::Result<Vec<ReviewLogEntry>> {
         .lines()
         .filter(|line| !line.is_empty())
         .map(|line| {
-            serde_json::from_str(line).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+            serde_json::from_str(line)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
         })
         .collect()
 }
@@ -149,7 +154,13 @@ pub fn read_log_entries(history_dir: &Path) -> io::Result<Vec<ReviewLogEntry>> {
 /// `update` do tamanho em bytes little-endian, depois o conteúdo) —
 /// evita qualquer ambiguidade de um delimitador que apareça dentro do
 /// próprio texto "antes"/"depois".
-pub fn hunk_hash(path: &str, checkpoint_id: &str, before: &str, after: &str, before_start_line: usize) -> String {
+pub fn hunk_hash(
+    path: &str,
+    checkpoint_id: &str,
+    before: &str,
+    after: &str,
+    before_start_line: usize,
+) -> String {
     let mut hasher = Sha256::new();
     for field in [path, checkpoint_id, before, after] {
         hasher.update((field.len() as u64).to_le_bytes());

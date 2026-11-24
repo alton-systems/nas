@@ -87,8 +87,36 @@ SPC = { prefix = "leader" }
 [prefixes.go]
 g = "move-buffer-start"
 l = "prompt-goto-line"
+# "h" ("ir até o trecho atual") compõe o prefixo "ir para" com o
+# radical "trecho" (docs/decisions/0008-modo-de-revisao.md §4) — sem
+# efeito fora da revisão, que é a única tabela onde "trecho" existe
+# como unidade.
+h = "goto-hunk"
 # "c" (ir para uma posição em caracteres) e "f" (ir para a definição de
 # uma função, via LSP) ficam reservados — ver docs/keys.md §4.9.
+
+# Camada do estado Review (docs/decisions/0008-modo-de-revisao.md §4):
+# consultada ANTES de [visual] enquanto o estado é Review — o que não
+# estiver aqui cai no [visual] já resolvido (com o keymap.toml do
+# usuário aplicado). Só o que é novo, ou precisa ser bloqueado por não
+# fazer sentido num buffer somente leitura (verbos, seleção/colar,
+# repetir — bloqueados por NOME de ação, não por tecla, em
+# Keymap::review_resolution; não aparecem aqui porque o bloqueio não é
+# dado, é lógica). "u" não é uma tecla nova — redefine o "desfazer" de
+# sempre com o alvo "o trecho atual" em vez de "a última transação".
+[review]
+RET = "review-accept"
+u = "review-reject"
+h = { unit = "hunk" }
+H = { unit = "file" }
+
+[objects.hunk]
+k = "hunk-forward"
+l = "hunk-backward"
+
+[objects.file]
+k = "file-forward"
+l = "file-backward"
 
 [prefixes.leader]
 SPC = "enter-sequential"
@@ -126,6 +154,11 @@ e = "checkpoint-diff"
 r = "checkpoint-restore"
 a = "checkpoint-blame"
 m = "message-history"
+# "v" abre a revisão direto, no padrão; Shift ("V") leva a ação ao seu
+# extremo — mostra a lista de checkpoints pra escolher, em vez do
+# caminho direto (docs/decisions/0008-modo-de-revisao.md §1/§4).
+v = "review-open"
+V = "review-open-picker"
 z = { action = "history-delete", destructive = true }
 
 [commands]
@@ -187,3 +220,19 @@ checkpoint-restore = "restaurar checkpoint"
 checkpoint-blame = "autoria (histórico do arquivo)"
 history-delete = "apagar histórico do projeto"
 message-history = "histórico de mensagens"
+review-open = "revisar a sessão de IA mais recente"
+review-open-picker = "revisar — escolher o checkpoint"
+review = "revisão"
+review-accept = "aceitar o trecho"
+review-reject = "rejeitar o trecho"
+review-next-hunk = "próximo trecho"
+review-prev-hunk = "trecho anterior"
+review-next-file = "próximo arquivo"
+review-prev-file = "arquivo anterior"
+hunk = "trecho"
+file = "arquivo"
+hunk-forward = "até o próximo trecho"
+hunk-backward = "até o trecho anterior"
+file-forward = "até o próximo arquivo"
+file-backward = "até o arquivo anterior"
+goto-hunk = "ir até o trecho atual"
