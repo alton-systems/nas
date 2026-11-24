@@ -310,15 +310,27 @@ O nas ainda não tem janelas: `Alt+direção` fica só documentado — ver
 | `Shift+Espaço` | abre a paleta de comandos — só no Visual; depende do protocolo de teclado do Kitty (`supports_keyboard_enhancement`) pra distinguir de um `Espaço` comum |
 | `Espaço p` | abre a mesma paleta, em qualquer terminal — a entrada que funciona sem o protocolo do Kitty |
 
+A lista é **todo** nome de `[commands]` do keymap (já com o keymap do
+usuário aplicado) — não só os que têm um atalho. Um comando sem
+atalho (por natureza, como "a linha atual" — só existe como "o verbo
+repetido", nunca uma tecla própria; ou porque o usuário removeu a
+única tecla dele em `keymap.toml`, `chave = false`, docs/config.md)
+aparece com a coluna da tecla vazia, e `Enter` ainda executa: como
+não há tecla pra repetir, a paleta despacha a ação diretamente. Um
+comando destrutivo (ex.: apagar o histórico do projeto) usa a mesma
+cor de alerta que o which-key já usa pra isso, com um `!` de prefixo.
+
 Com a paleta aberta: `↑`/`↓` movem a seleção na lista (dando a volta
-nas duas pontas), `Enter` executa o comando selecionado — exatamente
-como apertar a tecla dele, incluindo abrir um prompt se o comando
-pedir algo (ex.: "ir para uma linha") — e `Esc` fecha sem executar
-nada. Qualquer outra tecla normal entra na busca (aproximada, por
-nome ou descrição, sem diferenciar acentos nem maiúsculas); nenhuma
-tecla chega à máquina modal enquanto a paleta está ativa, do mesmo
-jeito que um prompt (regra 8, "a dica which-key segue a mesma ideia
-de camada por cima da barra de status").
+nas duas pontas), `Enter` executa o comando selecionado — com atalho,
+exatamente como apertar a tecla dele, incluindo abrir um prompt se o
+comando pedir algo (ex.: "ir para uma linha") ou armar um verbo/
+unidade pendente que uma tecla seguinte completa normalmente (e que
+`.` continua repetindo depois, como sempre) — e `Esc` fecha sem
+executar nada. Qualquer outra tecla normal entra na busca (aproximada,
+por nome ou descrição, sem diferenciar acentos nem maiúsculas);
+nenhuma tecla chega à máquina modal enquanto a paleta está ativa, do
+mesmo jeito que um prompt (regra 8, "a dica which-key segue a mesma
+ideia de camada por cima da barra de status").
 
 Em `Espaço`, no líder, `p` é livre pra isto: diferente do `p`
 sozinho em `[visual]` (reservado pra "dentro de"/"em volta de", §6),
