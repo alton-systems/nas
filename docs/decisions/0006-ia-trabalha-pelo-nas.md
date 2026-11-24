@@ -535,7 +535,7 @@ nos dois: o nas segue como editor, fase 3 continua pelas etapas
 seguintes (§8). Falhou em qualquer um dos dois: pivô — o nas deixa de
 perseguir ser um editor de propósito geral competitivo em eficiência
 de edição, e passa a focar em histórico e supervisão sobre o que a IA
-já faz direto, em vez de MCP de edição (ver Visão e plano).
+já faz direto, em vez de MCP de edição.
 
 Registro: uma tabela em `docs/benchmark-fase3.md`, uma linha por
 (tarefa, lado, rodada) — dezoito linhas no total (cinco tarefas × dois
@@ -552,10 +552,11 @@ usada durante o benchmark (§5) fica documentada no topo do próprio
 Divisão em PRs pequenos, mesmo espírito da fase 2 (2a–2d). **Os
 nomes (3a, 3b, ...) identificam a etapa, não a ordem de execução** —
 a ordem real, revisada, é **3a → 3c → paleta de comandos (fora da
-fase 3) → 3d → 3e → 3f-prep → 3f (benchmark) → decisão → 3b (núcleo
-em segundo plano) → 3g**, com janelas e modo de notas — também fora
-da fase 3 — só depois do ponto de decisão (ver abaixo). O daemon (3b)
-virou a penúltima, não a segunda: é a etapa mais cara desta fase
+fase 3) → 3d → 3e → revisão → 3f-prep → 3f (benchmark) → decisão →
+3b (núcleo em segundo plano) → 3g**, com janelas e modo de notas —
+também fora da fase 3 — só depois do ponto de decisão (ver abaixo).
+O daemon (3b) virou a penúltima, não a segunda: é a etapa mais cara
+desta fase
 (processo novo, protocolo entre processos, autostart, remapeamento
 de cursor entre clientes) e nada que o benchmark do §7 mede depende
 dela — `nas-mcp` já funciona sem ela (ver a ressalva em 3c, abaixo).
@@ -597,6 +598,33 @@ depois.
 - **3e** — autoria de sessão: o checkpoint automático por
   `(agent, session)`, um teste de ponta a ponta provando que `Ctrl+t
   r` nesse checkpoint desfaz a sessão inteira.
+- **revisão** — uma tela pra revisar o trabalho de uma sessão de IA
+  (ou de um período) antes de confiar nele, trecho a trecho:
+  - um buffer único com todos os trechos alterados, de todos os
+    arquivos tocados na sessão (ou no período escolhido), cada um com
+    antes/depois, arquivo, linha e autor;
+  - navegação trecho a trecho, com três ações por trecho: aceitar
+    (marca como revisado), rejeitar (desfaz só aquele trecho —
+    recusa, com aviso, se o trecho mudou depois da edição da IA, do
+    mesmo jeito que `edit` já recusa uma edição sobre texto que não é
+    mais o que a IA viu, §3) e ir até o arquivo, naquela linha;
+  - "antes" vem do checkpoint automático da sessão (3e); a autoria,
+    do journal (ADR 0005 §1) — nada novo pra guardar, só exibição
+    sobre o que já existe. Comparar contra o último commit do Git,
+    em vez do checkpoint da sessão, fica como base opcional, pra
+    revisar tudo que mudou desde o último commit, não só desde a
+    sessão atual.
+  - diff unificado primeiro (não depende de janelas, §8); lado a
+    lado fica pra depois, quando o nas tiver janelas (fora da fase
+    3, só depois da decisão, acima).
+
+  **Motivo**: vale nos dois desfechos do benchmark (3f) — se passar,
+  é parte do produto que a fase 3 está construindo; se falhar e o
+  foco pivotar pra histórico e supervisão em vez de MCP de edição,
+  a revisão **é** esse produto, não trabalho perdido. Também dá uma
+  métrica de controle que o §7 ainda não media: quanto tempo leva
+  pra revisar o trabalho de uma sessão de IA inteira, não só pra
+  desfazê-la.
 - **3f-prep** — eficiência das ferramentas do MCP (§3): ajustes nas
   ferramentas existentes antes de medi-las no benchmark (3f), porque
   cada ferramenta nova ocupa contexto em toda mensagem — por isso o
