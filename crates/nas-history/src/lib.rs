@@ -42,8 +42,9 @@ pub use author::Author;
 pub use checkpoint::{
     CheckpointFile, CheckpointManifest, CreatedCheckpoint, ExcludedFile, ExcludedReason,
     FileChange, FileDiff, MAX_AUTOMATIC_CHECKPOINTS, MAX_FILE_SIZE, MAX_TOTAL_SIZE_BYTES,
-    PruneReport, create as create_checkpoint, diff, diff_against_current, hash_content,
-    list as list_checkpoints, prune, prune_with_limits, read_object,
+    PruneReport, TextHunk, create as create_checkpoint, diff, diff_against_current,
+    file_text_at_checkpoint, hash_content, list as list_checkpoints, prune, prune_with_limits,
+    read_object, text_hunks,
 };
 pub use journal::{Journal, JournalEntry, file_history, journal_path, now_unix, read_entries};
 pub use last_save::{LastSave, get_last_save, record_last_save};
