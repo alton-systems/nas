@@ -30,6 +30,7 @@ mod checkpoint;
 mod journal;
 mod lock;
 mod originals;
+mod permissions;
 mod project;
 mod restore;
 mod trash;
@@ -43,6 +44,12 @@ pub use checkpoint::{
 };
 pub use journal::{Journal, JournalEntry, file_history, journal_path, now_unix, read_entries};
 pub use originals::{OriginalEntry, ensure_tracked, get as get_tracked, list as list_tracked};
+pub use permissions::{
+    PermissionDecision, PermissionDecisionEntry, PermissionSource, PermissionsError,
+    PermissionsPolicy, ensure_template as ensure_permissions_template, load as load_permissions,
+    permission_log_path, permissions_path, read_decisions as read_permission_decisions,
+    record_decision as record_permission_decision,
+};
 pub use project::{ProjectId, delete_project_history, state_home};
 pub use restore::{RestoreReport, RestoreTarget, restore};
 pub use trash::move_to_trash;

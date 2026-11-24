@@ -22,3 +22,21 @@ pub enum Effect {
     Shell,
     Network,
 }
+
+impl Effect {
+    /// Só `WriteFile`, `Shell` e `Network` pedem aprovação (ADR 0006
+    /// §5) — os três que `permissions.toml` pode liberar
+    /// (`crate::permission::allowed_by_policy`), e os únicos cujo
+    /// nome aparece no journal de decisões
+    /// (`nas_history::PermissionDecisionEntry::effect`). `None` pros
+    /// demais: nunca pedem aprovação, então nunca têm uma chave de
+    /// política.
+    pub fn policy_key(self) -> Option<&'static str> {
+        match self {
+            Effect::WriteFile => Some("write-file"),
+            Effect::Shell => Some("shell"),
+            Effect::Network => Some("network"),
+            Effect::Pure | Effect::ReadFile | Effect::WriteBuffer | Effect::WriteHistory => None,
+        }
+    }
+}

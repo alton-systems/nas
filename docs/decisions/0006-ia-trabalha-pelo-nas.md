@@ -375,40 +375,68 @@ própria tecla).
   projeto. Isso cobre `create_file`, `checkpoint_restore` e
   `save_file` entre os dez comandos de §1 — `checkpoint_create` não,
   pela razão acima.
-  **`--approve-writes` (revisão da etapa 3c, temporário)**: até esta
-  etapa existir de verdade, `nas --mcp --approve-writes` é o único
-  jeito de liberar `WriteFile` (nunca `Shell`/`Network`, que não têm
-  comando nenhum ainda) — pensada só pra testar o resto do fluxo
-  (`save_file` incluído) antes de 3d existir; desligada por padrão, e
-  este parágrafo marca que a flag **deve ser removida ou substituída**
-  pela interface de aprovação de verdade quando 3d for implementada,
-  nunca conviver com ela como uma segunda porta.
-- **Interface aberta**: o núcleo manda um pedido de permissão pra todo
-  cliente `nas-term` conectado e **bloqueia** aquele comando até
-  decidir (com um tempo limite — alguns minutos — que nega
-  automaticamente; nunca aplica por silêncio, nunca trava o agente pra
-  sempre). `nas-term` mostra isso na echo area, reaproveitando o
-  mesmo mecanismo which-key desta própria PR: um título com o agente e
-  o comando, e as opções **uma vez**, **sempre na sessão** e qualquer
-  outra tecla cancela (nega) — mesmo padrão de "qualquer tecla fecha"
-  que já existe pros overlays. "Sempre na sessão" vale só pelo resto
-  daquela sessão daquele agente (o par `agent`+`session` de
-  `Author::Ai`, §6) — nunca é escrito em disco automaticamente; uma
-  nova sessão de IA sempre pergunta de novo.
-- **Interface fechada**: não existe ninguém pra perguntar. O núcleo
+  **`--approve-writes` (revisão da etapa 3c, temporário)**: até a
+  etapa 3d existir de verdade, `nas --mcp --approve-writes` foi o
+  único jeito de liberar `WriteFile` (nunca `Shell`/`Network`, que não
+  têm comando nenhum ainda) — pensada só pra testar o resto do fluxo
+  (`save_file` incluído) antes de 3d existir. **Removida na própria
+  etapa 3d** (ver abaixo), substituída pelo arquivo de política —
+  nunca conviveu com ele como uma segunda porta.
+- **Interface aberta — revisão da etapa 3d: passa pra 3b.** A ideia
+  original abaixo (pedido bloqueante com echo area, "uma vez"/"sempre
+  na sessão") depende do `nas-term` e do processo que roda os
+  comandos da IA estarem **conectados** — hoje (3c/3d, sem núcleo em
+  segundo plano) não estão: cada um mantém seu próprio `Workspace` em
+  processo, sem nada pra notificar. Essa conexão só passa a existir
+  com o daemon (§2, etapa 3b) — é lá que esta interface entra, não em
+  3d. O texto abaixo é o design que 3b implementa quando chegar lá,
+  não o que 3d entrega:
+  o núcleo manda um pedido de permissão pra todo cliente `nas-term`
+  conectado e **bloqueia** aquele comando até decidir (com um tempo
+  limite — alguns minutos — que nega automaticamente; nunca aplica por
+  silêncio, nunca trava o agente pra sempre). `nas-term` mostra isso na
+  echo area, reaproveitando o mesmo mecanismo which-key da paleta de
+  comandos: um título com o agente e o comando, e as opções **uma
+  vez**, **sempre na sessão** e qualquer outra tecla cancela (nega) —
+  mesmo padrão de "qualquer tecla fecha" que já existe pros overlays.
+  "Sempre na sessão" vale só pelo resto daquela sessão daquele agente
+  (o par `agent`+`session` de `Author::Ai`, §6) — nunca é escrito em
+  disco automaticamente; uma nova sessão de IA sempre pergunta de novo.
+- **Interface fechada — o que a etapa 3d de fato implementa.** Sem
+  núcleo em segundo plano (3b não existe ainda) e sem ninguém do
+  `nas-term` pra perguntar, 3d entrega só o arquivo: `nas --mcp`
   consulta um arquivo de configuração por projeto
   (`~/.local/state/nas/history/<hash>/permissions.toml` — ao lado do
   `journal.jsonl` e dos `checkpoints/` já existentes da ADR 0005,
   **não** em `$XDG_RUNTIME_DIR`: é configuração que precisa sobreviver
   a reiniciar a máquina, diferente do socket do núcleo, §2), que o
-  usuário mantém manualmente de antemão, liberando os efeitos que
-  confia rodar sem supervisão (`write-file`, `shell`, `network`, algum
-  ou nenhum).
+  usuário mantém manualmente de antemão (`nas --permissions` mostra o
+  caminho e cria um modelo comentado, com tudo negado, se ainda não
+  existir), liberando os efeitos que confia rodar sem supervisão
+  (`write-file`, `shell`, `network`, algum ou nenhum).
   Um efeito sem entrada nesse arquivo é **negado direto**, com um erro
-  claro de volta pro agente — nunca aplica por padrão, nunca finge
-  sucesso. Persistir "sempre na sessão" de uma sessão atendida nesse
-  arquivo fica fora desta fase (ver "Fora de escopo") — por ora é só
-  leitura manual.
+  claro de volta pro agente dizendo o que falta e como liberar (`nas
+  --permissions`) — nunca aplica por padrão, nunca finge sucesso. Um
+  arquivo inválido nega **tudo**, com o motivo na mensagem (mesma
+  ideia de configuração recuperável da ADR 0007 §3). Cada pedido —
+  negado ou aprovado — é registrado em
+  `~/.local/state/nas/history/<hash>/permissions_log.jsonl` (quem
+  pediu, o comando, o efeito, a decisão e, numa aprovação, se veio do
+  arquivo, de uma pergunta ou de "sempre na sessão" — hoje sempre
+  "arquivo", única fonte que existe).
+  **A pergunta interativa (item (b) do plano original desta etapa) e
+  "sempre na sessão" ficam de fora de 3d, de propósito**: ambas
+  dependem de `elicitation` do MCP, e o `rmcp` fixado neste workspace
+  (`0.3`, ver `Cargo.toml` raiz) não suporta `elicitation` — o recurso
+  só existe em versões bem posteriores (major `1.0+`) da própria
+  crate. O cliente (Claude Code) já suporta desde a versão `2.1.76`;
+  o bloqueio é só do lado da biblioteca Rust. Confirmado antes de
+  implementar, como pedido: nenhuma das duas partes (arquivo de
+  política sozinho, ou arquivo + pergunta) ficou pra trás por decisão
+  de projeto — é a biblioteca pinada que não dá. Migrar `rmcp` pra uma
+  versão com suporte é uma mudança grande (salto de major version,
+  API bem diferente da 0.3) — fica como trabalho futuro, com uma ADR
+  ou decisão própria quando for feita, não parte de 3d.
 - **O benchmark do §7 usa uma política explícita**: pra rodar as
   tarefas sem travar em cada aprovação, o arquivo de configuração do
   benchmark libera exatamente os efeitos que as tarefas escolhidas
@@ -587,14 +615,21 @@ depois.
   nesta lista só pra marcar a ordem real entre entregas do projeto —
   fica entre 3c e 3d no calendário, sem ganhar uma etapa "3-algo"
   nova nem escopo detalhado aqui.
-- **3d** — permissões pelo risco real: o bloqueio pra
-  `WriteFile`/`Shell`/`Network`, o prompt na echo area (uma vez/sempre
-  na sessão), o arquivo de configuração pro caso sem interface (§5).
-  Sem o núcleo em segundo plano ainda, o bloqueio é dentro do próprio
-  processo `nas --mcp` (síncrono com a chamada MCP), não num núcleo
-  compartilhado — mesma ressalva de 3c. **Remove ou substitui
-  `--approve-writes`** (a flag temporária de 3c, §5) pela interface de
-  aprovação de verdade — a flag não sobrevive a esta etapa.
+- **3d** (pronta) — permissões pelo risco real: o bloqueio pra
+  `WriteFile`/`Shell`/`Network`, feito dentro do próprio processo
+  `nas --mcp` (síncrono com a chamada MCP, sem núcleo em segundo plano
+  ainda — mesma ressalva de 3c). Entrega **(a)** o arquivo de política
+  por projeto (`permissions.toml`, `nas --permissions`) e o registro
+  de cada decisão (`permissions_log.jsonl`) — §5. **Não entrega (b)**
+  a pergunta interativa via `elicitation`, nem "sempre na sessão": o
+  `rmcp` fixado neste workspace (`0.3`) não suporta `elicitation`
+  ainda (confirmado antes de implementar, conforme pedido) — fica
+  registrado em §5 como trabalho futuro, junto da migração de versão
+  que destravaria isso. O prompt na echo area do `nas-term` (que
+  dependia de nas-term/MCP conectados) **passa pra 3b** — não é mais
+  parte de 3d. **Remove `--approve-writes`** (a flag temporária de 3c,
+  §5), substituída pelo arquivo de política — a flag não sobrevive a
+  esta etapa.
 - **3e** — autoria de sessão: o checkpoint automático por
   `(agent, session)`, um teste de ponta a ponta provando que `Ctrl+t
   r` nesse checkpoint desfaz a sessão inteira.
@@ -661,7 +696,11 @@ depois.
   socket órfão (§2), e o remapeamento de cursor entre clientes (§2.1,
   com seu teste de aceite); `nas-term` e `nas-mcp` passam a tentar
   conectar antes de cada um criar seu próprio núcleo em processo —
-  é aqui que a ressalva de 3c deixa de valer.
+  é aqui que a ressalva de 3c deixa de valer. **Também aqui** (revisão
+  da etapa 3d, §5): a interface aberta de permissões — pedido
+  bloqueante com tempo limite, echo area do `nas-term` com "uma
+  vez"/"sempre na sessão" — que 3d não entregou porque dependia
+  justamente desta conexão `nas-term`↔núcleo não existir ainda.
 - **3g** — unificação do despacho de comandos (§1): depois que as
   etapas acima provarem o formato do registro na prática, decidir e
   implementar como `nas-keys` passa a resolver (pelo menos parte das)

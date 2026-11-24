@@ -1,3 +1,4 @@
+use nas_history::Author;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -105,7 +106,10 @@ impl Registry {
         let spec = self
             .get(name)
             .ok_or_else(|| CommandError::UnknownCommand(name.to_string()))?;
-        if needs_approval(spec.effect) && !ctx.approved_effects.contains(&spec.effect) {
+        if needs_approval(spec.effect)
+            && matches!(ctx.author, Author::Ai { .. })
+            && !ctx.approved_effects.contains(&spec.effect)
+        {
             return Err(CommandError::NeedsApproval {
                 command: name.to_string(),
                 effect: spec.effect,
@@ -129,10 +133,11 @@ impl Registry {
 /// Efeitos que pedem aprovação pelo risco real (ADR 0006 §5):
 /// `Pure`, `ReadFile`, `WriteBuffer` e `WriteHistory` rodam direto —
 /// só `WriteFile`, `Shell` e `Network` tocam o disco de verdade ou
-/// saem do projeto. A aprovação de verdade (prompt na echo area,
-/// "uma vez"/"sempre") é a etapa 3d; até lá, este é o único jeito de
-/// um comando desses dois rodar — `ctx.approved_effects` precisa já
-/// ter o efeito (ver `CommandContext`).
+/// saem do projeto, e só quando quem chama é um agente de IA
+/// (`Author::Ai` — ações do usuário nunca passam por aqui). Quem
+/// decide se o efeito está de fato liberado (política do projeto,
+/// etapa 3d) é quem chama `Registry::run`, não este `Registry` —
+/// `ctx.approved_effects` já precisa ter o efeito antes desta chamada.
 fn needs_approval(effect: Effect) -> bool {
     matches!(effect, Effect::WriteFile | Effect::Shell | Effect::Network)
 }

@@ -15,10 +15,15 @@ confundir com defeito):
   mesma detecção de mudança externa de sempre (`docs/decisions/0005`
   §1): se o buffer dele estiver limpo, recarrega sozinho; se tiver
   alterações, avisa e espera `Ctrl+r`.
-- **Sem aprovação de verdade (até a etapa 3d).** Qualquer comando com
-  efeito `WriteFile`/`Shell`/`Network` é recusado por padrão, com um
-  erro dizendo que a aprovação chega na etapa 3d. `--approve-writes`
-  (abaixo) é a única válvula de escape — temporária, só pra testar.
+- **Sem pergunta interativa (`elicitation`) ainda.** O `rmcp` fixado
+  neste workspace (`0.3`) não suporta `elicitation` — só chegou em
+  versões bem posteriores (major `1.0+`). Até o workspace migrar pra
+  uma versão que suporte (e o cliente MCP também — o Claude Code
+  suporta desde a versão `2.1.76`), o único jeito de liberar
+  `WriteFile`/`Shell`/`Network` é de antemão, pelo arquivo de política
+  (`nas --permissions`, abaixo) — nunca uma pergunta no meio da
+  sessão, nem "sempre nesta sessão" (ADR 0006 §5, revisão da etapa
+  3d).
 - **Sem checkpoint automático de sessão (até a etapa 3e).** Cada
   sessão de IA ainda não ganha um checkpoint próprio no começo; use
   `checkpoint_create` manualmente se quiser um ponto pra voltar antes
@@ -33,13 +38,6 @@ lançando o comando como subprocesso:
 claude mcp add nas -- /caminho/para/nas --mcp
 ```
 
-Pra liberar `save_file` enquanto a etapa 3d (aprovação de verdade)
-não existe:
-
-```sh
-claude mcp add nas -- /caminho/para/nas --mcp --approve-writes
-```
-
 O servidor descobre a raiz do projeto do mesmo jeito que o histórico
 (`docs/decisions/0005` §6: raiz do Git, ou o diretório onde foi
 iniciado) — registre o comando a partir do diretório do projeto, ou
@@ -47,6 +45,44 @@ confira que o Claude Code inicia o subprocesso lá.
 
 Confirme com `claude mcp list` — o nas deve aparecer como `connected`
 depois da primeira chamada.
+
+## Permissões
+
+`open_file`, `read`, `search`, `list_files`, `edit` e
+`checkpoint_create` rodam direto — são `Pure`, `ReadFile`,
+`WriteBuffer` ou `WriteHistory` (ADR 0006 §5): nenhum toca o disco do
+projeto de verdade, nem sai dele. `create_file`, `checkpoint_restore`
+e `save_file` são `WriteFile` — pedem aprovação.
+
+A aprovação, nesta etapa, vem só de um arquivo:
+
+```sh
+nas --permissions
+```
+
+Mostra o caminho de `permissions.toml` deste projeto (fora do
+repositório, em `~/.local/state/nas/history/<hash>/`, nunca dentro
+dele — nada no projeto pode se autoaprovar) e a política atual; cria
+um modelo comentado, com tudo negado, se ainda não existir. Edite o
+arquivo à mão e marque `true` o que quiser liberar:
+
+```toml
+write-file = true
+shell = false
+network = false
+```
+
+Sem o arquivo, ou com o efeito marcado `false` (ou ausente), o
+comando é recusado com um erro claro dizendo o que falta e como
+liberar. Um arquivo inválido (TOML malformado, chave desconhecida,
+valor que não é booleano) nega **tudo**, com o motivo na própria
+mensagem — nunca aplica a metade que deu certo (mesma ideia de
+configuração recuperável da `docs/decisions/0007` §3). Cada pedido —
+negado ou aprovado — é registrado em
+`~/.local/state/nas/history/<hash>/permissions_log.jsonl`.
+
+Não existe ainda uma pergunta interativa no meio da sessão (ver a
+limitação no topo deste documento) — só o arquivo, lido de antemão.
 
 ## Como testar à mão
 
