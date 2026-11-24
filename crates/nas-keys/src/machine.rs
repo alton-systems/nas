@@ -239,6 +239,13 @@ pub enum Action {
     /// verbo/prefixo/unidade pendente (docs/keys.md §3, "Esc
     /// cancela").
     ClearSelection,
+    /// Abre a paleta de comandos (`Espaço p`, ou `Shift+Espaço` — este
+    /// último tratado à parte em `nas-term`, nunca aqui: `Key` não
+    /// modela Shift, então não há como diferenciar `Shift+Espaço` de
+    /// `Espaço` dentro do vocabulário do nas-keys). Quem chama decide
+    /// como mostrar e executar a paleta — a máquina só sabe que foi
+    /// pedida.
+    OpenCommandPalette,
 }
 
 impl Action {
@@ -266,6 +273,7 @@ impl Action {
             Action::StartSelection => "start-selection",
             Action::SelectAll => "select-all",
             Action::Paste => "paste",
+            Action::OpenCommandPalette => "open-command-palette",
             Action::DeleteForward
             | Action::DeleteBackward
             | Action::InsertChar(_)
@@ -353,6 +361,31 @@ pub struct PendingHint {
     /// modal), e quem exibe precisa alfabetizar por conta própria pra
     /// ficar determinístico.
     pub ordered: bool,
+}
+
+/// Um comando do catálogo da paleta de comandos (`Espaço p`/`Shift+Espaço`,
+/// docs/keys.md "paleta de comandos") — nome, descrição, e o atalho que
+/// o alcança sozinho a partir do estado Visual, se houver um. Produzido
+/// por [`Machine::command_catalog`], já com as teclas traduzidas pro
+/// layout físico do usuário (pra exibição — ver [`crate::layout::to_physical`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    /// O nome usado em `[commands]` do keymap — também o que entra em
+    /// `App::recent_commands` quando executado pela paleta.
+    pub name: String,
+    pub description: String,
+    /// Vazio se o comando não tem um atalho que o alcance sozinho a
+    /// partir do estado Visual — ainda aparece na paleta (docs/keys.md),
+    /// só sem nada pra mostrar como atalho.
+    pub keys: Vec<Key>,
+    /// `true` se a **primeira** tecla de `keys` é Ctrl (classe sistema) —
+    /// nunca a segunda: `Ctrl+t n` é Ctrl só na tecla que abre o
+    /// prefixo, nunca na que o completa.
+    pub ctrl: bool,
+    /// Ação destrutiva (hoje só `history-delete`, `Ctrl+t z`) — a
+    /// paleta marca essas com um aviso discreto, como o which-key já
+    /// faz (`ui::which_key_lines`).
+    pub destructive: bool,
 }
 
 /// A máquina modal nunca marca nada como destrutivo — só o prefixo de
@@ -476,6 +509,30 @@ impl Machine {
                 ordered: false,
             }),
         }
+    }
+
+    /// O catálogo da paleta de comandos (docs/keys.md "paleta de
+    /// comandos") — todo comando alcançável a partir do estado Visual
+    /// (ações diretas, verbos e unidades que armam um pendente,
+    /// prefixos resolvidos recursivamente, e a classe sistema/Ctrl),
+    /// com as teclas já traduzidas pro layout físico em uso (pra
+    /// exibição — a máquina continua resolvendo tudo em qwerty
+    /// canônico por dentro). Prefixos em si (`go`, `leader`, `tempo`)
+    /// nunca aparecem — só os comandos em que eles resolvem.
+    /// Determinístico: mesma entrada, mesma ordem, sempre (ver
+    /// `Keymap::catalog`) — quem chama decide a ordem de exibição
+    /// (recência, busca) por conta própria.
+    pub fn command_catalog(&self) -> Vec<CatalogEntry> {
+        self.keymap
+            .catalog()
+            .into_iter()
+            .map(|mut entry| {
+                for key in &mut entry.keys {
+                    *key = layout::to_physical(&self.layout_table, *key);
+                }
+                entry
+            })
+            .collect()
     }
 
     fn key_text_for_prefix(&self, name: &str) -> String {
@@ -844,8 +901,13 @@ impl Machine {
 /// Traduz um objeto de unidade (palavra/parágrafo) num movimento puro,
 /// pra quando a unidade é usada sozinha (sem verbo). As demais
 /// variantes de [`Object`] nunca aparecem aqui — só palavra e
-/// parágrafo têm tabela de unidade no keymap.
-fn plain_motion_for(object: Object) -> Option<Action> {
+/// parágrafo têm tabela de unidade no keymap. `pub(crate)` porque
+/// `Keymap::catalog` (keymap.rs) também precisa dela, pra saber que
+/// "unidade palavra/parágrafo + direção" (`w ;`, `w j`, `W k`, `W l`)
+/// alcança `move-word-*`/`move-paragraph-*` na paleta de comandos —
+/// a mesma resolução que `Machine::resolve_pending` já faz em tempo
+/// de tecla.
+pub(crate) fn plain_motion_for(object: Object) -> Option<Action> {
     match object {
         Object::WordBackward => Some(Action::MoveWordBackward),
         Object::WordForward => Some(Action::MoveWordForward),
@@ -1527,6 +1589,36 @@ mod tests {
         // o verbo continua pendente — consultar a classe sistema não
         // interfere no estado da máquina modal.
         assert!(machine.pending_hint().is_some());
+    }
+
+    #[test]
+    fn command_catalog_traduz_as_teclas_pro_layout_fisico_em_uso() {
+        let qwerty = Machine::new();
+        let abnt = Machine::with_layout(Layout::QwertyAbnt);
+
+        let find = |catalog: &[CatalogEntry], name: &str| {
+            catalog
+                .iter()
+                .find(|entry| entry.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} não encontrado no catálogo"))
+        };
+
+        // "move-right" é "j" no qwerty... não, é ";" — na posição do
+        // qwerty onde o ABNT2 tem 'ç'. A exibição deveria mostrar 'ç'
+        // pro usuário ABNT2, nunca ';' (docs/keys.md, "paleta de
+        // comandos").
+        let qwerty_entry = find(&qwerty.command_catalog(), "move-right");
+        assert_eq!(qwerty_entry.keys, vec![Key::char(';')]);
+
+        let abnt_entry = find(&abnt.command_catalog(), "move-right");
+        assert_eq!(abnt_entry.keys, vec![Key::char('ç')]);
+
+        // uma tecla que não difere entre os dois layouts (letras)
+        // continua igual.
+        let qwerty_delete = find(&qwerty.command_catalog(), "delete");
+        let abnt_delete = find(&abnt.command_catalog(), "delete");
+        assert_eq!(qwerty_delete.keys, abnt_delete.keys);
     }
 
     #[test]

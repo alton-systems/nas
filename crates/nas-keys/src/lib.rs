@@ -16,4 +16,6 @@ mod machine;
 pub use key::{Key, KeyCode};
 pub use keymap::{Binding, DEFAULT_TOML, Keymap, KeymapError};
 pub use layout::Layout;
-pub use machine::{Action, Machine, ModalState, Object, PendingHint, SystemAction, Unit, Verb};
+pub use machine::{
+    Action, CatalogEntry, Machine, ModalState, Object, PendingHint, SystemAction, Unit, Verb,
+};

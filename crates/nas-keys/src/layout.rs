@@ -108,6 +108,33 @@ pub fn to_qwerty(table: &HashMap<char, char>, key: Key) -> Key {
     }
 }
 
+/// O inverso de [`to_qwerty`]: de uma tecla canônica (qwerty) para como
+/// ela aparece no layout físico do usuário — só pra **exibição** (ex.:
+/// a paleta de comandos mostra "ç" em vez de ";" pra um usuário ABNT2,
+/// docs/keys.md "paleta de comandos"). A máquina de estados sempre
+/// consulta o keymap em qwerty canônico; essa tradução de volta nunca
+/// entra na lógica de comandos, só na tela. Usa a mesma tabela
+/// físico→qwerty de `to_qwerty` (a mesma que [`Layout::translation_table`]
+/// monta), procurando o caractere físico cujo destino é `c` — correto
+/// porque a tabela é uma bijeção entre os caracteres que diferem nos
+/// dois diagramas.
+pub fn to_physical(table: &HashMap<char, char>, key: Key) -> Key {
+    match key.code {
+        KeyCode::Char(c) => {
+            let physical = table
+                .iter()
+                .find(|&(_, &qwerty)| qwerty == c)
+                .map(|(&physical, _)| physical)
+                .unwrap_or(c);
+            Key {
+                code: KeyCode::Char(physical),
+                alt: key.alt,
+            }
+        }
+        _ => key,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +152,27 @@ mod tests {
         // a posição do ';' no qwerty é o 'ç' no ABNT2 — digitar 'ç' deve
         // ser entendido como o ';' canônico.
         assert_eq!(to_qwerty(&table, Key::char('ç')), Key::char(';'));
+    }
+
+    #[test]
+    fn to_physical_e_o_inverso_de_to_qwerty_para_exibicao() {
+        let table = Layout::QwertyAbnt.translation_table();
+        // o inverso de ';' -> 'ç': exibir a tecla canônica ';' pro
+        // usuário ABNT2 deveria mostrar 'ç'.
+        assert_eq!(to_physical(&table, Key::char(';')), Key::char('ç'));
+        // qwerty não traduz nada (tabela vazia): o inverso também não.
+        let qwerty_table = Layout::Qwerty.translation_table();
+        assert_eq!(to_physical(&qwerty_table, Key::char(';')), Key::char(';'));
+    }
+
+    #[test]
+    fn to_physical_preserva_teclas_fora_do_diagrama_e_o_modificador_alt() {
+        let table = Layout::QwertyAbnt.translation_table();
+        assert_eq!(to_physical(&table, Key::enter()), Key::enter());
+        assert_eq!(
+            to_physical(&table, Key::with_alt(KeyCode::Char(';'))),
+            Key::with_alt(KeyCode::Char('ç'))
+        );
     }
 
     #[test]

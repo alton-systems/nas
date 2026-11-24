@@ -12,7 +12,7 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::key::Key;
-use crate::machine::{Action, Object, SystemAction, Unit, Verb};
+use crate::machine::{Action, CatalogEntry, Object, SystemAction, Unit, Verb, plain_motion_for};
 
 /// O keymap embutido no binário — a única fonte de verdade para
 /// atalhos; ver `docs/decisions/0004-especificacao-de-teclas-no-nas.md`.
@@ -279,6 +279,159 @@ impl Keymap {
             Binding::Repeat => self.describe("repeat"),
         }
     }
+
+    /// O catálogo da paleta de comandos — ver [`crate::machine::Machine::command_catalog`],
+    /// que é quem expõe isto fora do crate (depois de traduzir as
+    /// teclas pro layout físico). Monta a lista crua (nome, teclas em
+    /// qwerty canônico, se é Ctrl, se é destrutivo) a partir do
+    /// próprio keymap, sem tocar nada externo — determinístico:
+    /// `HashMap` não garante ordem, então a lista crua é sempre
+    /// ordenada e deduplicada antes de devolver (ver `dedup_sorted`).
+    ///
+    /// **O que entra:** ações diretas, verbos e unidades de `[visual]`
+    /// (armam um pendente — executar pela paleta "aperta a tecla", não
+    /// completa o composto sozinho), prefixos resolvidos
+    /// recursivamente até um comando de verdade (`g l`, `SPC f`, ...),
+    /// unidade sozinha + direção (`w ;`, `W k`, ..., que é como
+    /// `move-word-forward` etc. são alcançados — a mesma resolução de
+    /// `Machine::resolve_pending`), e a classe sistema/Ctrl
+    /// (`[system]` + `[system_prefixes.*]`).
+    ///
+    /// **O que não entra, de propósito:** os próprios prefixos (`go`,
+    /// `leader`, `tempo` — docs/keys.md, "Prefixos não aparecem como
+    /// itens") e os nomes de **objeto** puro (`char-left`,
+    /// `whole-buffer`, `current-line`, ...) — esses só existem como o
+    /// complemento de um verbo já pendente, nunca como um comando
+    /// autônomo que "apertar uma tecla a partir do Visual" alcance por
+    /// si só; incluí-los exigiria simular um verbo arbitrário
+    /// pendente, o que não corresponde a nenhuma tecla real.
+    pub(crate) fn catalog(&self) -> Vec<CatalogEntry> {
+        let mut raw = Vec::new();
+        collect_modal_catalog(&self.visual, &[], self, &mut raw);
+        collect_system_catalog(self, &mut raw);
+        dedup_sorted(raw, self)
+    }
+}
+
+/// Uma entrada crua do catálogo da paleta, antes de alfabetizar e
+/// deduplicar — nome, teclas (em qwerty canônico), se a primeira é
+/// Ctrl, se é destrutivo. Ver [`Keymap::catalog`].
+type RawCatalogEntry = (String, Vec<Key>, bool, bool);
+
+/// Percorre `[visual]` (ou um `[prefixes.*]`, recursivamente)
+/// coletando todo comando alcançável, com a sequência de teclas que o
+/// alcança a partir de `prefix` (vazio na chamada de topo). Verbos e
+/// unidades entram como o próprio comando (`delete`, `word`, ...) —
+/// nunca recursa nos objetos que completam o composto, ver a nota em
+/// [`Keymap::catalog`]. A única exceção em que uma unidade *sozinha*
+/// produz um comando diferente de si mesma é a direção que a completa
+/// (`w ;` → `move-word-forward`), resolvida abaixo via
+/// `plain_motion_for` — a mesma conversão que `Machine::resolve_pending`
+/// já faz em tempo de tecla.
+fn collect_modal_catalog(
+    bindings: &HashMap<Key, Binding>,
+    prefix: &[Key],
+    keymap: &Keymap,
+    out: &mut Vec<RawCatalogEntry>,
+) {
+    for (key, binding) in bindings {
+        let mut keys = prefix.to_vec();
+        keys.push(*key);
+        match binding {
+            Binding::Action(action) => {
+                if let Some(name) = action.command_name() {
+                    out.push((name.to_string(), keys, false, false));
+                }
+            }
+            Binding::EnterInsert => out.push(("enter-insert".to_string(), keys, false, false)),
+            Binding::EnterSequential => {
+                out.push(("enter-sequential".to_string(), keys, false, false))
+            }
+            Binding::Repeat => out.push(("repeat".to_string(), keys, false, false)),
+            // Só existe em [insert] (M-SPC -> enter-visual); a paleta só
+            // abre a partir do Visual (docs/keys.md), então nunca é
+            // alcançável daqui — sem entrada no catálogo.
+            Binding::EnterVisual => {}
+            Binding::Verb(verb) => {
+                out.push((verb.command_name().to_string(), keys, false, false));
+            }
+            Binding::Unit(unit) => {
+                out.push((unit.command_name().to_string(), keys.clone(), false, false));
+                for (direction, object) in keymap.objects_for_unit(*unit) {
+                    if let Some(action) = plain_motion_for(*object)
+                        && let Some(name) = action.command_name()
+                    {
+                        let mut compound = keys.clone();
+                        compound.push(*direction);
+                        out.push((name.to_string(), compound, false, false));
+                    }
+                }
+            }
+            Binding::Prefix(name) => {
+                if let Some(sub) = keymap.prefixes.get(name) {
+                    collect_modal_catalog(sub, &keys, keymap, out);
+                }
+            }
+        }
+    }
+}
+
+/// A classe sistema (`[system]` + `[system_prefixes.*]`) — a primeira
+/// tecla é sempre Ctrl; a segunda (quando houver, pelo prefixo
+/// `Ctrl+t`), nunca.
+fn collect_system_catalog(keymap: &Keymap, out: &mut Vec<RawCatalogEntry>) {
+    for (key, action) in &keymap.system {
+        out.push((action.command_name().to_string(), vec![*key], true, false));
+    }
+    for (key, prefix_name) in &keymap.system_prefix_keys {
+        let Some(entries) = keymap.system_prefixes.get(prefix_name) else {
+            continue;
+        };
+        for entry in entries {
+            out.push((
+                entry.action.command_name().to_string(),
+                vec![*key, entry.key],
+                true,
+                entry.destructive,
+            ));
+        }
+    }
+}
+
+/// Determinismo sobre um `HashMap`: ordena por (nome, teclas
+/// renderizadas) e mantém só a primeira ocorrência de cada nome —
+/// alguns comandos têm mais de um caminho até eles no keymap padrão
+/// (`move-buffer-start` por `L` e por `g g`; `enter-insert` por `RET` e
+/// por `M-SPC`), e a paleta mostra só um atalho por item. Critério
+/// arbitrário mas estável — o keymap não declara um atalho "canônico",
+/// e qualquer escolha fixa serve, desde que não mude de uma chamada
+/// pra outra (o que quebraria os snapshots da paleta em `nas-term`).
+fn dedup_sorted(mut raw: Vec<RawCatalogEntry>, keymap: &Keymap) -> Vec<CatalogEntry> {
+    raw.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| render_keys(&a.1).cmp(&render_keys(&b.1)))
+    });
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .filter(|(name, ..)| seen.insert(name.clone()))
+        .map(|(name, keys, ctrl, destructive)| {
+            let description = keymap.describe(&name);
+            CatalogEntry {
+                name,
+                description,
+                keys,
+                ctrl,
+                destructive,
+            }
+        })
+        .collect()
+}
+
+fn render_keys(keys: &[Key]) -> String {
+    keys.iter()
+        .map(Key::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `deny_unknown_fields`: um atalho com campos de mais de uma forma
@@ -567,6 +720,7 @@ fn parse_action(name: &str) -> Result<Action, KeymapError> {
         "start-selection" => Action::StartSelection,
         "select-all" => Action::SelectAll,
         "paste" => Action::Paste,
+        "open-command-palette" => Action::OpenCommandPalette,
         _ => return Err(KeymapError::UnknownAction(name.to_string())),
     })
 }
@@ -765,6 +919,100 @@ z = "move-right"
             Some(SystemAction::ReloadBuffer)
         );
         assert_eq!(keymap.system_action(&Key::char('z')), None);
+    }
+
+    #[test]
+    fn catalogo_inclui_acao_direta_verbo_unidade_e_prefixo_resolvido() {
+        let keymap = Keymap::default_keymap();
+        let catalog = keymap.catalog();
+
+        let find = |name: &str| catalog.iter().find(|entry| entry.name == name);
+
+        let move_left = find("move-left").expect("move-left no catálogo");
+        assert_eq!(move_left.keys, vec![Key::char('j')]);
+        assert!(!move_left.ctrl);
+        assert_eq!(move_left.description, "caractere anterior");
+
+        let delete = find("delete").expect("delete (verbo) no catálogo");
+        assert_eq!(delete.keys, vec![Key::char('d')]);
+
+        let word = find("word").expect("word (unidade) no catálogo");
+        assert_eq!(word.keys, vec![Key::char('w')]);
+
+        // "g l" resolvido recursivamente através do prefixo "go".
+        let goto_line = find("prompt-goto-line").expect("prompt-goto-line no catálogo");
+        assert_eq!(goto_line.keys, vec![Key::char('g'), Key::char('l')]);
+
+        // unidade sozinha + direção: "w ;" alcança move-word-forward,
+        // não listado em [visual] nem em nenhum [prefixes.*] — só
+        // através da resolução de unidade (`plain_motion_for`).
+        let word_forward = find("move-word-forward").expect("move-word-forward no catálogo");
+        assert_eq!(word_forward.keys, vec![Key::char('w'), Key::char(';')]);
+    }
+
+    #[test]
+    fn catalogo_nao_inclui_prefixos_nem_objetos_puros() {
+        let keymap = Keymap::default_keymap();
+        let catalog = keymap.catalog();
+        let names: Vec<&str> = catalog.iter().map(|entry| entry.name.as_str()).collect();
+
+        for prefix in ["go", "leader", "tempo"] {
+            assert!(!names.contains(&prefix), "{prefix} não deveria aparecer");
+        }
+        for object in ["char-left", "whole-buffer", "current-line", "line-start"] {
+            assert!(!names.contains(&object), "{object} não deveria aparecer");
+        }
+    }
+
+    #[test]
+    fn catalogo_classe_sistema_ctrl_so_na_primeira_tecla() {
+        let keymap = Keymap::default_keymap();
+        let catalog = keymap.catalog();
+
+        let save = catalog
+            .iter()
+            .find(|entry| entry.name == "save")
+            .expect("save no catálogo");
+        assert_eq!(save.keys, vec![Key::char('s')]);
+        assert!(save.ctrl);
+
+        let checkpoint_new = catalog
+            .iter()
+            .find(|entry| entry.name == "checkpoint-new")
+            .expect("checkpoint-new no catálogo");
+        assert_eq!(checkpoint_new.keys, vec![Key::char('t'), Key::char('n')]);
+        assert!(checkpoint_new.ctrl);
+
+        let history_delete = catalog
+            .iter()
+            .find(|entry| entry.name == "history-delete")
+            .expect("history-delete no catálogo");
+        assert!(history_delete.destructive);
+    }
+
+    #[test]
+    fn catalogo_e_deterministico_e_sem_nomes_duplicados() {
+        let keymap = Keymap::default_keymap();
+        let first = keymap.catalog();
+        let second = keymap.catalog();
+        assert_eq!(
+            first, second,
+            "duas chamadas deveriam devolver a mesma lista"
+        );
+
+        let mut names: Vec<&str> = first.iter().map(|entry| entry.name.as_str()).collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), total, "nenhum nome deveria se repetir");
+
+        // "move-buffer-start" é alcançável por "L" e por "g g" — a
+        // dedupe deveria manter só um dos dois, não os dois.
+        let occurrences = first
+            .iter()
+            .filter(|entry| entry.name == "move-buffer-start")
+            .count();
+        assert_eq!(occurrences, 1);
     }
 
     #[test]

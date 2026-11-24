@@ -17,6 +17,7 @@ nas-editor = { path = "../nas-editor" }
 nas-history = { path = "../nas-history" }
 nas-keys = { path = "../nas-keys" }
 nas-mcp = { path = "../nas-mcp" }
+nucleo = "0.5.0"
 ratatui = "0.29.0"
 tokio = { version = "1.54.1", features = ["rt", "macros"] }
 tracing = "0.1.44"
