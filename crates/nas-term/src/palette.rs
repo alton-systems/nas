@@ -148,6 +148,7 @@ mod tests {
             keys: vec![nas_keys::Key::char('x')],
             ctrl: false,
             destructive: false,
+            target: None,
         }
     }
 

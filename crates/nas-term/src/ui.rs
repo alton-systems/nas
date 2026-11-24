@@ -102,8 +102,10 @@ const PALETTE_PROMPT: &str = "Paleta de comandos  »  ";
 /// mesmo princípio de `draw_overlay`, mas com uma linha de busca no
 /// título (em vez de só um rótulo) e navegação por seleção em vez de
 /// rolagem. Comandos sem atalho aparecem sem nada na coluna de tecla;
-/// um comando destrutivo (`entry.destructive`) leva um marcador `⚠` em
-/// destaque, mesma cor de alerta do which-key (`HINT_DESTRUCTIVE_COLOR`).
+/// um comando destrutivo (`entry.destructive`) usa a mesma cor de
+/// alerta do which-key (`HINT_DESTRUCTIVE_COLOR`) na linha inteira,
+/// mais um prefixo `!` na descrição — nunca um emoji, que pode ter
+/// largura ambígua num terminal.
 fn draw_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
     let mut lines = vec![Line::from(Span::styled(
         format!("{PALETTE_PROMPT}{}", palette.query),
@@ -142,25 +144,31 @@ fn draw_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
             .unwrap_or(0);
         for (offset, entry) in visible.iter().enumerate() {
             let selected = start + offset == palette.selected;
-            let base = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
+            let mut base = Style::default();
+            if selected {
+                base = base.add_modifier(Modifier::REVERSED);
+            }
             let shortcut = shortcut_label(entry);
             let pad = shortcut_width.saturating_sub(shortcut.chars().count()) + 2;
 
-            let mut spans = vec![
-                Span::styled(shortcut, base.fg(HINT_KEY_COLOR)),
+            // Mesma convenção do which-key pra ação destrutiva
+            // (`ui::which_key_lines`, `HINT_DESTRUCTIVE_COLOR`): a cor
+            // de alerta na linha inteira, nunca um caractere à parte —
+            // sem largura ambígua num terminal (regra 8). O prefixo
+            // `!` reforça o aviso mesmo onde a cor não se destaca
+            // (ex.: o estilo reverso da seleção).
+            let (shortcut_style, text_style, description) = if entry.destructive {
+                let alert = base.fg(HINT_DESTRUCTIVE_COLOR);
+                (alert, alert, format!("! {}", entry.description))
+            } else {
+                (base.fg(HINT_KEY_COLOR), base, entry.description.clone())
+            };
+
+            let spans = vec![
+                Span::styled(shortcut, shortcut_style),
                 Span::styled(" ".repeat(pad), base),
-                Span::styled(entry.description.clone(), base),
+                Span::styled(description, text_style),
             ];
-            if entry.destructive {
-                spans.push(Span::styled(
-                    "  ⚠",
-                    Style::default().fg(HINT_DESTRUCTIVE_COLOR),
-                ));
-            }
             lines.push(Line::from(spans));
         }
     }
