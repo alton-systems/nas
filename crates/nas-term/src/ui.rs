@@ -8,9 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use nas_keys::{CatalogEntry, Key, PendingHint};
+use nas_keys::{CatalogEntry, Key, ModalState, PendingHint};
 
-use crate::app::{App, Overlay, PromptKind, buffer_name};
+use crate::app::{App, Overlay, PromptKind, ReviewPicker, buffer_name, format_author};
 use crate::palette::Palette;
 
 /// Cor das letras das opções numa dica which-key — provisória, até
@@ -32,6 +32,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(palette) = &app.palette {
         draw_palette(frame, root, palette);
+        return;
+    }
+
+    if let Some(picker) = &app.review_picker {
+        draw_review_picker(frame, root, picker);
         return;
     }
 
@@ -179,6 +184,40 @@ fn draw_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
     frame.set_cursor_position((cursor_x.min(area.x + area.width.saturating_sub(1)), area.y));
 }
 
+/// `Ctrl+t V` (docs/decisions/0008-modo-de-revisao.md §4): a lista
+/// selecionável de checkpoints pra escolher o "antes" da revisão —
+/// mesmos dados de `Ctrl+t l` (`checkpoint_list`), mas navegável
+/// (`↑`/`↓`, `Enter` confirma, `Esc` cancela) em vez de só mostrada.
+fn draw_review_picker(frame: &mut Frame, area: Rect, picker: &ReviewPicker) {
+    let mut lines = vec![Line::from(Span::styled(
+        "Revisar — escolha um checkpoint  »  ↑/↓ escolhe, Enter confirma, Esc cancela",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+
+    for (idx, checkpoint) in picker.checkpoints().iter().enumerate() {
+        let mut style = Style::default();
+        if idx == picker.selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let kind = if checkpoint.automatic {
+            "automático"
+        } else {
+            "nomeado"
+        };
+        let text = format!(
+            "{}  {} ({}, {}, {} arquivo(s))",
+            nas_history::format_timestamp(checkpoint.created_at),
+            checkpoint.name,
+            kind,
+            format_author(&checkpoint.author),
+            checkpoint.files.len()
+        );
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// O atalho de um comando do catálogo, pra exibição — vazio se o
 /// comando não tiver um atalho que o alcance sozinho (ver
 /// `CatalogEntry::keys`); `Ctrl+` só na primeira tecla, nunca na
@@ -220,17 +259,44 @@ fn draw_gutter(frame: &mut Frame, area: Rect, app: &App, gutter_width: usize) {
 
 fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
     let selection = app.document().selection_range();
+    let is_review = app.modal.state() == ModalState::Review;
     let lines: Vec<Line> = visible_line_range(app, area.height as usize)
         .map(|idx| {
-            let line_start = app.document().line_start_offset(idx);
             let text = app.document().line(idx).into_owned();
-            line_with_selection(text, line_start, selection)
+            if is_review {
+                review_line(text)
+            } else {
+                let line_start = app.document().line_start_offset(idx);
+                line_with_selection(text, line_start, selection)
+            }
         })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).scroll((0, app.scroll_left() as u16)),
         area,
     );
+}
+
+/// Uma linha do buffer sintético da revisão (docs/decisions/0008-modo-de-revisao.md
+/// §2): `-`/`+` coloridas (vermelho/verde — o mesmo par que remover/
+/// adicionar já usa no resto do nas), o cabeçalho de um trecho já
+/// revisado (`[revisado]`/`[rejeitado]`) e o separador de arquivo
+/// (`=== ... ===`) em destaque.
+fn review_line(text: String) -> Line<'static> {
+    let trimmed = text.trim_end_matches(['\n', '\r']);
+    let style = if trimmed.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if trimmed.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if trimmed.starts_with("===")
+        || trimmed.ends_with("[revisado]")
+        || trimmed.ends_with("[rejeitado]")
+    {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(text, style))
 }
 
 /// Só o estado **persistente** do buffer ativo — nome, `[+]` se
@@ -287,6 +353,17 @@ fn echo_area_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
     if let Some(hint) = app.modal.pending_hint() {
         return which_key_lines(hint, width);
+    }
+
+    // A dica de [review] é persistente (docs/decisions/0008-modo-de-revisao.md
+    // §4: "fica persistente enquanto o estado for Review") — ao
+    // contrário das de cima, aparece mesmo sem nada pendente. `g h` e
+    // `Esc` não vivem em `[review]` (o primeiro é global, em
+    // `[prefixes.go]`; o segundo é universal), por isso entram à mão.
+    if let Some(hint) = app.modal.review_hint() {
+        let mut lines = which_key_lines(hint, width);
+        lines.push(Line::from("g h ir até lá  ·  Esc sair da revisão"));
+        return lines;
     }
 
     Vec::new()
@@ -618,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn tela_com_dica_which_key_do_ctrl_t_todas_as_seis_opcoes_visiveis() {
+    fn tela_com_dica_which_key_do_ctrl_t_todas_as_nove_opcoes_visiveis() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut document = Document::empty();

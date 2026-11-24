@@ -388,6 +388,9 @@ fn cursor_style_for(app: &App) -> SetCursorStyle {
         ModalState::Insert => SetCursorStyle::SteadyBar,
         ModalState::Visual => SetCursorStyle::SteadyBlock,
         ModalState::Sequential => SetCursorStyle::SteadyUnderScore,
+        // Revisão (ADR 0008 §2/§4): buffer somente leitura, mesmo
+        // bloco do Visual — não há texto sendo digitado.
+        ModalState::Review => SetCursorStyle::SteadyBlock,
     }
 }
 

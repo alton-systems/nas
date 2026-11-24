@@ -1,6 +1,5 @@
 ---
 source: crates/nas-term/src/ui.rs
-assertion_line: 509
 expression: rendered
 ---
 1 ola mundo                                                                     
@@ -8,10 +7,10 @@ expression: rendered
                                                                                 
                                                                                 
                                                                                 
-                                                                                
 [V] [sem nome] [+]                                                          1:10
 Ctrl+t  tempo (checkpoints e histórico)                                         
-n novo checkpoint                 l listar checkpoints                          
-e diff entre checkpoints          r restaurar checkpoint                        
-a autoria (histórico do arquivo)  m histórico de mensagens                      
+n novo checkpoint                      l listar checkpoints                     
+e diff entre checkpoints               r restaurar checkpoint                   
+a autoria (histórico do arquivo)       m histórico de mensagens                 
+v revisar a sessão de IA mais recente  V revisar — escolher o checkpoint        
 z apagar histórico do projeto

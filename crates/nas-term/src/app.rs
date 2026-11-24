@@ -54,6 +54,12 @@ pub struct Buffer {
     pub document: Document,
     pub scroll_top: usize,
     pub scroll_left: usize,
+    /// `true` só para o buffer sintético da revisão
+    /// (docs/decisions/0008-modo-de-revisao.md §2) — nunca lido nem
+    /// escrito em disco. Bloqueia `Ctrl+s`/`Ctrl+r` (sem caminho pra
+    /// agir); `Ctrl+b`/`Ctrl+k`/`Ctrl+q` continuam normais, porque
+    /// este buffer nunca tem alteração não salva pra perguntar sobre.
+    pub read_only: bool,
 }
 
 impl Buffer {
@@ -62,6 +68,16 @@ impl Buffer {
             document,
             scroll_top: 0,
             scroll_left: 0,
+            read_only: false,
+        }
+    }
+
+    fn new_read_only(document: Document) -> Self {
+        Self {
+            document,
+            scroll_top: 0,
+            scroll_left: 0,
+            read_only: true,
         }
     }
 }
@@ -90,6 +106,56 @@ pub struct Overlay {
     pub title: String,
     pub lines: Vec<String>,
     pub scroll: u16,
+}
+
+/// Um trecho alterado mostrado na revisão
+/// (docs/decisions/0008-modo-de-revisao.md §2) — já com a posição
+/// (0-indexada, como `Document::cursor_position`) que ele ocupa no
+/// buffer sintético, pra mapear o cursor de volta a um trecho.
+#[derive(Debug, Clone)]
+struct ReviewHunk {
+    file: String,
+    before: String,
+    after: String,
+    /// 1-indexada no "depois" — pra `g h`/o cabeçalho exibido. A linha
+    /// no "antes" entra só no `hunk_hash` (§5), calculada na hora, sem
+    /// precisar ficar guardada aqui.
+    after_start_line: usize,
+    hash: String,
+    authors: Vec<Author>,
+    decision: Option<nas_history::ReviewDecision>,
+    header_line: usize,
+    body_end_line: usize,
+}
+
+/// Uma revisão aberta (`Ctrl+t v`/`Ctrl+t V`) — docs/decisions/0008-modo-de-revisao.md
+/// §1/§5. `buffer_index` é o buffer sintético (sempre o mais recente
+/// a ser criado; removido ao sair — `close_review`).
+struct ReviewSession {
+    from_checkpoint: String,
+    started_at: u64,
+    buffer_index: usize,
+    previous_active: usize,
+    hunks: Vec<ReviewHunk>,
+    total_hunks: usize,
+    accepted: usize,
+    rejected: usize,
+}
+
+/// A lista selecionável de `Ctrl+t V` — mesma ideia de seleção da
+/// paleta de comandos (`↑`/`↓` dando a volta nas pontas, `Enter`
+/// confirma, `Esc` cancela), mas sobre checkpoints, não
+/// `CatalogEntry` — dados diferentes, mesmo padrão de interação.
+pub struct ReviewPicker {
+    /// Mais recente primeiro — mesma ordem que `Ctrl+t l` já mostra.
+    checkpoints: Vec<CheckpointManifest>,
+    pub selected: usize,
+}
+
+impl ReviewPicker {
+    pub fn checkpoints(&self) -> &[CheckpointManifest] {
+        &self.checkpoints
+    }
 }
 
 /// Uma linha de entrada ativa na barra de status — equivalente ao
@@ -202,6 +268,13 @@ pub struct App {
     /// `None` quando `main.rs` não ligou nenhuma configuração
     /// (como em todos os testes deste módulo).
     config_paths: Option<ConfigPaths>,
+    /// A revisão aberta (`Ctrl+t v`/`Ctrl+t V`), se houver uma — ver
+    /// [`ReviewSession`]. `docs/decisions/0008-modo-de-revisao.md`.
+    review: Option<ReviewSession>,
+    /// A lista selecionável de `Ctrl+t V`, enquanto não confirmada —
+    /// ver [`ReviewPicker`]. Igual a `overlay`/`prompt`/`palette`:
+    /// nenhuma tecla chega à máquina modal enquanto ativa.
+    pub review_picker: Option<ReviewPicker>,
 }
 
 /// Os caminhos efetivos de uma carga de configuração — guardados só
@@ -245,6 +318,8 @@ impl App {
             recent_commands: Vec::new(),
             config: nas_config::Config::default(),
             config_paths: None,
+            review: None,
+            review_picker: None,
         }
     }
 
@@ -450,6 +525,11 @@ impl App {
             return;
         }
 
+        if self.review_picker.is_some() {
+            self.handle_review_picker_key(key);
+            return;
+        }
+
         if self.palette.is_some() {
             self.handle_palette_key(key);
             return;
@@ -559,6 +639,24 @@ impl App {
     /// repetição da mesma tecla); os demais limpam qualquer
     /// mensagem/confirmação pendente antes de agir.
     fn dispatch_system_action(&mut self, action: SystemAction) {
+        // Trocar de buffer, abrir outro arquivo, fechar o buffer atual
+        // ou sair enquanto a revisão está aberta termina a sessão de
+        // revisão primeiro (registra o fim, remove o buffer sintético)
+        // — docs/decisions/0008-modo-de-revisao.md §5: "Ctrl+b"/"Ctrl+k"/
+        // "Ctrl+q" continuam funcionando normalmente, mas a revisão não
+        // fica um buffer órfão na lista depois.
+        if self.review.is_some()
+            && matches!(
+                action,
+                SystemAction::SwitchBuffer
+                    | SystemAction::OpenFile
+                    | SystemAction::CloseBuffer
+                    | SystemAction::Quit
+            )
+        {
+            self.close_review();
+        }
+
         if action == SystemAction::Quit {
             self.handle_quit_request();
             return;
@@ -590,6 +688,8 @@ impl App {
             SystemAction::CheckpointBlame => self.checkpoint_blame(),
             SystemAction::HistoryDelete => self.open_prompt(PromptKind::DeleteHistoryConfirm),
             SystemAction::MessageHistory => self.show_message_history(),
+            SystemAction::ReviewOpen => self.open_review(None),
+            SystemAction::ReviewOpenPicker => self.open_review_picker(),
             SystemAction::Quit
             | SystemAction::CloseBuffer
             | SystemAction::Save
@@ -680,6 +780,17 @@ impl App {
             Action::Paste => self.pending_paste = true,
             Action::VerbObject(verb, object) => self.apply_verb_object(verb, object),
             Action::ClearSelection => self.document_mut().clear_selection(),
+            Action::ReviewAccept => self.review_accept(),
+            Action::ReviewReject => self.review_reject(),
+            Action::ReviewNextHunk => self.review_move_hunk(1),
+            Action::ReviewPrevHunk => self.review_move_hunk(-1),
+            Action::ReviewNextFile => self.review_move_file(1),
+            Action::ReviewPrevFile => self.review_move_file(-1),
+            Action::ReviewExit => self.close_review(),
+            Action::ReviewActionBlocked => {
+                self.set_status_message("Ação não disponível na revisão.".to_string());
+            }
+            Action::GotoHunk => self.review_goto(),
         }
     }
 
@@ -1230,6 +1341,11 @@ impl App {
         self.quit_confirm_pending = false;
         self.close_confirm_pending = false;
 
+        if self.buffers[self.active].read_only {
+            self.set_status_message("Buffer somente leitura.".to_string());
+            return;
+        }
+
         self.check_external_change_active();
         if self.document().external_change_pending() && !self.external_overwrite_confirm_pending {
             self.external_overwrite_confirm_pending = true;
@@ -1261,6 +1377,11 @@ impl App {
     fn reload_buffer(&mut self) {
         self.quit_confirm_pending = false;
         self.close_confirm_pending = false;
+
+        if self.buffers[self.active].read_only {
+            self.set_status_message("Buffer somente leitura.".to_string());
+            return;
+        }
 
         if self.document().is_modified() && !self.reload_confirm_pending {
             self.reload_confirm_pending = true;
@@ -1596,6 +1717,467 @@ impl App {
         }
     }
 
+    /// O checkpoint "antes" padrão (ADR 0008 §1): o automático mais
+    /// recente cujo autor é `Author::Ai { .. }` — a sessão de IA mais
+    /// recente. `None` se não houver nenhum ainda.
+    fn default_review_checkpoint(checkpoints: &[CheckpointManifest]) -> Option<String> {
+        checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.automatic && matches!(c.author, Author::Ai { .. }))
+            .map(|c| c.id.clone())
+    }
+
+    /// `Ctrl+t v`: abre a revisão direto, no checkpoint padrão — sem
+    /// lista. `checkpoint_override` (`Some`, de `Ctrl+t V`) troca o
+    /// "antes" por outro checkpoint escolhido.
+    fn open_review(&mut self, checkpoint_override: Option<String>) {
+        let Some(history_dir) = self.history_dir() else {
+            self.set_status_message("Histórico não disponível.".to_string());
+            return;
+        };
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap_or_default();
+        let checkpoint_id = match checkpoint_override {
+            Some(id) => id,
+            None => match Self::default_review_checkpoint(&checkpoints) {
+                Some(id) => id,
+                None => {
+                    self.set_status_message("Nenhuma sessão de IA pra revisar ainda.".to_string());
+                    return;
+                }
+            },
+        };
+        let Some(checkpoint) = checkpoints.iter().find(|c| c.id == checkpoint_id) else {
+            self.set_status_message(format!("Checkpoint não encontrado: {checkpoint_id}"));
+            return;
+        };
+
+        let mut hunks = self.gather_review_hunks(checkpoint, &history_dir);
+        let text = render_review_buffer(&mut hunks);
+        let total_hunks = hunks.len();
+        let accepted = hunks
+            .iter()
+            .filter(|h| h.decision == Some(nas_history::ReviewDecision::Accepted))
+            .count();
+        let rejected = hunks
+            .iter()
+            .filter(|h| h.decision == Some(nas_history::ReviewDecision::Rejected))
+            .count();
+
+        let mut document = Document::empty();
+        document.replace_all(&text);
+        document.set_cursor(0);
+        self.buffers.push(Buffer::new_read_only(document));
+        let buffer_index = self.buffers.len() - 1;
+        let previous_active = self.active;
+        self.active = buffer_index;
+
+        self.review = Some(ReviewSession {
+            from_checkpoint: checkpoint_id,
+            started_at: nas_history::now_unix(),
+            buffer_index,
+            previous_active,
+            hunks,
+            total_hunks,
+            accepted,
+            rejected,
+        });
+        self.modal.enter_review();
+        self.status_message = None;
+    }
+
+    /// `Ctrl+t V`: monta a lista selecionável de checkpoints — mesmos
+    /// dados de `Ctrl+t l`, com o padrão (acima) pré-selecionado.
+    fn open_review_picker(&mut self) {
+        let Some(history_dir) = self.history_dir() else {
+            self.set_status_message("Histórico não disponível.".to_string());
+            return;
+        };
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap_or_default();
+        if checkpoints.is_empty() {
+            self.set_status_message("Nenhum checkpoint ainda.".to_string());
+            return;
+        }
+        let default_id = Self::default_review_checkpoint(&checkpoints);
+        let mut ordered = checkpoints;
+        ordered.reverse(); // mais recente primeiro, como Ctrl+t l.
+        let selected = default_id
+            .and_then(|id| ordered.iter().position(|c| c.id == id))
+            .unwrap_or(0);
+        self.review_picker = Some(ReviewPicker {
+            checkpoints: ordered,
+            selected,
+        });
+    }
+
+    fn handle_review_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = &mut self.review_picker else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down => {
+                let len = picker.checkpoints.len();
+                if len > 0 {
+                    picker.selected = (picker.selected + 1) % len;
+                }
+            }
+            KeyCode::Up => {
+                let len = picker.checkpoints.len();
+                if len > 0 {
+                    picker.selected = (picker.selected + len - 1) % len;
+                }
+            }
+            KeyCode::Enter => {
+                let Some(picker) = self.review_picker.take() else {
+                    return;
+                };
+                if let Some(checkpoint) = picker.checkpoints.get(picker.selected) {
+                    let id = checkpoint.id.clone();
+                    self.open_review(Some(id));
+                }
+            }
+            _ => self.review_picker = None,
+        }
+    }
+
+    /// Monta os trechos de uma revisão: para cada arquivo que o
+    /// checkpoint rastreia, compara o texto de lá ("antes") contra o
+    /// estado atual ("depois" — buffer aberto, se houver, senão o
+    /// disco), via `nas_history::text_hunks`; cada trecho ganha
+    /// autoria (`attribute_hunk`, "misto" incluído) e a marca já
+    /// registrada, se houver (ADR 0008 §2/§5). Sem posição de buffer
+    /// ainda — `render_review_buffer` preenche isso ao desenhar o
+    /// texto.
+    fn gather_review_hunks(
+        &self,
+        checkpoint: &CheckpointManifest,
+        history_dir: &Path,
+    ) -> Vec<ReviewHunk> {
+        let marks =
+            nas_history::marks_for_checkpoint(history_dir, &checkpoint.id).unwrap_or_default();
+        let mut paths: Vec<&str> = checkpoint.files.iter().map(|f| f.path.as_str()).collect();
+        paths.sort_unstable();
+
+        let mut hunks = Vec::new();
+        for path in paths {
+            let Some(new_bytes) = self.current_content_for(path) else {
+                continue; // arquivo não existe mais nem em buffer nem em disco.
+            };
+            let new_text = String::from_utf8_lossy(&new_bytes).into_owned();
+            let old_text = nas_history::file_text_at_checkpoint(history_dir, &checkpoint.id, path)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            if old_text == new_text {
+                continue;
+            }
+
+            for hunk in nas_history::text_hunks(&old_text, &new_text) {
+                let hash = nas_history::hunk_hash(
+                    path,
+                    &checkpoint.id,
+                    &hunk.old_text,
+                    &hunk.new_text,
+                    hunk.old_start_line,
+                );
+                let range_start = char_offset_of_line(&new_text, hunk.new_start_line);
+                let range_end = range_start + hunk.new_text.chars().count();
+                let authors = nas_history::attribute_hunk(
+                    history_dir,
+                    path,
+                    checkpoint.created_at,
+                    (range_start, range_end),
+                )
+                .unwrap_or_default();
+                let decision = marks
+                    .iter()
+                    .find(|m| m.file == path && m.hunk_hash == hash)
+                    .map(|m| m.decision);
+
+                hunks.push(ReviewHunk {
+                    file: path.to_string(),
+                    before: hunk.old_text,
+                    after: hunk.new_text,
+                    after_start_line: hunk.new_start_line,
+                    hash,
+                    authors,
+                    decision,
+                    header_line: 0,
+                    body_end_line: 0,
+                });
+            }
+        }
+        hunks
+    }
+
+    /// Recalcula a revisão aberta a partir do zero (mesmo
+    /// checkpoint), depois de aceitar ou rejeitar um trecho — ADR
+    /// 0008 §3: "a revisão recalcular os trechos". Preserva a mesma
+    /// sessão (início, contagens já persistidas em marcas).
+    fn rebuild_review(&mut self) {
+        let Some(history_dir) = self.history_dir() else {
+            return;
+        };
+        let Some(checkpoint_id) = self.review.as_ref().map(|s| s.from_checkpoint.clone()) else {
+            return;
+        };
+        let checkpoints = nas_history::list_checkpoints(&history_dir).unwrap_or_default();
+        let Some(checkpoint) = checkpoints.iter().find(|c| c.id == checkpoint_id) else {
+            return;
+        };
+        let mut hunks = self.gather_review_hunks(checkpoint, &history_dir);
+        let text = render_review_buffer(&mut hunks);
+        let total_hunks = hunks.len();
+        let accepted = hunks
+            .iter()
+            .filter(|h| h.decision == Some(nas_history::ReviewDecision::Accepted))
+            .count();
+        let rejected = hunks
+            .iter()
+            .filter(|h| h.decision == Some(nas_history::ReviewDecision::Rejected))
+            .count();
+
+        let Some(session) = &mut self.review else {
+            return;
+        };
+        session.hunks = hunks;
+        session.total_hunks = total_hunks;
+        session.accepted = accepted;
+        session.rejected = rejected;
+        let buffer_index = session.buffer_index;
+        self.buffers[buffer_index].document.replace_all(&text);
+        self.buffers[buffer_index].document.set_cursor(0);
+    }
+
+    /// O trecho sob o cursor na revisão, se houver um.
+    fn current_review_hunk(&self) -> Option<usize> {
+        let session = self.review.as_ref()?;
+        let cursor_line = self.document().cursor_position().line;
+        session
+            .hunks
+            .iter()
+            .position(|h| (h.header_line..=h.body_end_line).contains(&cursor_line))
+    }
+
+    /// `Enter`, dentro da revisão: aceita o trecho sob o cursor —
+    /// marca como revisado (persiste), sem tocar em nenhum arquivo.
+    fn review_accept(&mut self) {
+        let Some(idx) = self.current_review_hunk() else {
+            self.set_status_message("Nenhum trecho sob o cursor.".to_string());
+            return;
+        };
+        let Some(history_dir) = self.history_dir() else {
+            return;
+        };
+        let Some(session) = &self.review else {
+            return;
+        };
+        let hunk = &session.hunks[idx];
+        let mark = nas_history::ReviewMark {
+            ts: nas_history::now_unix(),
+            reviewer: Author::User,
+            from_checkpoint: session.from_checkpoint.clone(),
+            file: hunk.file.clone(),
+            hunk_hash: hunk.hash.clone(),
+            decision: nas_history::ReviewDecision::Accepted,
+        };
+        let _ = nas_history::record_mark(&history_dir, &mark);
+        self.rebuild_review();
+        self.set_status_message("Trecho aceito.".to_string());
+    }
+
+    /// `u`, dentro da revisão: rejeita o trecho sob o cursor — desfaz
+    /// aquela mudança no arquivo real (como uma edição do usuário),
+    /// só se o texto atual ainda for exatamente o que a IA deixou
+    /// (mesma semântica de `edit`, ADR 0006 §3/0008 §3): busca o texto
+    /// "depois" exato no conteúdo atual do arquivo, recusa se não
+    /// achar ou achar mais de uma vez.
+    fn review_reject(&mut self) {
+        let Some(idx) = self.current_review_hunk() else {
+            self.set_status_message("Nenhum trecho sob o cursor.".to_string());
+            return;
+        };
+        let Some(session) = &self.review else {
+            return;
+        };
+        let hunk = session.hunks[idx].clone();
+        let from_checkpoint = session.from_checkpoint.clone();
+
+        let Some(current_bytes) = self.current_content_for(&hunk.file) else {
+            self.set_status_message(format!("'{}' não existe mais.", hunk.file));
+            return;
+        };
+        let current_text = String::from_utf8_lossy(&current_bytes).into_owned();
+        let occurrences = current_text.matches(hunk.after.as_str()).count();
+        if occurrences != 1 {
+            self.set_status_message(format!(
+                "'{}' já mudou desde a revisão — rejeitar recusado.",
+                hunk.file
+            ));
+            return;
+        }
+        let byte_pos = current_text
+            .find(hunk.after.as_str())
+            .expect("já contado acima");
+        let from = current_text[..byte_pos].chars().count();
+        let to = from + hunk.after.chars().count();
+
+        let buffer_index = match self.find_buffer_by_path(Path::new(&hunk.file)) {
+            Some(index) => index,
+            None => match Document::open(&hunk.file) {
+                Ok(document) => {
+                    self.buffers.push(Buffer::new(document));
+                    self.buffers.len() - 1
+                }
+                Err(err) => {
+                    self.set_status_message(format!("Erro ao abrir '{}': {err}", hunk.file));
+                    return;
+                }
+            },
+        };
+        let change = self.buffers[buffer_index]
+            .document
+            .replace_region(from, to, &hunk.before);
+        self.journal_record_for(
+            hunk.file.clone(),
+            "review-reject",
+            change.from,
+            change.to,
+            change.removed,
+            change.inserted,
+        );
+
+        if let Some(history_dir) = self.history_dir() {
+            let mark = nas_history::ReviewMark {
+                ts: nas_history::now_unix(),
+                reviewer: Author::User,
+                from_checkpoint,
+                file: hunk.file.clone(),
+                hunk_hash: hunk.hash.clone(),
+                decision: nas_history::ReviewDecision::Rejected,
+            };
+            let _ = nas_history::record_mark(&history_dir, &mark);
+        }
+
+        self.rebuild_review();
+        self.set_status_message("Trecho rejeitado.".to_string());
+    }
+
+    /// `g h`, dentro da revisão: abre o arquivo real na linha do
+    /// trecho sob o cursor e sai da revisão. Sem trecho atual (ou
+    /// fora da revisão, `self.review` é `None`), não tem efeito.
+    fn review_goto(&mut self) {
+        let Some(idx) = self.current_review_hunk() else {
+            self.set_status_message("Nenhum trecho sob o cursor.".to_string());
+            return;
+        };
+        let Some(session) = &self.review else {
+            return;
+        };
+        let file = session.hunks[idx].file.clone();
+        let line = session.hunks[idx].after_start_line;
+        self.close_review();
+        self.open_file(&file);
+        self.document_mut().goto_line(line);
+    }
+
+    /// O índice do primeiro trecho de cada arquivo tocado, na ordem
+    /// em que aparecem na revisão — pra `H k`/`H l` saltarem entre
+    /// arquivos.
+    fn review_file_start_indices(&self) -> Vec<usize> {
+        let Some(session) = &self.review else {
+            return Vec::new();
+        };
+        let mut starts = Vec::new();
+        let mut last_file: Option<&str> = None;
+        for (i, hunk) in session.hunks.iter().enumerate() {
+            if last_file != Some(hunk.file.as_str()) {
+                starts.push(i);
+                last_file = Some(hunk.file.as_str());
+            }
+        }
+        starts
+    }
+
+    /// O trecho mais próximo, na posição atual do cursor (o último
+    /// cujo cabeçalho vem antes ou no cursor) — ponto de partida pra
+    /// `h`/`H` navegarem por delta.
+    fn current_review_hunk_overall(&self) -> Option<usize> {
+        let session = self.review.as_ref()?;
+        if session.hunks.is_empty() {
+            return None;
+        }
+        let cursor_line = self.document().cursor_position().line;
+        let mut best = 0;
+        for (i, hunk) in session.hunks.iter().enumerate() {
+            if hunk.header_line <= cursor_line {
+                best = i;
+            }
+        }
+        Some(best)
+    }
+
+    /// `h k`/`h l`: próximo/anterior trecho, dando a volta nas pontas.
+    fn review_move_hunk(&mut self, delta: isize) {
+        let Some(len) = self.review.as_ref().map(|s| s.hunks.len()) else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        let current = self.current_review_hunk_overall().unwrap_or(0) as isize;
+        let target = (current + delta).rem_euclid(len as isize) as usize;
+        let line = self.review.as_ref().unwrap().hunks[target].header_line;
+        let offset = self.document().line_start_offset(line);
+        self.document_mut().set_cursor(offset);
+    }
+
+    /// `H k`/`H l`: próximo/anterior arquivo, dando a volta nas
+    /// pontas.
+    fn review_move_file(&mut self, delta: isize) {
+        let starts = self.review_file_start_indices();
+        if starts.is_empty() {
+            return;
+        }
+        let current_overall = self.current_review_hunk_overall().unwrap_or(0);
+        let current_group = starts
+            .iter()
+            .rposition(|&start| start <= current_overall)
+            .unwrap_or(0);
+        let target_group =
+            (current_group as isize + delta).rem_euclid(starts.len() as isize) as usize;
+        let target_hunk = starts[target_group];
+        let line = self.review.as_ref().unwrap().hunks[target_hunk].header_line;
+        let offset = self.document().line_start_offset(line);
+        self.document_mut().set_cursor(offset);
+    }
+
+    /// Sai da revisão: registra o fim da sessão (`reviews_log.jsonl`,
+    /// ADR 0008 §5) e remove o buffer sintético — sem efeito se não
+    /// houver revisão aberta (seguro de chamar de vários lugares:
+    /// `Esc`, trocar/fechar buffer, sair do nas).
+    fn close_review(&mut self) {
+        let Some(session) = self.review.take() else {
+            return;
+        };
+        if let Some(history_dir) = self.history_dir() {
+            let entry = nas_history::ReviewLogEntry {
+                started_at: session.started_at,
+                ended_at: nas_history::now_unix(),
+                from_checkpoint: session.from_checkpoint,
+                total_hunks: session.total_hunks,
+                accepted: session.accepted,
+                rejected: session.rejected,
+            };
+            let _ = nas_history::record_log_entry(&history_dir, &entry);
+        }
+        if session.buffer_index < self.buffers.len() {
+            self.buffers.remove(session.buffer_index);
+        }
+        self.active = session
+            .previous_active
+            .min(self.buffers.len().saturating_sub(1));
+    }
+
     /// `Ctrl+t m`: histórico de mensagens da echo area, num `Overlay`
     /// — mais recente primeiro, como `checkpoint_list`.
     fn show_message_history(&mut self) {
@@ -1898,14 +2480,111 @@ fn checkpoint_created_message(created: &nas_history::CreatedCheckpoint) -> Strin
     )
 }
 
-/// Nome de exibição de um autor, pra autoria legível no terminal.
-fn format_author(author: &Author) -> String {
+/// Nome de exibição de um autor, pra autoria legível no terminal —
+/// `pub(crate)` pra `ui::draw_review_picker` reaproveitar, mesma
+/// formatação que `checkpoint_list` já usa.
+pub(crate) fn format_author(author: &Author) -> String {
     match author {
         Author::User => "você".to_string(),
         Author::Ai { agent, .. } => format!("IA ({agent})"),
         Author::Extension { name } => format!("extensão ({name})"),
         Author::External => "externo".to_string(),
     }
+}
+
+/// A autoria de um cabeçalho de trecho, na revisão — "autoria
+/// desconhecida" sem nenhum autor, o nome de um autor só (com a
+/// sessão, se for a IA — ADR 0008 §2: "IA (claude-code, sessão
+/// a1b2)"), ou "misto (A + B)" com mais de um.
+fn format_hunk_authors(authors: &[Author]) -> String {
+    if authors.is_empty() {
+        return "autoria desconhecida".to_string();
+    }
+    let parts: Vec<String> = authors
+        .iter()
+        .map(|author| match author {
+            Author::Ai { agent, session } => format!("IA ({agent}, sessão {session})"),
+            other => format_author(other),
+        })
+        .collect();
+    if parts.len() == 1 {
+        parts.into_iter().next().expect("checado acima")
+    } else {
+        format!("misto ({})", parts.join(" + "))
+    }
+}
+
+/// O deslocamento em caracteres do início da linha `line` (1-indexada,
+/// como `nas_history::TextHunk::new_start_line`) dentro de `text` —
+/// pra converter a posição de um trecho (em linhas) pra um intervalo
+/// de caracteres (o que `nas_history::attribute_hunk` espera, porque o
+/// journal registra posições em caracteres, ADR 0005 §1).
+fn char_offset_of_line(text: &str, line: usize) -> usize {
+    text.split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(|l| l.chars().count())
+        .sum()
+}
+
+/// Monta o texto do buffer sintético da revisão (ADR 0008 §2): um
+/// resumo, depois um bloco por arquivo, cada trecho em diff unificado
+/// (`-`/`+`) com um cabeçalho — arquivo, linha, autoria, e "[revisado]"
+/// se já tiver uma marca. Preenche `header_line`/`body_end_line` de
+/// cada `ReviewHunk` (0-indexados, como `Document::cursor_position`)
+/// com a posição que ele ocupa no texto gerado — é assim que o cursor
+/// na revisão volta a apontar pra um trecho.
+fn render_review_buffer(hunks: &mut [ReviewHunk]) -> String {
+    let total = hunks.len();
+    let reviewed = hunks.iter().filter(|h| h.decision.is_some()).count();
+    let files = hunks
+        .iter()
+        .map(|h| h.file.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+
+    let mut lines: Vec<String> = vec![
+        format!("Revisão — {files} arquivo(s), {total} trecho(s), {reviewed} já revisado(s)"),
+        String::new(),
+    ];
+
+    let mut current_file: Option<&str> = None;
+    for hunk in hunks.iter_mut() {
+        if current_file != Some(hunk.file.as_str()) {
+            if current_file.is_some() {
+                lines.push(String::new());
+            }
+            lines.push(format!("=== {} ===", hunk.file));
+            current_file = Some(hunk.file.as_str());
+        }
+
+        let mut header = format!(
+            "{}:{}  {}",
+            hunk.file,
+            hunk.after_start_line,
+            format_hunk_authors(&hunk.authors)
+        );
+        match hunk.decision {
+            Some(nas_history::ReviewDecision::Accepted) => header.push_str("  [revisado]"),
+            Some(nas_history::ReviewDecision::Rejected) => header.push_str("  [rejeitado]"),
+            None => {}
+        }
+        hunk.header_line = lines.len();
+        lines.push(header);
+
+        for line in hunk.before.lines() {
+            lines.push(format!("-{line}"));
+        }
+        for line in hunk.after.lines() {
+            lines.push(format!("+{line}"));
+        }
+        hunk.body_end_line = lines.len() - 1;
+    }
+
+    if hunks.is_empty() {
+        lines.push("Nenhuma diferença pra revisar.".to_string());
+    }
+
+    lines.join("\n")
 }
 
 fn verb_label(verb: Verb) -> &'static str {
@@ -1932,6 +2611,13 @@ fn to_region_object(object: Object) -> RegionObject {
         Object::ParagraphBackward => RegionObject::ParagraphBackward,
         Object::CurrentLine => RegionObject::CurrentLine,
         Object::WholeBuffer => RegionObject::WholeBuffer,
+        // Hunk/File (ADR 0008 §4) só existem como unidade sozinha —
+        // nunca combinam com um verbo (bloqueado por nome de ação em
+        // Review, Keymap::review_resolution), então nunca chegam
+        // como o objeto de um VerbObject.
+        Object::HunkForward | Object::HunkBackward | Object::FileForward | Object::FileBackward => {
+            unreachable!("trecho/arquivo nunca são objeto de um verbo")
+        }
     }
 }
 
