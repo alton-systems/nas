@@ -4,7 +4,7 @@
 //! vive em `docs/keys.md`; este módulo só sabe interpretar o formato
 //! TOML que a implementa.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -12,7 +12,9 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::key::Key;
-use crate::machine::{Action, CatalogEntry, Object, SystemAction, Unit, Verb, plain_motion_for};
+use crate::machine::{
+    Action, CatalogEntry, CommandTarget, Object, SystemAction, Unit, Verb, plain_motion_for,
+};
 
 /// O keymap embutido no binário — a única fonte de verdade para
 /// atalhos; ver `docs/decisions/0004-especificacao-de-teclas-no-nas.md`.
@@ -282,34 +284,55 @@ impl Keymap {
 
     /// O catálogo da paleta de comandos — ver [`crate::machine::Machine::command_catalog`],
     /// que é quem expõe isto fora do crate (depois de traduzir as
-    /// teclas pro layout físico). Monta a lista crua (nome, teclas em
-    /// qwerty canônico, se é Ctrl, se é destrutivo) a partir do
-    /// próprio keymap, sem tocar nada externo — determinístico:
-    /// `HashMap` não garante ordem, então a lista crua é sempre
-    /// ordenada e deduplicada antes de devolver (ver `dedup_sorted`).
+    /// teclas pro layout físico). **Todo** nome de `[commands]`,
+    /// menos os próprios prefixos (`go`, `leader`, `tempo` —
+    /// docs/keys.md, "Prefixos não aparecem como itens") — não só os
+    /// alcançáveis por tecla: um comando sem atalho (por natureza, ou
+    /// porque o keymap do usuário removeu o único vínculo que havia)
+    /// continua na lista, só com `keys` vazio.
     ///
-    /// **O que entra:** ações diretas, verbos e unidades de `[visual]`
-    /// (armam um pendente — executar pela paleta "aperta a tecla", não
-    /// completa o composto sozinho), prefixos resolvidos
-    /// recursivamente até um comando de verdade (`g l`, `SPC f`, ...),
-    /// unidade sozinha + direção (`w ;`, `W k`, ..., que é como
-    /// `move-word-forward` etc. são alcançados — a mesma resolução de
-    /// `Machine::resolve_pending`), e a classe sistema/Ctrl
-    /// (`[system]` + `[system_prefixes.*]`).
-    ///
-    /// **O que não entra, de propósito:** os próprios prefixos (`go`,
-    /// `leader`, `tempo` — docs/keys.md, "Prefixos não aparecem como
-    /// itens") e os nomes de **objeto** puro (`char-left`,
-    /// `whole-buffer`, `current-line`, ...) — esses só existem como o
-    /// complemento de um verbo já pendente, nunca como um comando
-    /// autônomo que "apertar uma tecla a partir do Visual" alcance por
-    /// si só; incluí-los exigiria simular um verbo arbitrário
-    /// pendente, o que não corresponde a nenhuma tecla real.
+    /// Monta primeiro um mapa nome → atalho a partir do próprio
+    /// keymap (`shortcut_map`, determinístico — `HashMap` não garante
+    /// ordem, então a lista crua é sempre ordenada e deduplicada antes
+    /// de virar mapa), depois percorre `self.commands` (a fonte de
+    /// verdade de quais nomes existem) consultando esse mapa — nunca o
+    /// inverso, que deixaria de fora qualquer nome sem tecla nenhuma.
     pub(crate) fn catalog(&self) -> Vec<CatalogEntry> {
         let mut raw = Vec::new();
         collect_modal_catalog(&self.visual, &[], self, &mut raw);
+        collect_object_catalog(self, &mut raw);
         collect_system_catalog(self, &mut raw);
-        dedup_sorted(raw, self)
+        let shortcuts = shortcut_map(raw);
+
+        let prefix_names: HashSet<&str> = self
+            .prefixes
+            .keys()
+            .map(String::as_str)
+            .chain(self.system_prefixes.keys().map(String::as_str))
+            .collect();
+
+        let mut names: Vec<&String> = self
+            .commands
+            .keys()
+            .filter(|name| !prefix_names.contains(name.as_str()))
+            .collect();
+        names.sort();
+
+        names
+            .into_iter()
+            .map(|name| {
+                let (keys, ctrl, destructive) =
+                    shortcuts.get(name.as_str()).cloned().unwrap_or_default();
+                CatalogEntry {
+                    name: name.clone(),
+                    description: self.describe(name),
+                    keys,
+                    ctrl,
+                    destructive,
+                    target: command_target(name),
+                }
+            })
+            .collect()
     }
 }
 
@@ -319,15 +342,15 @@ impl Keymap {
 type RawCatalogEntry = (String, Vec<Key>, bool, bool);
 
 /// Percorre `[visual]` (ou um `[prefixes.*]`, recursivamente)
-/// coletando todo comando alcançável, com a sequência de teclas que o
-/// alcança a partir de `prefix` (vazio na chamada de topo). Verbos e
-/// unidades entram como o próprio comando (`delete`, `word`, ...) —
-/// nunca recursa nos objetos que completam o composto, ver a nota em
-/// [`Keymap::catalog`]. A única exceção em que uma unidade *sozinha*
-/// produz um comando diferente de si mesma é a direção que a completa
-/// (`w ;` → `move-word-forward`), resolvida abaixo via
-/// `plain_motion_for` — a mesma conversão que `Machine::resolve_pending`
-/// já faz em tempo de tecla.
+/// coletando todo comando alcançável a partir do Visual, com a
+/// sequência de teclas que o alcança a partir de `prefix` (vazio na
+/// chamada de topo). Verbos e unidades entram como o próprio comando
+/// (`delete`, `word`, ...) — nunca recursa nos objetos que completam
+/// o composto (ver [`collect_object_catalog`] pra esses). A única
+/// exceção em que uma unidade *sozinha* produz um comando diferente de
+/// si mesma é a direção que a completa (`w ;` → `move-word-forward`),
+/// resolvida abaixo via `plain_motion_for` — a mesma conversão que
+/// `Machine::resolve_pending` já faz em tempo de tecla.
 fn collect_modal_catalog(
     bindings: &HashMap<Key, Binding>,
     prefix: &[Key],
@@ -348,9 +371,11 @@ fn collect_modal_catalog(
                 out.push(("enter-sequential".to_string(), keys, false, false))
             }
             Binding::Repeat => out.push(("repeat".to_string(), keys, false, false)),
-            // Só existe em [insert] (M-SPC -> enter-visual); a paleta só
-            // abre a partir do Visual (docs/keys.md), então nunca é
-            // alcançável daqui — sem entrada no catálogo.
+            // Só existe em [insert] (M-SPC -> enter-visual) no keymap
+            // padrão — nunca alcançável a partir de [visual]/
+            // [prefixes.*], que é tudo que esta função percorre; fica
+            // como salvaguarda caso um keymap.toml bizarro ligue
+            // "enter-visual" direto num prefixo do Visual.
             Binding::EnterVisual => {}
             Binding::Verb(verb) => {
                 out.push((verb.command_name().to_string(), keys, false, false));
@@ -372,6 +397,29 @@ fn collect_modal_catalog(
                     collect_modal_catalog(sub, &keys, keymap, out);
                 }
             }
+        }
+    }
+}
+
+/// Os nomes de **objeto** (`char-left`, `whole-buffer`, `word-forward`,
+/// ...) direto das tabelas `[objects.*]` — a mesma tecla de um
+/// movimento já capturado por [`collect_modal_catalog`] (ex.: `j` é
+/// `move-left` sozinho e `char-left` como objeto de um verbo), só que
+/// com o nome e a tecla que fazem sentido quando um verbo já está
+/// pendente. `current-line` nunca aparece aqui — não tem tabela
+/// nenhuma (é "o próprio verbo repetido", docs/keys.md §5.3), então
+/// fica de fora do mapa de atalhos e a paleta mostra sem tecla.
+fn collect_object_catalog(keymap: &Keymap, out: &mut Vec<RawCatalogEntry>) {
+    let tables = [
+        keymap.objects_horizontal(),
+        keymap.objects_vertical(),
+        keymap.objects_whole(),
+        keymap.objects_for_unit(Unit::Word),
+        keymap.objects_for_unit(Unit::Paragraph),
+    ];
+    for table in tables {
+        for (key, object) in table {
+            out.push((object.command_name().to_string(), vec![*key], false, false));
         }
     }
 }
@@ -406,25 +454,19 @@ fn collect_system_catalog(keymap: &Keymap, out: &mut Vec<RawCatalogEntry>) {
 /// arbitrário mas estável — o keymap não declara um atalho "canônico",
 /// e qualquer escolha fixa serve, desde que não mude de uma chamada
 /// pra outra (o que quebraria os snapshots da paleta em `nas-term`).
-fn dedup_sorted(mut raw: Vec<RawCatalogEntry>, keymap: &Keymap) -> Vec<CatalogEntry> {
+/// Um nome ausente do mapa resultante (não deduplicado aqui, por
+/// construção) significa "sem atalho nenhum" — `Keymap::catalog` lê
+/// isso como `(Vec::new(), false, false)`.
+fn shortcut_map(mut raw: Vec<RawCatalogEntry>) -> HashMap<String, (Vec<Key>, bool, bool)> {
     raw.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| render_keys(&a.1).cmp(&render_keys(&b.1)))
     });
-    let mut seen = std::collections::HashSet::new();
-    raw.into_iter()
-        .filter(|(name, ..)| seen.insert(name.clone()))
-        .map(|(name, keys, ctrl, destructive)| {
-            let description = keymap.describe(&name);
-            CatalogEntry {
-                name,
-                description,
-                keys,
-                ctrl,
-                destructive,
-            }
-        })
-        .collect()
+    let mut map = HashMap::new();
+    for (name, keys, ctrl, destructive) in raw {
+        map.entry(name).or_insert((keys, ctrl, destructive));
+    }
+    map
 }
 
 fn render_keys(keys: &[Key]) -> String {
@@ -432,6 +474,40 @@ fn render_keys(keys: &[Key]) -> String {
         .map(Key::to_string)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// O alvo de execução direta (sem tecla nenhuma) de `name`, se houver
+/// um — ver `CatalogEntry::target`. Pura busca por vocabulário:
+/// reaproveita os mesmos `parse_*` que interpretam o keymap em TOML,
+/// então um nome só resolve aqui se for um dos nomes que o keymap já
+/// reconheceria como ação, verbo, unidade ou comando de sistema —
+/// nunca por estar (ou não) ligado a alguma tecla agora, o que é
+/// exatamente o que permite continuar resolvendo mesmo depois do
+/// usuário remover a única tecla de um comando (`chave = false`,
+/// docs/config.md). Nomes de objeto puro (`char-left`, `whole-buffer`,
+/// `current-line`, ...) não batem com nenhum desses vocabulários —
+/// devolvem `None` de propósito, por não terem execução autônoma
+/// coerente fora de um verbo pendente (ver `Keymap::catalog`).
+fn command_target(name: &str) -> Option<CommandTarget> {
+    if let Ok(action) = parse_system_action(name) {
+        return Some(CommandTarget::System(action));
+    }
+    if let Ok(action) = parse_action(name) {
+        return Some(CommandTarget::Modal(Binding::Action(action)));
+    }
+    if let Ok(verb) = parse_verb(name) {
+        return Some(CommandTarget::Modal(Binding::Verb(verb)));
+    }
+    if let Ok(unit) = parse_unit(name) {
+        return Some(CommandTarget::Modal(Binding::Unit(unit)));
+    }
+    match name {
+        "enter-insert" => Some(CommandTarget::Modal(Binding::EnterInsert)),
+        "enter-visual" => Some(CommandTarget::Modal(Binding::EnterVisual)),
+        "enter-sequential" => Some(CommandTarget::Modal(Binding::EnterSequential)),
+        "repeat" => Some(CommandTarget::Modal(Binding::Repeat)),
+        _ => None,
+    }
 }
 
 /// `deny_unknown_fields`: um atalho com campos de mais de uma forma
@@ -951,17 +1027,40 @@ z = "move-right"
     }
 
     #[test]
-    fn catalogo_nao_inclui_prefixos_nem_objetos_puros() {
+    fn catalogo_nao_inclui_prefixos_mas_inclui_todo_objeto_puro() {
+        // "Prefixos não aparecem como itens" (docs/keys.md) continua
+        // valendo — mas a revisão do PR #30 pede TODO nome de
+        // [commands], não só os alcançáveis por tecla sozinha: os
+        // nomes de objeto (só completam um verbo já pendente) agora
+        // aparecem, com o atalho que a própria tabela [objects.*]
+        // declara (mesma tecla de um movimento, só que no papel de
+        // objeto) — exceto "current-line", que não tem tabela
+        // nenhuma (é "o verbo repetido"), então aparece sem atalho.
         let keymap = Keymap::default_keymap();
         let catalog = keymap.catalog();
+        let find = |name: &str| catalog.iter().find(|entry| entry.name == name);
         let names: Vec<&str> = catalog.iter().map(|entry| entry.name.as_str()).collect();
 
         for prefix in ["go", "leader", "tempo"] {
             assert!(!names.contains(&prefix), "{prefix} não deveria aparecer");
         }
-        for object in ["char-left", "whole-buffer", "current-line", "line-start"] {
-            assert!(!names.contains(&object), "{object} não deveria aparecer");
-        }
+
+        let char_left = find("char-left").expect("char-left deveria aparecer");
+        assert_eq!(char_left.keys, vec![Key::char('j')]);
+        assert!(char_left.target.is_none());
+
+        let line_start = find("line-start").expect("line-start deveria aparecer");
+        assert_eq!(line_start.keys, vec![Key::char('J')]);
+
+        let whole_buffer = find("whole-buffer").expect("whole-buffer deveria aparecer");
+        assert_eq!(whole_buffer.keys, vec![Key::char('a')]);
+
+        let current_line = find("current-line").expect("current-line deveria aparecer");
+        assert!(
+            current_line.keys.is_empty(),
+            "current-line não tem tabela — é só \"o verbo repetido\""
+        );
+        assert!(current_line.target.is_none());
     }
 
     #[test]
@@ -1013,6 +1112,37 @@ z = "move-right"
             .filter(|entry| entry.name == "move-buffer-start")
             .count();
         assert_eq!(occurrences, 1);
+    }
+
+    #[test]
+    fn comando_sem_tecla_alcanca_via_target_mesmo_sem_atalho_no_keymap() {
+        // "history-delete" é removido do keymap do jeito que o
+        // usuário removeria uma tecla em keymap.toml — simulado aqui
+        // direto no TOML, já que este teste é do próprio nas-keys, não
+        // da camada de mesclagem do nas-config (ver
+        // crates/nas-config/src/keymap_layer.rs pro teste de ponta a
+        // ponta com "chave = false").
+        let keymap = Keymap::from_toml_str(&DEFAULT_TOML.replace(
+            "z = { action = \"history-delete\", destructive = true }\n",
+            "",
+        ))
+        .expect("keymap válido sem o 'z' de history-delete");
+
+        let entry = keymap
+            .catalog()
+            .into_iter()
+            .find(|entry| entry.name == "history-delete")
+            .expect("history-delete deveria continuar no catálogo");
+        assert!(entry.keys.is_empty());
+        assert!(
+            !entry.destructive,
+            "sem vínculo nenhum, não há de onde vir a marca destrutiva"
+        );
+        assert_eq!(
+            entry.target,
+            Some(CommandTarget::System(SystemAction::HistoryDelete)),
+            "mesmo sem tecla, o alvo de execução direta continua resolvendo"
+        );
     }
 
     #[test]

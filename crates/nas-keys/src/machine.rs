@@ -364,28 +364,55 @@ pub struct PendingHint {
 }
 
 /// Um comando do catálogo da paleta de comandos (`Espaço p`/`Shift+Espaço`,
-/// docs/keys.md "paleta de comandos") — nome, descrição, e o atalho que
-/// o alcança sozinho a partir do estado Visual, se houver um. Produzido
-/// por [`Machine::command_catalog`], já com as teclas traduzidas pro
-/// layout físico do usuário (pra exibição — ver [`crate::layout::to_physical`]).
+/// docs/keys.md "paleta de comandos") — **todo** nome de `[commands]`
+/// do keymap, menos os próprios prefixos (`go`, `leader`, `tempo`), já
+/// com o keymap do usuário aplicado. Produzido por
+/// [`Machine::command_catalog`], com as teclas traduzidas pro layout
+/// físico do usuário (pra exibição — ver [`crate::layout::to_physical`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogEntry {
     /// O nome usado em `[commands]` do keymap — também o que entra em
     /// `App::recent_commands` quando executado pela paleta.
     pub name: String,
     pub description: String,
-    /// Vazio se o comando não tem um atalho que o alcance sozinho a
-    /// partir do estado Visual — ainda aparece na paleta (docs/keys.md),
-    /// só sem nada pra mostrar como atalho.
+    /// Vazio se o comando não tem (mais) um atalho que o alcance
+    /// sozinho a partir do estado Visual — por natureza (ex.:
+    /// `current-line`, só "o verbo repetido", nunca uma tecla própria)
+    /// ou porque o keymap do usuário removeu o único vínculo que
+    /// existia (`chave = false`, docs/config.md) — em qualquer um dos
+    /// dois casos, o comando continua na paleta (docs/keys.md).
     pub keys: Vec<Key>,
     /// `true` se a **primeira** tecla de `keys` é Ctrl (classe sistema) —
     /// nunca a segunda: `Ctrl+t n` é Ctrl só na tecla que abre o
     /// prefixo, nunca na que o completa.
     pub ctrl: bool,
     /// Ação destrutiva (hoje só `history-delete`, `Ctrl+t z`) — a
-    /// paleta marca essas com um aviso discreto, como o which-key já
-    /// faz (`ui::which_key_lines`).
+    /// paleta marca essas com a mesma cor de alerta que o which-key já
+    /// usa (`ui::which_key_lines`, `HINT_DESTRUCTIVE_COLOR`).
     pub destructive: bool,
+    /// Como executar este comando **sem** passar por nenhuma tecla —
+    /// usado só quando `keys` está vazio (quem chama prefere sempre
+    /// repetir a tecla de verdade, quando existe uma: isso preserva
+    /// nuances como "só arma o pendente se não houver seleção ativa
+    /// agora", que `dispatch`/dispatch de sistema não sabem decidir
+    /// sozinhos). `None` só para os nomes de **objeto** puro (`char-left`,
+    /// `whole-buffer` fora de um verbo pendente, `current-line`, ...) —
+    /// esses não têm execução autônoma coerente, por não serem um
+    /// `Binding` nem uma `SystemAction` nomeada; só fazem sentido como
+    /// o complemento de um verbo já pendente.
+    pub target: Option<CommandTarget>,
+}
+
+/// O que executar quando um comando do catálogo não tem tecla
+/// nenhuma pra "repetir" — ver [`CatalogEntry::target`]. As duas
+/// variantes espelham as duas classes de comando que o keymap conhece
+/// (modal, resolvida por [`Machine::dispatch`]; sistema/Ctrl,
+/// resolvida por quem chama — `App::dispatch_system_action` em
+/// `nas-term` — já que `Machine` não sabe nada de classe sistema).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandTarget {
+    Modal(Binding),
+    System(SystemAction),
 }
 
 /// A máquina modal nunca marca nada como destrutivo — só o prefixo de
@@ -512,15 +539,13 @@ impl Machine {
     }
 
     /// O catálogo da paleta de comandos (docs/keys.md "paleta de
-    /// comandos") — todo comando alcançável a partir do estado Visual
-    /// (ações diretas, verbos e unidades que armam um pendente,
-    /// prefixos resolvidos recursivamente, e a classe sistema/Ctrl),
-    /// com as teclas já traduzidas pro layout físico em uso (pra
-    /// exibição — a máquina continua resolvendo tudo em qwerty
-    /// canônico por dentro). Prefixos em si (`go`, `leader`, `tempo`)
-    /// nunca aparecem — só os comandos em que eles resolvem.
-    /// Determinístico: mesma entrada, mesma ordem, sempre (ver
-    /// `Keymap::catalog`) — quem chama decide a ordem de exibição
+    /// comandos") — **todo** nome de `[commands]` do keymap, menos os
+    /// próprios prefixos (`go`, `leader`, `tempo`), com o atalho que o
+    /// alcança sozinho a partir do Visual, se houver um, e as teclas
+    /// já traduzidas pro layout físico em uso (pra exibição — a
+    /// máquina continua resolvendo tudo em qwerty canônico por
+    /// dentro). Determinístico: mesma entrada, mesma ordem, sempre
+    /// (ver `Keymap::catalog`) — quem chama decide a ordem de exibição
     /// (recência, busca) por conta própria.
     pub fn command_catalog(&self) -> Vec<CatalogEntry> {
         self.keymap
@@ -533,6 +558,19 @@ impl Machine {
                 entry
             })
             .collect()
+    }
+
+    /// Executa diretamente o que a tecla ligada a `binding` faria —
+    /// usado pela paleta de comandos quando `CatalogEntry::keys` está
+    /// vazio (nenhuma tecla pra "repetir", ver `CommandTarget::Modal`).
+    /// Mesmo efeito de [`Machine::handle_key`] resolver pra este
+    /// `binding`, com um desvio: um verbo sempre arma o pendente,
+    /// nunca age na hora sobre uma seleção — sem uma tecla de verdade
+    /// não há como saber se existe uma seleção ativa *agora* (ver
+    /// `run_binding`); isso só importa no caso raro de o usuário ter
+    /// removido a única tecla de um verbo do keymap.
+    pub fn dispatch(&mut self, binding: Binding) -> Vec<Action> {
+        self.run_binding(binding)
     }
 
     fn key_text_for_prefix(&self, name: &str) -> String {
