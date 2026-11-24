@@ -432,10 +432,12 @@ pub fn prune_with_limits(
     //    sobrevivente.
     let removed_objects = garbage_collect_objects(history_dir, &manifests)?;
 
-    // 4. Journal: só entradas mais novas que o checkpoint mais antigo
-    //    ainda vivo (nomeado ou automático).
+    // 4. Journal e journal de permissões: só entradas mais novas que
+    //    o checkpoint mais antigo ainda vivo (nomeado ou automático) —
+    //    mesma regra de corte pros dois.
     if let Some(oldest) = manifests.iter().map(|m| m.created_at).min() {
         prune_journal(history_dir, oldest)?;
+        prune_permissions_log(history_dir, oldest)?;
     }
 
     Ok(PruneReport {
@@ -496,6 +498,24 @@ fn prune_journal(history_dir: &Path, cutoff: u64) -> io::Result<()> {
     let entries = read_entries(&path)?;
     let mut content = String::new();
     for entry in entries.iter().filter(|e| e.ts_end >= cutoff) {
+        let line = serde_json::to_string(entry)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        content.push_str(&line);
+        content.push('\n');
+    }
+    fs::write(&path, content)
+}
+
+/// Como [`prune_journal`], pra `permissions_log.jsonl` (ADR 0006 §5,
+/// etapa 3d) — mesma regra de corte (só entradas mais novas que o
+/// checkpoint sobrevivente mais antigo), só que sobre `ts` em vez de
+/// `ts_end` (uma decisão de permissão é um instante só, não um
+/// intervalo).
+fn prune_permissions_log(history_dir: &Path, cutoff: u64) -> io::Result<()> {
+    let path = crate::permissions::permission_log_path(history_dir);
+    let entries = crate::permissions::read_decisions(history_dir)?;
+    let mut content = String::new();
+    for entry in entries.iter().filter(|e| e.ts >= cutoff) {
         let line = serde_json::to_string(entry)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         content.push_str(&line);
@@ -835,6 +855,44 @@ mod tests {
         let entries = read_entries(&journal_path(dir.path())).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file, "b.txt");
+    }
+
+    #[test]
+    fn poda_do_journal_de_permissoes_remove_entradas_mais_antigas_que_o_checkpoint_sobrevivente() {
+        use crate::permissions::{PermissionDecision, PermissionDecisionEntry, record_decision};
+
+        let dir = tempfile::tempdir().unwrap();
+        let antiga = PermissionDecisionEntry {
+            ts: 50,
+            agent: "a".to_string(),
+            session: "s".to_string(),
+            command: "save_file".to_string(),
+            effect: "write-file".to_string(),
+            decision: PermissionDecision::Denied,
+        };
+        let nova = PermissionDecisionEntry {
+            ts: 500,
+            ..antiga.clone()
+        };
+        record_decision(dir.path(), &antiga).unwrap();
+        record_decision(dir.path(), &nova).unwrap();
+
+        automatic_checkpoint(dir.path(), "cp", 100);
+
+        prune_with_limits(dir.path(), MAX_AUTOMATIC_CHECKPOINTS, MAX_TOTAL_SIZE_BYTES).unwrap();
+
+        let entries = crate::permissions::read_decisions(dir.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ts, 500);
+    }
+
+    #[test]
+    fn poda_sem_nenhuma_decisao_de_permissao_registrada_nao_e_erro() {
+        let dir = tempfile::tempdir().unwrap();
+        automatic_checkpoint(dir.path(), "cp", 100);
+
+        prune_with_limits(dir.path(), MAX_AUTOMATIC_CHECKPOINTS, MAX_TOTAL_SIZE_BYTES)
+            .expect("podar sem permissions_log.jsonl nenhum não deveria falhar");
     }
 
     #[test]

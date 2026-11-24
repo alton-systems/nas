@@ -353,8 +353,13 @@ se vale a pena uma UI nativa de sessão dentro do nas-term.
 
 Refino o pilar 2 do README: em vez da mesma barreira pra todo efeito
 não-`Pure`, a aprovação é por **risco real**, não só pela classe —
-e só quando o autor é `Author::Ai` (um humano nunca precisa aprovar a
-própria tecla).
+e só quando o autor **não** é `Author::User` (um humano nunca precisa
+aprovar a própria tecla). **Revisão da etapa 3d**: a checagem vale
+pra todo autor que não seja o usuário, não só `Author::Ai` — uma
+extensão futura (`Author::Extension`) ou uma mudança detectada por
+fora (`Author::External`) nascem bloqueadas por padrão igual a um
+agente de IA, em vez de precisarem de uma exceção própria no dia em
+que algo de verdade as produzir.
 
 - **Liberados por padrão**: `Pure`, `ReadFile`, **`WriteBuffer`** e
   **`WriteHistory`**. `WriteBuffer` entra aqui de propósito — é
@@ -435,8 +440,8 @@ própria tecla).
   política sozinho, ou arquivo + pergunta) ficou pra trás por decisão
   de projeto — é a biblioteca pinada que não dá. Migrar `rmcp` pra uma
   versão com suporte é uma mudança grande (salto de major version,
-  API bem diferente da 0.3) — fica como trabalho futuro, com uma ADR
-  ou decisão própria quando for feita, não parte de 3d.
+  API bem diferente da 0.3) — fica registrada como etapa **3h** (§8),
+  depois da decisão do benchmark, não parte de 3d.
 - **O benchmark do §7 usa uma política explícita**: pra rodar as
   tarefas sem travar em cada aprovação, o arquivo de configuração do
   benchmark libera exatamente os efeitos que as tarefas escolhidas
@@ -581,8 +586,9 @@ Divisão em PRs pequenos, mesmo espírito da fase 2 (2a–2d). **Os
 nomes (3a, 3b, ...) identificam a etapa, não a ordem de execução** —
 a ordem real, revisada, é **3a → 3c → paleta de comandos (fora da
 fase 3) → 3d → 3e → revisão → 3f-prep → 3f (benchmark) → decisão →
-3b (núcleo em segundo plano) → 3g**, com janelas e modo de notas —
-também fora da fase 3 — só depois do ponto de decisão (ver abaixo).
+3h (rmcp 1.x + elicitation) → 3b (núcleo em segundo plano) → 3g**,
+com janelas e modo de notas — também fora da fase 3 — só depois do
+ponto de decisão (ver abaixo).
 O daemon (3b) virou a penúltima, não a segunda: é a etapa mais cara
 desta fase
 (processo novo, protocolo entre processos, autostart, remapeamento
@@ -690,6 +696,26 @@ depois.
   notas** — ambos fora da fase 3 e sem ADR própria ainda — só entram
   no roadmap depois deste ponto, nunca antes: nenhum dos dois ajuda a
   responder a pergunta que o benchmark faz.
+- **3h** (registrada; não implementada) — atualizar `rmcp` pra `1.x`
+  (ou a versão corrente, se for mais nova) e implementar a parte (b)
+  que a etapa 3d deixou de fora (§5): a pergunta de aprovação por
+  `elicitation` — agente, comando, caminho e efeito, com as opções
+  **uma vez**, **sempre nesta sessão** e **negar** (qualquer outra
+  resposta, ou nenhuma dentro de um tempo limite de alguns minutos,
+  nega — nunca aplica por silêncio). **Onde encaixa**: depois da
+  **Decisão** acima, antes de **3b** — as duas opções que o PR de 3d
+  pediu pra avaliar são, na prática, a mesma posição na ordem de hoje
+  (`decisão` já vem imediatamente antes de `3b`). Depois da decisão,
+  não antes, porque é um salto de major version do `rmcp` (API bem
+  diferente da `0.3` fixada hoje) — investimento que só vale a pena
+  depois de confirmar que o nas vai seguir pelo caminho de edição via
+  MCP, não pivotar pra histórico/supervisão. **Não depende do núcleo
+  em segundo plano (3b)**: a pergunta por `elicitation` é direto entre
+  o cliente MCP e `nas --mcp`, sem precisar do `nas-term` nem do
+  daemon — por isso pode vir antes de 3b (como proposto aqui), depois,
+  ou em paralelo; a posição só reflete que `decisão`/`3f` já precisam
+  ter acontecido primeiro. Rastreada também na issue #32 (rótulo
+  `ideia`), pra não depender só deste texto pra não ser esquecida.
 - **3b** — núcleo em segundo plano: `nas --daemon`, o socket por
   projeto em `$XDG_RUNTIME_DIR` (0600), o protocolo mínimo, múltiplos
   clientes, autostart/encerramento por inatividade/recuperação de

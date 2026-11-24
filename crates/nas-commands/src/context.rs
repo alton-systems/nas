@@ -331,7 +331,7 @@ pub struct CommandContext<'a> {
     /// consultando a política de permissões do projeto
     /// (`nas_history::load_permissions`, ADR 0006 §5, etapa 3d) antes
     /// de chamar `Registry::run`; sem o efeito aqui, um comando
-    /// `WriteFile`/`Shell`/`Network` pedido por um agente de IA é
-    /// recusado (`CommandError::NeedsApproval`).
+    /// `WriteFile`/`Shell`/`Network` pedido por qualquer autor que não
+    /// seja `Author::User` é recusado (`CommandError::NeedsApproval`).
     pub approved_effects: std::collections::HashSet<crate::effect::Effect>,
 }

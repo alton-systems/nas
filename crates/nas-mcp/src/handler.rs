@@ -17,8 +17,7 @@ use rmcp::service::{RequestContext, RoleServer};
 
 use nas_commands::{CommandContext, CommandSpec, Effect, Registry, Workspace};
 use nas_history::{
-    Author, PermissionDecision, PermissionDecisionEntry, PermissionSource, PermissionsError,
-    PermissionsPolicy,
+    Author, PermissionDecision, PermissionDecisionEntry, PermissionSource, PermissionsPolicy,
 };
 
 use crate::options::McpOptions;
@@ -26,13 +25,6 @@ use crate::options::McpOptions;
 pub(crate) struct NasMcpHandler {
     registry: Registry,
     workspace: Mutex<Workspace>,
-    /// A política de permissões deste projeto (ADR 0006 §5, etapa
-    /// 3d), lida uma vez ao iniciar — `Err` se `permissions.toml`
-    /// existir mas for inválido; tratado como "tudo negado" em
-    /// `decide_effect`, nunca como metade aplicada (ADR 0007 §3).
-    /// `Ok(PermissionsPolicy::default())` (tudo negado) se o arquivo
-    /// não existir, ou se não houver `history_dir` nenhum.
-    permissions: Result<PermissionsPolicy, PermissionsError>,
     /// Gerado uma vez, ao iniciar — `Author::Ai::session` pra toda
     /// chamada desta conexão (ADR 0006 §6).
     session_id: String,
@@ -49,21 +41,12 @@ impl NasMcpHandler {
             }
         }
 
-        let permissions = match &options.history_dir {
-            Some(history_dir) => nas_history::load_permissions(history_dir),
-            None => Ok(PermissionsPolicy::default()),
-        };
-        if let Err(err) = &permissions {
-            tracing::warn!(error = %err, "permissions.toml inválido — negando tudo até ser corrigido");
-        }
-
         let mut registry = Registry::new();
         nas_commands::register_all(&mut registry);
 
         NasMcpHandler {
             registry,
             workspace: Mutex::new(workspace),
-            permissions,
             session_id: session_id(),
         }
     }
@@ -92,15 +75,31 @@ impl NasMcpHandler {
     /// workspace não suporta `elicitation` (adicionado só em versões
     /// bem posteriores, major 1.0+), então o único canal de aprovação
     /// desta etapa é o arquivo.
-    fn decide_effect(&self, effect: Effect) -> EffectDecision {
-        match &self.permissions {
+    ///
+    /// **Lê `permissions.toml` de novo em toda chamada** (revisão
+    /// pedida na revisão do PR), nunca um valor cacheado desde
+    /// `NasMcpHandler::new` — editar o arquivo enquanto `nas --mcp`
+    /// está rodando (liberar um efeito, ou corrigir um erro de
+    /// sintaxe) tem efeito já na próxima chamada, sem reiniciar o
+    /// processo. O custo é uma leitura pequena de disco, só nas
+    /// chamadas que já pedem aprovação (nunca em `Pure`/`ReadFile`/
+    /// etc.) — desprezível frente ao resto de uma chamada MCP.
+    fn decide_effect(&self, effect: Effect, history_dir: Option<&Path>) -> EffectDecision {
+        let permissions = match history_dir {
+            Some(history_dir) => nas_history::load_permissions(history_dir),
+            None => Ok(PermissionsPolicy::default()),
+        };
+        match &permissions {
             Ok(policy) if nas_commands::allowed_by_policy(effect, policy) => {
                 EffectDecision::Allowed
             }
             Ok(_) => EffectDecision::Denied { reason: None },
-            Err(err) => EffectDecision::Denied {
-                reason: Some(err.to_string()),
-            },
+            Err(err) => {
+                tracing::warn!(error = %err, "permissions.toml inválido — negando tudo até ser corrigido");
+                EffectDecision::Denied {
+                    reason: Some(err.to_string()),
+                }
+            }
         }
     }
 
@@ -356,7 +355,7 @@ impl ServerHandler for NasMcpHandler {
         // 3d).
         let mut approved_effects = HashSet::new();
         if let Some(policy_key) = spec.effect.policy_key() {
-            let decision = self.decide_effect(spec.effect);
+            let decision = self.decide_effect(spec.effect, history_dir.as_deref());
             self.log_decision(
                 history_dir.as_deref(),
                 &author,
@@ -410,7 +409,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let h = handler(project.path(), None);
 
-        let decision = h.decide_effect(Effect::WriteFile);
+        let decision = h.decide_effect(Effect::WriteFile, None);
         assert!(matches!(decision, EffectDecision::Denied { reason: None }));
     }
 
@@ -420,7 +419,7 @@ mod tests {
         let history = tempfile::tempdir().unwrap();
         let h = handler(project.path(), Some(history.path()));
 
-        let decision = h.decide_effect(Effect::WriteFile);
+        let decision = h.decide_effect(Effect::WriteFile, Some(history.path()));
         assert!(matches!(decision, EffectDecision::Denied { reason: None }));
     }
 
@@ -436,13 +435,13 @@ mod tests {
         let h = handler(project.path(), Some(history.path()));
 
         assert!(matches!(
-            h.decide_effect(Effect::WriteFile),
+            h.decide_effect(Effect::WriteFile, Some(history.path())),
             EffectDecision::Allowed
         ));
         // Um efeito que o arquivo não cita continua negado — liberar
         // `write-file` não libera `shell`/`network` de brinde.
         assert!(matches!(
-            h.decide_effect(Effect::Shell),
+            h.decide_effect(Effect::Shell, Some(history.path())),
             EffectDecision::Denied { reason: None }
         ));
     }
@@ -454,10 +453,37 @@ mod tests {
         std::fs::write(nas_history::permissions_path(history.path()), "voar = 1\n").unwrap();
         let h = handler(project.path(), Some(history.path()));
 
-        match h.decide_effect(Effect::WriteFile) {
+        match h.decide_effect(Effect::WriteFile, Some(history.path())) {
             EffectDecision::Denied { reason: Some(_) } => {}
             other => panic!("devia negar com motivo: {other:?}"),
         }
+    }
+
+    /// Revisão do PR: `permissions.toml` precisa ser relido em toda
+    /// chamada, não só uma vez ao iniciar — editar o arquivo com o
+    /// processo já rodando (liberar um efeito antes negado) tem efeito
+    /// já na próxima decisão, sem reiniciar `nas --mcp`.
+    #[test]
+    fn mudanca_no_arquivo_depois_de_iniciar_o_processo_e_vista_na_proxima_chamada() {
+        let project = tempfile::tempdir().unwrap();
+        let history = tempfile::tempdir().unwrap();
+        let h = handler(project.path(), Some(history.path()));
+
+        assert!(matches!(
+            h.decide_effect(Effect::WriteFile, Some(history.path())),
+            EffectDecision::Denied { reason: None }
+        ));
+
+        std::fs::write(
+            nas_history::permissions_path(history.path()),
+            "write-file = true\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            h.decide_effect(Effect::WriteFile, Some(history.path())),
+            EffectDecision::Allowed
+        ));
     }
 
     #[test]
@@ -475,7 +501,7 @@ mod tests {
         let h = handler(project.path(), Some(history.path()));
 
         assert!(matches!(
-            h.decide_effect(Effect::WriteFile),
+            h.decide_effect(Effect::WriteFile, Some(history.path())),
             EffectDecision::Denied { reason: None }
         ));
     }
@@ -495,7 +521,7 @@ mod tests {
             session: "s1".to_string(),
         };
 
-        let allowed = h.decide_effect(Effect::WriteFile);
+        let allowed = h.decide_effect(Effect::WriteFile, Some(history.path()));
         h.log_decision(
             Some(history.path()),
             &author,
@@ -503,7 +529,7 @@ mod tests {
             "write-file",
             &allowed,
         );
-        let denied = h.decide_effect(Effect::Shell);
+        let denied = h.decide_effect(Effect::Shell, Some(history.path()));
         h.log_decision(Some(history.path()), &author, "run_shell", "shell", &denied);
 
         let entries = nas_history::read_permission_decisions(history.path()).unwrap();
