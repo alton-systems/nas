@@ -12,8 +12,19 @@ use std::time::{Duration, Instant};
 
 use nas_editor::{Document, OpenError, RegionObject};
 use nas_history::{Author, CheckpointManifest, ExcludedReason, FileChange, Journal, ProjectId};
-use nas_keys::{Action, Key, KeyCode as NasKeyCode, Layout, Machine, Object, SystemAction, Verb};
+use nas_keys::{
+    Action, Key, KeyCode as NasKeyCode, Layout, Machine, ModalState, Object, SystemAction, Verb,
+};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::palette::Palette;
+
+/// Quantos comandos `App::recent_commands` guarda, mais recente
+/// primeiro — além disso, o mais antigo é descartado. A paleta só usa
+/// os mais recentes com a busca vazia (docs/keys.md, "paleta de
+/// comandos"); não precisa de uma lista maior que algumas telas de
+/// resultado.
+const RECENT_COMMANDS_LIMIT: usize = 20;
 
 /// O journal de histórico, compartilhado com o panic hook de
 /// `main.rs` (ver `install_panic_hook`) — pra que um pânico também
@@ -166,6 +177,18 @@ pub struct App {
     /// Uma visualização somente-leitura ativa (diff, lista de
     /// checkpoints, autoria) — ver [`Overlay`].
     pub overlay: Option<Overlay>,
+    /// A paleta de comandos ativa (`Espaço p`/`Shift+Espaço`), se
+    /// houver uma — ver [`crate::palette::Palette`]. Só abre no
+    /// Visual (docs/keys.md); igual a `overlay`/`prompt`, nenhuma
+    /// tecla chega à máquina modal enquanto ativa.
+    pub palette: Option<Palette>,
+    /// Nomes de comando (`CatalogEntry::name`) executados pela paleta
+    /// nesta sessão, mais recente primeiro — é o que faz os "usados
+    /// recentemente" aparecerem primeiro na busca vazia (docs/keys.md).
+    /// Só rastreia execuções pela própria paleta, não toda tecla do
+    /// Visual — rastrear isso exigiria mapear toda `Action` de volta a
+    /// um nome de comando, o que nem toda `Action` tem.
+    recent_commands: Vec<String>,
     /// A configuração resolvida (ADR 0007) — `Default` sem nenhum
     /// arquivo de configuração, exatamente o comportamento de antes
     /// desta etapa. `ui::draw` lê `line_numbers`; `apply_action` lê
@@ -216,6 +239,8 @@ impl App {
             external_overwrite_confirm_pending: false,
             reload_confirm_pending: false,
             overlay: None,
+            palette: None,
+            recent_commands: Vec::new(),
             config: nas_config::Config::default(),
             config_paths: None,
         }
@@ -423,6 +448,11 @@ impl App {
             return;
         }
 
+        if self.palette.is_some() {
+            self.handle_palette_key(key);
+            return;
+        }
+
         if self.prompt.is_some() {
             self.handle_prompt_key(key);
             return;
@@ -430,6 +460,28 @@ impl App {
 
         if let Some(prefix) = self.pending_system_prefix.take() {
             self.handle_system_prefix_key(&prefix, key);
+            return;
+        }
+
+        // `Shift+Espaço` abre a paleta, só no Visual (docs/keys.md,
+        // "paleta de comandos") — tratado aqui, antes da máquina
+        // modal, porque `nas_keys::Key` não modela Shift: não há como
+        // representar "Shift+Espaço" diferente de "Espaço" dentro do
+        // vocabulário do nas-keys, então a distinção só existe aqui,
+        // no `KeyEvent` do crossterm. Sem o protocolo de teclado do
+        // Kitty (`DISAMBIGUATE_ESCAPE_CODES`, main.rs), o terminal
+        // nunca reporta o modificador Shift num espaço — a tecla cai
+        // no caminho normal abaixo e continua sendo só "Espaço" (o
+        // prefixo líder). `Espaço p` (via o keymap) é o jeito que
+        // funciona em qualquer terminal.
+        if self.modal.state() == ModalState::Visual
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.open_command_palette();
             return;
         }
 
@@ -617,6 +669,7 @@ impl App {
                 });
             }
             Action::PromptGotoLine => self.open_prompt(PromptKind::GotoLine),
+            Action::OpenCommandPalette => self.open_command_palette(),
             Action::StartSelection => self.document_mut().start_selection(),
             Action::SelectAll => self.document_mut().select_all(),
             Action::Copy => self.copy(),
@@ -634,6 +687,89 @@ impl App {
             input: String::new(),
             search_origin: None,
         });
+    }
+
+    /// Abre a paleta de comandos a partir do catálogo atual do keymap
+    /// (`Machine::command_catalog`) — já com o keymap do usuário
+    /// aplicado (ADR 0007), e as teclas já traduzidas pro layout
+    /// físico em uso (docs/keys.md: "no ABNT2, ç e não ;"). A busca
+    /// vazia inicial já ordena pelos mais usados recentemente, via
+    /// `self.recent_commands`.
+    fn open_command_palette(&mut self) {
+        let catalog = self.modal.command_catalog();
+        self.palette = Some(Palette::new(catalog, &self.recent_commands));
+    }
+
+    /// `Esc` fecha sem executar nada; `Up`/`Down` movem a seleção;
+    /// `Enter` executa o item selecionado; qualquer caractere normal
+    /// entra na busca — nunca chega à máquina modal enquanto a paleta
+    /// está ativa (mesmo princípio de `handle_prompt_key`).
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Up => {
+                if let Some(palette) = &mut self.palette {
+                    palette.move_selection(-1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(palette) = &mut self.palette {
+                    palette.move_selection(1);
+                }
+            }
+            KeyCode::Enter => self.execute_palette_entry(),
+            KeyCode::Backspace => {
+                if let Some(palette) = &mut self.palette {
+                    palette.backspace(&self.recent_commands);
+                }
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(palette) = &mut self.palette {
+                    palette.push_char(c, &self.recent_commands);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `Enter` na paleta: fecha a sobreposição e alimenta a máquina
+    /// modal com a sequência de teclas do item selecionado — "executar
+    /// pela paleta faz exatamente o mesmo que a tecla" (docs/keys.md),
+    /// incluindo abrir um prompt se o comando pedir algo (ex.: `g l`,
+    /// ir para uma linha) ou só armar um verbo/unidade pendente (ex.:
+    /// `delete`, que espera um objeto a seguir, como `d` sozinho já
+    /// fazia antes da paleta existir). Sem nada selecionado (lista
+    /// vazia) ou sem atalho (`keys` vazio — nenhum comando do keymap
+    /// padrão está nesse caso hoje, mas a paleta lista por nome mesmo
+    /// assim), só fecha, sem marcar nada como usado.
+    fn execute_palette_entry(&mut self) {
+        let Some(entry) = self.palette.as_ref().and_then(Palette::selected_entry) else {
+            self.palette = None;
+            return;
+        };
+        let name = entry.name.clone();
+        let keys = entry.keys.clone();
+        let ctrl = entry.ctrl;
+        self.palette = None;
+        if keys.is_empty() {
+            return;
+        }
+        self.remember_recent_command(name);
+        for (i, key) in keys.into_iter().enumerate() {
+            self.handle_key(synthesize_key_event(key, ctrl && i == 0));
+        }
+    }
+
+    /// Mais recente primeiro, sem repetir — um comando já na lista é
+    /// movido pro início, não duplicado.
+    fn remember_recent_command(&mut self, name: String) {
+        self.recent_commands.retain(|existing| existing != &name);
+        self.recent_commands.insert(0, name);
+        self.recent_commands.truncate(RECENT_COMMANDS_LIMIT);
     }
 
     /// Um verbo agindo sobre um objeto (docs/keys.md §4.3). `d a`/`x a`
@@ -1809,6 +1945,37 @@ fn translate_key(key: KeyEvent) -> Option<Key> {
     Some(Key { code, alt })
 }
 
+/// O inverso de [`translate_key`] — de uma tecla do catálogo da
+/// paleta (`nas_keys::Key`, já em qwerty canônico, nunca traduzida
+/// pro layout físico: essa tradução é só pra exibição, ver
+/// `nas_keys::layout::to_physical`) de volta para um `KeyEvent` do
+/// crossterm, pra alimentar `App::handle_key` como se o usuário
+/// tivesse apertado a tecla de verdade. `ctrl` marca a classe sistema
+/// (só a primeira tecla de um atalho de sistema, nunca a segunda —
+/// ver `CatalogEntry::ctrl`).
+fn synthesize_key_event(key: Key, ctrl: bool) -> KeyEvent {
+    let code = match key.code {
+        NasKeyCode::Char(c) => KeyCode::Char(c),
+        NasKeyCode::Enter => KeyCode::Enter,
+        NasKeyCode::Escape => KeyCode::Esc,
+        NasKeyCode::Backspace => KeyCode::Backspace,
+        NasKeyCode::Delete => KeyCode::Delete,
+        NasKeyCode::Tab => KeyCode::Tab,
+        NasKeyCode::Left => KeyCode::Left,
+        NasKeyCode::Right => KeyCode::Right,
+        NasKeyCode::Up => KeyCode::Up,
+        NasKeyCode::Down => KeyCode::Down,
+    };
+    let mut modifiers = KeyModifiers::NONE;
+    if key.alt {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if ctrl {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    KeyEvent::new(code, modifiers)
+}
+
 /// Resolve o caminho digitado no prompt de abrir arquivo: `~` (ou
 /// `~/...`) expande pro diretório home; um caminho relativo é resolvido
 /// a partir do diretório onde o nas foi iniciado — como o nas nunca
@@ -1846,6 +2013,10 @@ mod tests {
 
     fn ctrl_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     fn text(app: &App) -> String {
@@ -1960,6 +2131,117 @@ mod tests {
 
         app.handle_key(key(KeyCode::Esc));
         assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn shift_espaco_abre_a_paleta_so_no_visual() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn shift_espaco_no_insert_continua_inserindo_espaco() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(key(KeyCode::Enter)); // Visual -> Insert
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        assert!(app.palette.is_none());
+        assert_eq!(text(&app), " ");
+    }
+
+    #[test]
+    fn espaco_p_abre_a_paleta_sem_depender_do_protocolo_do_kitty() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn esc_fecha_a_paleta_sem_executar_nada() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.palette.is_none());
+        assert_eq!(app.modal.state(), nas_keys::ModalState::Visual);
+    }
+
+    #[test]
+    fn digitar_na_paleta_nunca_chega_na_maquina_modal() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('j'))); // 'j' seria mover o cursor no Visual
+        assert!(app.palette.is_some());
+        assert_eq!(app.document().cursor_offset(), 0);
+    }
+
+    #[test]
+    fn enter_na_paleta_executa_o_comando_selecionado_como_a_tecla() {
+        // "undo" é um comando de uma tecla só ('u'): executar pela
+        // paleta deveria desfazer, exatamente como apertar 'u'.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc");
+        assert_eq!(text(&app), "abc");
+
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        for c in "desfazer".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.palette.as_ref().unwrap().selected_entry().unwrap().name,
+            "undo"
+        );
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.palette.is_none());
+        // "undo" desfaz a última transação — a inserção de 'c', a mais
+        // recente de `type_text` (um `insert_char` por caractere) —
+        // não o "digitar abc" inteiro de uma vez.
+        assert_eq!(text(&app), "ab");
+    }
+
+    #[test]
+    fn enter_na_paleta_com_comando_composto_abre_o_prompt_que_ele_pede() {
+        // "ir para uma linha" (prompt-goto-line, "g l") deveria abrir o
+        // mesmo prompt que apertar "g l" abriria — não só mover o
+        // cursor direto.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "um\ndois\ntres"); // já termina no Visual
+
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        for c in "ir para uma linha".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.palette.is_none());
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::GotoLine)
+        );
+    }
+
+    #[test]
+    fn comando_executado_pela_paleta_fica_recente_e_aparece_primeiro_na_proxima_busca_vazia() {
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc"); // já termina no Visual
+
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        for c in "desfazer".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter)); // executa "undo"
+
+        app.handle_key(shift_key(KeyCode::Char(' '))); // abre de novo, busca vazia
+        let first = app
+            .palette
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .name
+            .clone();
+        assert_eq!(first, "undo");
     }
 
     #[test]

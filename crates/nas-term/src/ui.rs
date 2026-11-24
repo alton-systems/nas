@@ -8,9 +8,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use nas_keys::{Key, PendingHint};
+use nas_keys::{CatalogEntry, Key, PendingHint};
 
 use crate::app::{App, Overlay, PromptKind, buffer_name};
+use crate::palette::Palette;
 
 /// Cor das letras das opções numa dica which-key — provisória, até
 /// existir um sistema de temas de verdade (issue #10, "Temas por
@@ -26,6 +27,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if let Some(overlay) = &app.overlay {
         draw_overlay(frame, root, overlay);
+        return;
+    }
+
+    if let Some(palette) = &app.palette {
+        draw_palette(frame, root, palette);
         return;
     }
 
@@ -83,6 +89,107 @@ fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay) {
     ))];
     lines.extend(overlay.lines.iter().map(|line| Line::from(line.clone())));
     frame.render_widget(Paragraph::new(lines).scroll((overlay.scroll, 0)), area);
+}
+
+/// O rótulo que abre a sobreposição da paleta, antes da consulta
+/// digitada — reaproveitado pra posicionar o cursor do terminal no
+/// fim do texto (`draw_palette`), do mesmo jeito que `prompt_label`
+/// mais `": "` faz para `place_prompt_cursor`.
+const PALETTE_PROMPT: &str = "Paleta de comandos  »  ";
+
+/// A paleta de comandos (`Espaço p`/`Shift+Espaço`, docs/keys.md
+/// "paleta de comandos") ocupa a tela inteira, sem mexer no buffer —
+/// mesmo princípio de `draw_overlay`, mas com uma linha de busca no
+/// título (em vez de só um rótulo) e navegação por seleção em vez de
+/// rolagem. Comandos sem atalho aparecem sem nada na coluna de tecla;
+/// um comando destrutivo (`entry.destructive`) leva um marcador `⚠` em
+/// destaque, mesma cor de alerta do which-key (`HINT_DESTRUCTIVE_COLOR`).
+fn draw_palette(frame: &mut Frame, area: Rect, palette: &Palette) {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{PALETTE_PROMPT}{}", palette.query),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+
+    let entries: Vec<&CatalogEntry> = palette.visible_entries().collect();
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "nenhum comando encontrado",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        // A janela visível rola o mínimo pra manter `palette.selected`
+        // sempre à vista — sem isto, `Down` além da última linha que
+        // cabe na tela selecionaria um item invisível, o que quebraria
+        // "setas movem a seleção" (docs/keys.md) na prática assim que
+        // a lista for maior que a tela. Recalculado a cada desenho a
+        // partir da seleção atual — não precisa de estado próprio.
+        let available_rows = (area.height as usize).saturating_sub(1).max(1);
+        let start = if entries.len() <= available_rows {
+            0
+        } else {
+            palette
+                .selected
+                .saturating_sub(available_rows - 1)
+                .min(entries.len() - available_rows)
+        };
+        let end = (start + available_rows).min(entries.len());
+        let visible = &entries[start..end];
+
+        let shortcut_width = visible
+            .iter()
+            .map(|entry| shortcut_label(entry).chars().count())
+            .max()
+            .unwrap_or(0);
+        for (offset, entry) in visible.iter().enumerate() {
+            let selected = start + offset == palette.selected;
+            let base = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let shortcut = shortcut_label(entry);
+            let pad = shortcut_width.saturating_sub(shortcut.chars().count()) + 2;
+
+            let mut spans = vec![
+                Span::styled(shortcut, base.fg(HINT_KEY_COLOR)),
+                Span::styled(" ".repeat(pad), base),
+                Span::styled(entry.description.clone(), base),
+            ];
+            if entry.destructive {
+                spans.push(Span::styled(
+                    "  ⚠",
+                    Style::default().fg(HINT_DESTRUCTIVE_COLOR),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+
+    let cursor_x = area.x + (PALETTE_PROMPT.chars().count() + palette.query.chars().count()) as u16;
+    frame.set_cursor_position((cursor_x.min(area.x + area.width.saturating_sub(1)), area.y));
+}
+
+/// O atalho de um comando do catálogo, pra exibição — vazio se o
+/// comando não tiver um atalho que o alcance sozinho (ver
+/// `CatalogEntry::keys`); `Ctrl+` só na primeira tecla, nunca na
+/// segunda (`CatalogEntry::ctrl`, ex.: `Ctrl+t n`, nunca `Ctrl+t
+/// Ctrl+n`).
+fn shortcut_label(entry: &CatalogEntry) -> String {
+    entry
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            if i == 0 && entry.ctrl {
+                format!("Ctrl+{key}")
+            } else {
+                key.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn visible_line_range(app: &App, height: usize) -> std::ops::Range<usize> {
@@ -648,5 +755,91 @@ mod tests {
             .map(|col| buffer[(col, 0)].symbol().chars().next().unwrap_or(' '))
             .collect();
         assert_eq!(line, "ola");
+    }
+
+    #[test]
+    fn paleta_rola_a_lista_pra_manter_a_selecao_visivel() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
+
+        // terminal baixo o bastante pra caber bem menos que o
+        // catálogo inteiro (dezenas de comandos) — move a seleção além
+        // do que a primeira janela mostraria.
+        for _ in 0..15 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let selected_name = app
+            .palette
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .description
+            .clone();
+
+        let rendered = render_to_string(&mut app, 50, 6);
+        assert!(
+            rendered.contains(&selected_name),
+            "a linha selecionada ({selected_name:?}) deveria estar na janela visível:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn tela_com_paleta_de_comandos_vazia() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
+
+        let rendered = render_to_string(&mut app, 50, 10);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_paleta_de_comandos_com_busca() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
+        for c in "linha".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let rendered = render_to_string(&mut app, 50, 6);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_paleta_de_comandos_com_marcador_destrutivo() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
+        // "apagar o histórico do projeto" (Ctrl+t z) é o único comando
+        // destrutivo do keymap padrão — busca restrita a ele.
+        for c in "apagar historico".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let rendered = render_to_string(&mut app, 60, 6);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_com_paleta_de_comandos_no_layout_abnt2() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // move-right é "j k l ;" -> ";" no qwerty, "ç" no ABNT2
+        // (docs/keys.md, "paleta de comandos": "no ABNT2, ç e não ;").
+        let mut app = App::with_layout(Document::empty(), Layout::QwertyAbnt);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
+        for c in "proximo caractere".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let rendered = render_to_string(&mut app, 50, 6);
+        insta::assert_snapshot!(rendered);
     }
 }
