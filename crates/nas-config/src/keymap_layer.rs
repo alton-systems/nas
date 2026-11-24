@@ -169,6 +169,34 @@ mod tests {
     }
 
     #[test]
+    fn comando_sem_atalho_depois_de_remover_a_unica_tecla_continua_na_paleta() {
+        // "[system_prefixes.tempo] z = false" — exatamente como um
+        // usuário removeria a única tecla de "history-delete" em
+        // keymap.toml (ADR/docs/config.md). A paleta de comandos
+        // (nas-term) ainda deveria listar o comando, sem atalho, e
+        // conseguir executá-lo direto (ver `CatalogEntry::target`).
+        let keymap = load_keymap(&file(), Some("[system_prefixes.tempo]\nz = false\n"))
+            .expect("deveria carregar");
+
+        let mut machine = nas_keys::Machine::new();
+        machine.set_keymap(keymap);
+        let catalog = machine.command_catalog();
+
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.name == "history-delete")
+            .expect("history-delete deveria continuar no catálogo da paleta");
+        assert!(entry.keys.is_empty(), "o único atalho foi removido");
+        assert_eq!(
+            entry.target,
+            Some(nas_keys::CommandTarget::System(
+                nas_keys::SystemAction::HistoryDelete
+            )),
+            "mesmo sem tecla, a paleta deveria saber executá-lo direto"
+        );
+    }
+
+    #[test]
     fn remove_dentro_de_um_prefixo_aninhado() {
         let keymap =
             load_keymap(&file(), Some("[prefixes.go]\ng = false\n")).expect("deveria carregar");

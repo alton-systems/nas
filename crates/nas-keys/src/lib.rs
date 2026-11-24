@@ -17,5 +17,6 @@ pub use key::{Key, KeyCode};
 pub use keymap::{Binding, DEFAULT_TOML, Keymap, KeymapError};
 pub use layout::Layout;
 pub use machine::{
-    Action, CatalogEntry, Machine, ModalState, Object, PendingHint, SystemAction, Unit, Verb,
+    Action, CatalogEntry, CommandTarget, Machine, ModalState, Object, PendingHint, SystemAction,
+    Unit, Verb,
 };
