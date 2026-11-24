@@ -465,6 +465,98 @@ fn unified_text(path: &str, old: &str, new: &str) -> String {
         .to_string()
 }
 
+/// O texto de `path` dentro do checkpoint `checkpoint_id` —
+/// `Ok(None)` se o checkpoint existe mas não rastreava `path` (o
+/// arquivo é novo desde então); erro se o checkpoint não existir.
+/// Usado pela tela de revisão (docs/decisions/0008-modo-de-revisao.md
+/// §2) pra montar o lado "antes" de cada trecho, sem reimplementar a
+/// leitura de `objects/` que `diff`/`diff_against_current` já fazem.
+pub fn file_text_at_checkpoint(
+    history_dir: &Path,
+    checkpoint_id: &str,
+    path: &str,
+) -> io::Result<Option<String>> {
+    let manifests = list(history_dir)?;
+    let manifest = manifests
+        .iter()
+        .find(|m| m.id == checkpoint_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("checkpoint não encontrado: {checkpoint_id}"),
+            )
+        })?;
+    match manifest.files.iter().find(|f| f.path == path) {
+        Some(file) => Ok(Some(read_file_text(history_dir, file)?)),
+        None => Ok(None),
+    }
+}
+
+/// Um trecho alterado entre dois textos, com o conteúdo exato (não
+/// reformatado em `-`/`+`) e a linha de início em cada lado —
+/// docs/decisions/0008-modo-de-revisao.md §2/§5 (o cabeçalho de cada
+/// trecho mostra a linha; `hunk_hash`, de `crate::review`, precisa da
+/// linha de início no "antes" e dos dois textos exatos).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextHunk {
+    /// 1-indexada, como `Document::goto_line` já usa.
+    pub old_start_line: usize,
+    pub old_text: String,
+    /// 1-indexada.
+    pub new_start_line: usize,
+    pub new_text: String,
+}
+
+/// Os trechos alterados entre `old` e `new`, cada um com o texto
+/// exato dos dois lados — ao contrário de [`diff`]/[`diff_against_current`],
+/// que devolvem o diff já formatado em `-`/`+` (bom pra mostrar, ruim
+/// pra reconstruir o texto de um trecho sozinho). Reaproveita o mesmo
+/// `similar::TextDiff` (`grouped_ops(0)`: só os grupos de operações
+/// que mudaram, sem linhas de contexto — a revisão desenha seu próprio
+/// cabeçalho, não precisa do contexto que um diff unificado de
+/// terminal usaria).
+pub fn text_hunks(old: &str, new: &str) -> Vec<TextHunk> {
+    let old_lines = lines_with_endings(old);
+    let new_lines = lines_with_endings(new);
+    similar::TextDiff::from_lines(old, new)
+        .grouped_ops(0)
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .map(|group| {
+            let old_range = group[0].old_range().start..group[group.len() - 1].old_range().end;
+            let new_range = group[0].new_range().start..group[group.len() - 1].new_range().end;
+            TextHunk {
+                old_start_line: old_range.start + 1,
+                old_text: old_lines[old_range].concat(),
+                new_start_line: new_range.start + 1,
+                new_text: new_lines[new_range].concat(),
+            }
+        })
+        .collect()
+}
+
+/// Como `str::lines`, mas preservando a quebra de linha em cada item
+/// (equivalente a `splitlines(keepends=True)` do Python) — pra que
+/// juntar um intervalo de "linhas" de volta (`concat`) reproduza o
+/// texto original byte a byte, sem perder nem duplicar `\n`.
+fn lines_with_endings(text: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        match rest.find('\n') {
+            Some(pos) => {
+                result.push(&rest[..=pos]);
+                rest = &rest[pos + 1..];
+            }
+            None => {
+                result.push(rest);
+                rest = "";
+            }
+        }
+    }
+    result
+}
+
 /// Poda com os limites padrão (`MAX_AUTOMATIC_CHECKPOINTS`,
 /// `MAX_TOTAL_SIZE_BYTES`) — ver [`prune_with_limits`].
 pub fn prune(history_dir: &Path) -> io::Result<PruneReport> {
@@ -814,6 +906,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = diff_against_current(dir.path(), "999-fantasma", &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn file_text_at_checkpoint_le_o_conteudo_rastreado() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = create(
+            dir.path(),
+            "cp",
+            Author::User,
+            100,
+            false,
+            &[file("a.txt", "conteudo")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            file_text_at_checkpoint(dir.path(), &cp.manifest.id, "a.txt").unwrap(),
+            Some("conteudo".to_string())
+        );
+        assert_eq!(
+            file_text_at_checkpoint(dir.path(), &cp.manifest.id, "nunca-rastreado.txt").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn text_hunks_devolve_o_texto_exato_de_cada_trecho_com_linha_de_inicio() {
+        let old = "um\ndois\ntres\nquatro\ncinco\n";
+        let new = "um\nDOIS\ntres\nquatro\nCINCO\n";
+        let hunks = text_hunks(old, new);
+        assert_eq!(
+            hunks.len(),
+            2,
+            "duas regiões mudaram, separadas por contexto"
+        );
+
+        assert_eq!(hunks[0].old_start_line, 2);
+        assert_eq!(hunks[0].old_text, "dois\n");
+        assert_eq!(hunks[0].new_start_line, 2);
+        assert_eq!(hunks[0].new_text, "DOIS\n");
+
+        assert_eq!(hunks[1].old_start_line, 5);
+        assert_eq!(hunks[1].old_text, "cinco\n");
+        assert_eq!(hunks[1].new_start_line, 5);
+        assert_eq!(hunks[1].new_text, "CINCO\n");
+    }
+
+    #[test]
+    fn text_hunks_insercao_pura_tem_lado_antigo_vazio() {
+        let old = "a\nb\n";
+        let new = "a\nnovo\nb\n";
+        let hunks = text_hunks(old, new);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_text, "");
+        assert_eq!(hunks[0].new_text, "novo\n");
+    }
+
+    #[test]
+    fn text_hunks_sem_diferenca_e_vazio() {
+        assert!(text_hunks("igual\n", "igual\n").is_empty());
     }
 
     #[test]
