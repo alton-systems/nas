@@ -1,0 +1,10 @@
+---
+source: crates/nas-term/src/ui.rs
+expression: rendered
+---
+Paleta de comandos  »  linha                      
+k    linha abaixo                                 
+:    fim da linha                                 
+J    início da linha                              
+l    linha acima                                  
+g l  ir para uma linha
