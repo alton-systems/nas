@@ -1855,18 +1855,50 @@ impl App {
     ) -> Vec<ReviewHunk> {
         let marks =
             nas_history::marks_for_checkpoint(history_dir, &checkpoint.id).unwrap_or_default();
-        let mut paths: Vec<&str> = checkpoint.files.iter().map(|f| f.path.as_str()).collect();
+
+        // Todo arquivo rastreado, não só os que o manifesto do
+        // checkpoint lista — mesma correção que `nas_history::restore`
+        // já faz (ADR 0005 §4): um arquivo tocado pela primeira vez
+        // **depois** do checkpoint (ex.: a primeira edição de uma
+        // sessão de IA, que só rastreia o arquivo dentro do próprio
+        // comando, depois do checkpoint automático já ter sido
+        // preparado) não aparece em `checkpoint.files`, mas ainda tem
+        // um original guardado em `crate::originals` desde a primeira
+        // vez que foi tocado em todo o histórico do projeto — isso
+        // nunca inclui arquivo demais: um arquivo rastreado há muito
+        // tempo e sem mudança nenhuma desde então só dá `old == new`
+        // mais abaixo, e é pulado.
+        let originals = nas_history::list_tracked(history_dir).unwrap_or_default();
+        let mut paths: Vec<String> = checkpoint
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .chain(originals.iter().map(|o| o.path.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         paths.sort_unstable();
 
         let mut hunks = Vec::new();
-        for path in paths {
+        for path in &paths {
             let Some(new_bytes) = self.current_content_for(path) else {
                 continue; // arquivo não existe mais nem em buffer nem em disco.
             };
             let new_text = String::from_utf8_lossy(&new_bytes).into_owned();
-            let old_text = nas_history::file_text_at_checkpoint(history_dir, &checkpoint.id, path)
-                .unwrap_or(None)
-                .unwrap_or_default();
+            let old_text =
+                match nas_history::file_text_at_checkpoint(history_dir, &checkpoint.id, path)
+                    .unwrap_or(None)
+                {
+                    Some(text) => text,
+                    None => originals
+                        .iter()
+                        .find(|o| &o.path == path)
+                        .filter(|o| o.existed)
+                        .and_then(|o| o.content_hash.as_deref())
+                        .and_then(|hash| nas_history::read_object(history_dir, hash).ok())
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default(),
+                };
             if old_text == new_text {
                 continue;
             }
@@ -1890,7 +1922,7 @@ impl App {
                 .unwrap_or_default();
                 let decision = marks
                     .iter()
-                    .find(|m| m.file == path && m.hunk_hash == hash)
+                    .find(|m| &m.file == path && m.hunk_hash == hash)
                     .map(|m| m.decision);
 
                 hunks.push(ReviewHunk {
@@ -2021,6 +2053,16 @@ impl App {
         let from = current_text[..byte_pos].chars().count();
         let to = from + hunk.after.chars().count();
 
+        // Se já há um buffer aberto pra este arquivo, edita ali —
+        // mantém o histórico de desfazer dele (ADR 0008 §3: "essa
+        // rejeição é desfazível com u no arquivo real"). Sem buffer
+        // aberto, abre um — e, como ninguém mais tem como salvá-lo
+        // por fora (o buffer nem aparecia antes desta rejeição), grava
+        // no disco na hora: senão o arquivo real nunca mudaria, só um
+        // buffer que o usuário não sabia que existia. O buffer
+        // continua aberto depois (mesmo ponto: `u`, fora da revisão,
+        // continua desfazendo esta mesma transação).
+        let already_open = self.find_buffer_by_path(Path::new(&hunk.file)).is_some();
         let buffer_index = match self.find_buffer_by_path(Path::new(&hunk.file)) {
             Some(index) => index,
             None => match Document::open(&hunk.file) {
@@ -2037,6 +2079,10 @@ impl App {
         let change = self.buffers[buffer_index]
             .document
             .replace_region(from, to, &hunk.before);
+        if !already_open && let Err(err) = self.buffers[buffer_index].document.save() {
+            self.set_status_message(format!("Erro ao gravar '{}': {err}", hunk.file));
+            return;
+        }
         self.journal_record_for(
             hunk.file.clone(),
             "review-reject",
@@ -2159,6 +2205,13 @@ impl App {
         let Some(session) = self.review.take() else {
             return;
         };
+        // `Esc` dentro da revisão já chega aqui com o estado modal de
+        // volta pro Visual (a própria `Machine` troca antes de
+        // devolver `Action::ReviewExit`) — mas fechar a sessão por
+        // outro caminho (trocar/fechar buffer, sair do nas) chama
+        // isto direto, fora de qualquer tecla, então precisa forçar a
+        // troca aqui também. Chamar duas vezes (Esc + aqui) é inócuo.
+        self.modal.exit_review();
         if let Some(history_dir) = self.history_dir() {
             let entry = nas_history::ReviewLogEntry {
                 started_at: session.started_at,
@@ -4104,6 +4157,461 @@ mod tests {
                 .any(|f| f.path == path_d.to_str().unwrap()),
             "a edição do usuário em d.txt deveria estar recuperável no checkpoint \"antes de restaurar\": {:?}",
             antes_de_restaurar.files
+        );
+    }
+
+    // --- ADR 0008 (modo de revisão) ---
+
+    /// Fixture mínima pra testes de revisão que não precisam do
+    /// registro de comandos inteiro (`nas_commands::Registry`): cria
+    /// o checkpoint automático de uma sessão de IA com `before`, e
+    /// grava `after` direto no disco — como se a IA tivesse editado
+    /// por fora, sem precisar montar o registro só pra isso. Devolve
+    /// o caminho do arquivo e o manifesto do checkpoint criado.
+    fn ai_checkpoint_and_disk(
+        history_dir: &Path,
+        project_dir: &Path,
+        file_name: &str,
+        before: &str,
+        after: &str,
+        session: &str,
+        now: u64,
+    ) -> (PathBuf, nas_history::CheckpointManifest) {
+        let path = project_dir.join(file_name);
+        fs::write(&path, before).unwrap();
+        let author = Author::Ai {
+            agent: "claude-code".to_string(),
+            session: session.to_string(),
+        };
+        let manifest = nas_history::create_checkpoint(
+            history_dir,
+            &format!("antes da sessão de claude-code ({now})"),
+            author,
+            now,
+            true,
+            &[(
+                path.to_string_lossy().into_owned(),
+                before.as_bytes().to_vec(),
+            )],
+        )
+        .expect("criar checkpoint")
+        .manifest;
+        fs::write(&path, after).unwrap();
+        (path, manifest)
+    }
+
+    /// Move o cursor pro cabeçalho do trecho `idx` da revisão aberta —
+    /// conveniência de teste, pra não depender de navegar por tecla
+    /// (`h`/`H`, já testado em `nas-keys`) só pra chegar lá.
+    fn move_cursor_to_hunk(app: &mut App, idx: usize) {
+        let line = app.review.as_ref().expect("revisão aberta").hunks[idx].header_line;
+        let offset = app.document().line_start_offset(line);
+        app.document_mut().set_cursor(offset);
+    }
+
+    #[test]
+    fn duas_insercoes_no_mesmo_arquivo_tem_hashes_diferentes_e_aceitar_uma_nao_marca_a_outra() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        let before = "um\ndois\ntres\nquatro\ncinco\n";
+        let after = "um\ndois\nNOVA LINHA A\ntres\nquatro\nNOVA LINHA B\ncinco\n";
+        ai_checkpoint_and_disk(
+            &history_dir,
+            project_dir.path(),
+            "arquivo.txt",
+            before,
+            after,
+            "sessao-1",
+            100,
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+
+        let session = app.review.as_ref().expect("revisão deveria estar aberta");
+        assert_eq!(session.hunks.len(), 2, "duas inserções distintas");
+        let hash_a = session.hunks[0].hash.clone();
+        let hash_b = session.hunks[1].hash.clone();
+        assert_ne!(
+            hash_a, hash_b,
+            "duas inserções diferentes não deveriam colidir no hash"
+        );
+
+        move_cursor_to_hunk(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter)); // aceita o primeiro trecho
+
+        let session = app.review.as_ref().expect("revisão ainda aberta");
+        assert_eq!(
+            session.hunks[0].decision,
+            Some(nas_history::ReviewDecision::Accepted)
+        );
+        assert_eq!(
+            session.hunks[1].decision, None,
+            "aceitar o primeiro trecho não deveria marcar o segundo"
+        );
+    }
+
+    #[test]
+    fn rejeitar_recusa_quando_o_trecho_mudou_depois_da_ia() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        let (path, _) = ai_checkpoint_and_disk(
+            &history_dir,
+            project_dir.path(),
+            "arquivo.txt",
+            "linha original\n",
+            "linha editada pela ia\n",
+            "sessao-1",
+            100,
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+        move_cursor_to_hunk(&mut app, 0);
+
+        // Mais uma edição acontece no arquivo real **depois** que a
+        // revisão já tinha capturado o trecho — simulando outra
+        // sessão, ou o próprio usuário, tocando o mesmo texto antes
+        // de rejeitar.
+        fs::write(&path, "linha editada de novo, nem pela ia\n").unwrap();
+
+        app.handle_key(key(KeyCode::Char('u'))); // rejeitar
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "linha editada de novo, nem pela ia\n",
+            "rejeitar recusado não deveria tocar no arquivo"
+        );
+        let message = app.status_message().expect("deveria avisar a recusa");
+        assert!(
+            message.contains("recusado"),
+            "mensagem deveria explicar a recusa: {message}"
+        );
+    }
+
+    #[test]
+    fn autoria_mista_quando_usuario_edita_por_cima_da_ia() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let path = project_dir.path().join("arquivo.txt");
+        fs::write(&path, "linha1\nlinha2\nlinha3\n").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        let mut registry = nas_commands::Registry::new();
+        nas_commands::register_all(&mut registry);
+        let journal = Journal::open(&history_dir).expect("abrir journal");
+        let mut mcp_workspace = nas_commands::Workspace::new(project_dir.path())
+            .with_history_dir(history_dir.clone())
+            .with_journal(journal);
+        let session_author = Author::Ai {
+            agent: "claude-code".to_string(),
+            session: "sessao-1".to_string(),
+        };
+        let mut mcp_ctx = nas_commands::CommandContext {
+            workspace: &mut mcp_workspace,
+            author: session_author,
+            approved_effects: [nas_commands::Effect::WriteFile].into_iter().collect(),
+            warnings: Vec::new(),
+        };
+        let path_str = path.to_string_lossy().into_owned();
+        registry
+            .run(
+                "open_file",
+                &mut mcp_ctx,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+        registry
+            .run(
+                "edit",
+                &mut mcp_ctx,
+                serde_json::json!({ "path": path_str, "old_text": "linha2", "new_text": "LINHA2" }),
+            )
+            .expect("editar");
+        registry
+            .run(
+                "save_file",
+                &mut mcp_ctx,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("salvar");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // O usuário, depois, edita dentro da mesma linha que a IA
+        // tocou — mesmo trecho, autoria deveria sair "misto".
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.document_mut().goto_line(2);
+        app.document_mut().move_to_line_end();
+        type_text(&mut app, "X");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+        app.flush_history();
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+
+        let session = app.review.as_ref().expect("revisão deveria estar aberta");
+        let hunk = session
+            .hunks
+            .iter()
+            .find(|h| h.after.contains("LINHA2"))
+            .expect("deveria haver um trecho com a edição da IA");
+        assert!(
+            hunk.authors.iter().any(|a| matches!(a, Author::Ai { .. })),
+            "autoria deveria incluir a IA: {:?}",
+            hunk.authors
+        );
+        assert!(
+            hunk.authors.contains(&Author::User),
+            "autoria deveria incluir o usuário: {:?}",
+            hunk.authors
+        );
+    }
+
+    #[test]
+    fn marca_de_aceitar_persiste_ao_fechar_e_reabrir_a_revisao() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        ai_checkpoint_and_disk(
+            &history_dir,
+            project_dir.path(),
+            "arquivo.txt",
+            "antes\n",
+            "depois da ia\n",
+            "sessao-1",
+            100,
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+        move_cursor_to_hunk(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter)); // aceita
+
+        app.handle_key(key(KeyCode::Esc)); // sai — fecha a sessão de revisão
+        assert!(app.review.is_none());
+
+        // Reabrir a mesma revisão (mesmo checkpoint padrão) mostra o
+        // trecho já revisado.
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+        let session = app.review.as_ref().expect("revisão reaberta");
+        assert_eq!(
+            session.hunks[0].decision,
+            Some(nas_history::ReviewDecision::Accepted),
+            "a marca deveria ter sobrevivido ao fechar e reabrir"
+        );
+    }
+
+    #[test]
+    fn fechar_a_revisao_registra_inicio_fim_e_contagens() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        let before = "um\ndois\ntres\nquatro\ncinco\n";
+        let after = "um\nDOIS\ntres\nquatro\nCINCO\n";
+        ai_checkpoint_and_disk(
+            &history_dir,
+            project_dir.path(),
+            "arquivo.txt",
+            before,
+            after,
+            "sessao-1",
+            100,
+        );
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(app.review.as_ref().unwrap().hunks.len(), 2);
+        move_cursor_to_hunk(&mut app, 0);
+        app.handle_key(key(KeyCode::Enter)); // aceita só o primeiro
+
+        app.handle_key(key(KeyCode::Esc)); // termina a sessão de revisão
+
+        let entries = nas_history::read_log_entries(&history_dir).expect("ler reviews_log");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].total_hunks, 2);
+        assert_eq!(entries[0].accepted, 1);
+        assert_eq!(entries[0].rejected, 0);
+        assert!(entries[0].ended_at >= entries[0].started_at);
+    }
+
+    #[test]
+    fn ponta_a_ponta_sessao_mcp_revisao_aceitar_rejeitar_desfazer_ir_ate_la_reabrir() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let path_a = project_dir.path().join("a.txt");
+        let path_b = project_dir.path().join("b.txt");
+        fs::write(&path_a, "a original\n").unwrap();
+        fs::write(&path_b, "b original\n").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        // 1. Uma sessão MCP edita dois arquivos — o mesmo registro
+        //    que `nas --mcp` usa por dentro (nas-commands), não um
+        //    stand-in: checkpoint automático de sessão, aprovação e
+        //    autoria vêm todos do registro de verdade.
+        let mut registry = nas_commands::Registry::new();
+        nas_commands::register_all(&mut registry);
+        let journal = Journal::open(&history_dir).expect("abrir journal");
+        let mut mcp_workspace = nas_commands::Workspace::new(project_dir.path())
+            .with_history_dir(history_dir.clone())
+            .with_journal(journal);
+        let session_author = Author::Ai {
+            agent: "claude-code".to_string(),
+            session: "sessao-1".to_string(),
+        };
+        let mut mcp_ctx = nas_commands::CommandContext {
+            workspace: &mut mcp_workspace,
+            author: session_author,
+            approved_effects: [nas_commands::Effect::WriteFile].into_iter().collect(),
+            warnings: Vec::new(),
+        };
+        for (path, old, new) in [
+            (&path_a, "a original", "a editado pela ia"),
+            (&path_b, "b original", "b editado pela ia"),
+        ] {
+            let path_str = path.to_string_lossy().into_owned();
+            registry
+                .run(
+                    "open_file",
+                    &mut mcp_ctx,
+                    serde_json::json!({ "path": path_str }),
+                )
+                .expect("abrir");
+            registry
+                .run(
+                    "edit",
+                    &mut mcp_ctx,
+                    serde_json::json!({ "path": path_str, "old_text": old, "new_text": new }),
+                )
+                .expect("editar");
+            registry
+                .run(
+                    "save_file",
+                    &mut mcp_ctx,
+                    serde_json::json!({ "path": path_str }),
+                )
+                .expect("salvar");
+        }
+
+        // 2. Ctrl+t v abre a revisão.
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+        assert!(app.review.is_some(), "a revisão deveria ter aberto");
+        assert_eq!(app.review.as_ref().unwrap().hunks.len(), 2);
+
+        let hunk_a_idx = app
+            .review
+            .as_ref()
+            .unwrap()
+            .hunks
+            .iter()
+            .position(|h| h.file == path_a.to_string_lossy())
+            .expect("trecho de a.txt");
+        let hunk_b_idx = app
+            .review
+            .as_ref()
+            .unwrap()
+            .hunks
+            .iter()
+            .position(|h| h.file == path_b.to_string_lossy())
+            .expect("trecho de b.txt");
+
+        // 3. Aceita o trecho de a.txt.
+        move_cursor_to_hunk(&mut app, hunk_a_idx);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.review.as_ref().unwrap().hunks[hunk_a_idx].decision,
+            Some(nas_history::ReviewDecision::Accepted)
+        );
+
+        // 4. Rejeita o trecho de b.txt com "u" — conferir o arquivo.
+        move_cursor_to_hunk(&mut app, hunk_b_idx);
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "b original\n");
+
+        // 5. "u" no arquivo real (fora da revisão) desfaz a rejeição.
+        // Trocar de buffer enquanto a revisão está aberta a encerra
+        // primeiro (ADR 0008 §5 — ver o guard em
+        // `dispatch_system_action`), removendo o buffer sintético;
+        // mesmo assim, o buffer de `b.txt` que a rejeição abriu
+        // continua ali, com o histórico de desfazer intacto.
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path_b.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            buffer_name(app.document()),
+            path_b.to_string_lossy(),
+            "deveria ter trocado pro buffer de b.txt"
+        );
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(
+            app.status_message(),
+            None,
+            "u não deveria dizer 'nada pra desfazer'"
+        );
+        assert_eq!(app.document().full_text(), "b editado pela ia\n");
+
+        // Reabre a revisão pra continuar o fluxo (6 e 7): a.txt
+        // continua aceito; o trecho de b.txt existe de novo, já que a
+        // rejeição foi desfeita.
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+        let hunk_b_idx = app
+            .review
+            .as_ref()
+            .unwrap()
+            .hunks
+            .iter()
+            .position(|h| h.file == path_b.to_string_lossy())
+            .expect("trecho de b.txt deveria existir de novo");
+
+        // 6. "g h" abre o arquivo na linha do trecho.
+        move_cursor_to_hunk(&mut app, hunk_b_idx);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('h')));
+        assert!(app.review.is_none(), "g h deveria ter saído da revisão");
+        assert_eq!(
+            buffer_name(app.document()),
+            path_b.to_string_lossy(),
+            "deveria ter aberto b.txt"
+        );
+
+        // 7. Reabrir a revisão mostra o que já foi revisado — a.txt
+        //    (aceito antes) continua marcado.
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+        let hunk_a_idx = app
+            .review
+            .as_ref()
+            .unwrap()
+            .hunks
+            .iter()
+            .position(|h| h.file == path_a.to_string_lossy())
+            .expect("trecho de a.txt");
+        assert_eq!(
+            app.review.as_ref().unwrap().hunks[hunk_a_idx].decision,
+            Some(nas_history::ReviewDecision::Accepted),
+            "a marca de aceitar deveria ter persistido"
         );
     }
 

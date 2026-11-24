@@ -814,7 +814,14 @@ impl Machine {
         self.pending = None;
     }
 
-    fn exit_review(&mut self) {
+    /// Sai de `Review` de volta pro `Visual` — chamado internamente
+    /// pelo `Esc` dentro da revisão (`handle_review`), e também por
+    /// `nas-term` quando a sessão de revisão termina por outro
+    /// caminho (trocar/fechar buffer, sair do nas — ADR 0008 §5):
+    /// nesses casos, quem decide fechar a sessão é a classe sistema,
+    /// fora da máquina modal, então ela precisa de um jeito de levar
+    /// o estado de volta sem passar por uma tecla `Esc` de verdade.
+    pub fn exit_review(&mut self) {
         self.state = ModalState::Visual;
         self.pending = None;
     }
