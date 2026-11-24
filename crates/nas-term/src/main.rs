@@ -2,6 +2,7 @@
 
 mod app;
 mod logging;
+mod palette;
 mod ui;
 
 use std::io::{self, Write as _};
@@ -347,7 +348,7 @@ fn read_system_clipboard(clipboard: &mut Option<arboard::Clipboard>) -> Option<S
 /// — o terminal não tem um cursor "oco" como o do Emacs, sublinhado é o
 /// mais distinto dos outros dois disponível.
 fn cursor_style_for(app: &App) -> SetCursorStyle {
-    if app.prompt.is_some() {
+    if app.prompt.is_some() || app.palette.is_some() {
         return SetCursorStyle::SteadyBar;
     }
     match app.modal.state() {

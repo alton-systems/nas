@@ -93,6 +93,7 @@ l = "prompt-goto-line"
 [prefixes.leader]
 SPC = "enter-sequential"
 f = "prompt-search"
+p = "open-command-palette"
 # "r" (substituir) e "h" (ajuda) ficam de fora por ora: substituir
 # precisa de um fluxo interativo de confirmação por ocorrência que
 # ainda não existe, e ajuda não tem pra onde apontar ainda — ver
@@ -147,7 +148,10 @@ paste = "colar"
 repeat = "repetir o último comando que alterou o texto"
 prompt-search = "buscar"
 prompt-goto-line = "ir para uma linha"
+enter-insert = "entrar no modo de inserção"
+enter-visual = "entrar no modo visual"
 enter-sequential = "modo sequencial"
+open-command-palette = "paleta de comandos"
 delete = "apagar"
 copy = "copiar"
 cut = "recortar"
