@@ -3,12 +3,12 @@ source: crates/nas-term/src/ui.rs
 expression: rendered
 ---
 Paleta de comandos  »                             
+K         até o fim do arquivo                    
+L         até o início do arquivo                 
+j         até aqui, pra trás                      
+;         até aqui                                
 Ctrl+t a  autoria (histórico do arquivo)          
 Ctrl+t e  diff entre checkpoints                  
 Ctrl+t l  listar checkpoints                      
 Ctrl+t n  novo checkpoint                         
-Ctrl+t r  restaurar checkpoint                    
-Ctrl+k    fechar o buffer atual                   
-c         copiar                                  
-x         recortar                                
-d         apagar
+Ctrl+t r  restaurar checkpoint

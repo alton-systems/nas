@@ -3,4 +3,4 @@ source: crates/nas-term/src/ui.rs
 expression: rendered
 ---
 Paleta de comandos  »  apagar historico                     
-Ctrl+t z  apagar histórico do projeto  ⚠
+Ctrl+t z  ! apagar histórico do projeto

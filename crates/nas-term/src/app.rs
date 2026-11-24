@@ -736,16 +736,24 @@ impl App {
         }
     }
 
-    /// `Enter` na paleta: fecha a sobreposição e alimenta a máquina
-    /// modal com a sequência de teclas do item selecionado — "executar
-    /// pela paleta faz exatamente o mesmo que a tecla" (docs/keys.md),
-    /// incluindo abrir um prompt se o comando pedir algo (ex.: `g l`,
-    /// ir para uma linha) ou só armar um verbo/unidade pendente (ex.:
-    /// `delete`, que espera um objeto a seguir, como `d` sozinho já
-    /// fazia antes da paleta existir). Sem nada selecionado (lista
-    /// vazia) ou sem atalho (`keys` vazio — nenhum comando do keymap
-    /// padrão está nesse caso hoje, mas a paleta lista por nome mesmo
-    /// assim), só fecha, sem marcar nada como usado.
+    /// `Enter` na paleta: fecha a sobreposição e executa o item
+    /// selecionado. Com atalho (`keys` não vazio), alimenta a máquina
+    /// modal com a sequência de teclas — "executar pela paleta faz
+    /// exatamente o mesmo que a tecla" (docs/keys.md), incluindo abrir
+    /// um prompt se o comando pedir algo (ex.: `g l`, ir para uma
+    /// linha) ou só armar um verbo/unidade pendente (ex.: `delete`,
+    /// que espera um objeto a seguir, como `d` sozinho já fazia antes
+    /// da paleta existir) — preserva nuances como "verbo age na hora
+    /// se já houver uma seleção", que só uma tecla de verdade sabe
+    /// decidir. Sem atalho, despacha direto via `CatalogEntry::target`
+    /// (`Machine::dispatch` pra um `Binding`, ou
+    /// `dispatch_system_action` pra uma `SystemAction`) — é como o
+    /// comando continua executável mesmo depois do usuário remover a
+    /// única tecla dele do keymap (docs/config.md, `chave = false`).
+    /// Sem nada selecionado (lista vazia) ou sem `target` nenhum
+    /// (objeto puro, ex. `current-line` — só faz sentido como
+    /// complemento de um verbo já pendente, não tem execução sozinha),
+    /// só fecha, sem marcar nada como usado.
     fn execute_palette_entry(&mut self) {
         let Some(entry) = self.palette.as_ref().and_then(Palette::selected_entry) else {
             self.palette = None;
@@ -754,13 +762,28 @@ impl App {
         let name = entry.name.clone();
         let keys = entry.keys.clone();
         let ctrl = entry.ctrl;
+        let target = entry.target.clone();
         self.palette = None;
-        if keys.is_empty() {
+
+        if !keys.is_empty() {
+            self.remember_recent_command(name);
+            for (i, key) in keys.into_iter().enumerate() {
+                self.handle_key(synthesize_key_event(key, ctrl && i == 0));
+            }
             return;
         }
+
+        let Some(target) = target else {
+            return;
+        };
         self.remember_recent_command(name);
-        for (i, key) in keys.into_iter().enumerate() {
-            self.handle_key(synthesize_key_event(key, ctrl && i == 0));
+        match target {
+            nas_keys::CommandTarget::Modal(binding) => {
+                for action in self.modal.dispatch(binding) {
+                    self.apply_action(action);
+                }
+            }
+            nas_keys::CommandTarget::System(action) => self.dispatch_system_action(action),
         }
     }
 
@@ -2242,6 +2265,96 @@ mod tests {
             .name
             .clone();
         assert_eq!(first, "undo");
+    }
+
+    #[test]
+    fn comando_sem_tecla_no_padrao_aparece_na_paleta() {
+        // "current-line" não tem tabela nenhuma no keymap — é só "o
+        // verbo repetido" (docs/keys.md §5.3). Mesmo assim, a revisão
+        // do PR #30 pede que apareça: TODO nome de [commands], não só
+        // os alcançáveis por tecla.
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        for c in "a linha atual".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let entry = app
+            .palette
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .clone();
+        assert_eq!(entry.name, "current-line");
+        assert!(entry.keys.is_empty());
+    }
+
+    #[test]
+    fn comando_sem_atalho_depois_de_removido_do_keymap_continua_executavel_pela_paleta() {
+        // "[system_prefixes.tempo] z = false" removeria a única tecla
+        // de "history-delete" num keymap.toml de verdade (ver
+        // crates/nas-config/src/keymap_layer.rs pro teste com a
+        // mesclagem real) — aqui, simulado direto no keymap, só pra
+        // confirmar que o comando continua na paleta, sem atalho, e
+        // que Enter ainda executa (abre o prompt de confirmação,
+        // exatamente como `Ctrl+t z` faria).
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let keymap = nas_keys::Keymap::from_toml_str(&nas_keys::DEFAULT_TOML.replace(
+            "z = { action = \"history-delete\", destructive = true }\n",
+            "",
+        ))
+        .expect("keymap válido sem o 'z' de history-delete");
+        app.modal.set_keymap(keymap);
+
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        for c in "apagar historico".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let entry = app
+            .palette
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .clone();
+        assert_eq!(entry.name, "history-delete");
+        assert!(entry.keys.is_empty());
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.palette.is_none());
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::DeleteHistoryConfirm)
+        );
+    }
+
+    #[test]
+    fn comando_armado_pela_paleta_e_completado_normalmente_fica_repetivel_com_ponto() {
+        // "delete" (verbo, atalho 'd') armado pela paleta é exatamente
+        // como apertar 'd' — a tecla seguinte completa o objeto
+        // normalmente, e o composto resultante fica repetível com
+        // "." do mesmo jeito que já era antes da paleta existir
+        // (docs/keys.md §4.2).
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        type_text(&mut app, "abc"); // já termina no Visual, cursor no fim
+        app.handle_key(key(KeyCode::Char('L'))); // move pro início do buffer
+
+        app.handle_key(shift_key(KeyCode::Char(' ')));
+        for c in "apagar".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.palette.as_ref().unwrap().selected_entry().unwrap().name,
+            "delete"
+        );
+        app.handle_key(key(KeyCode::Enter)); // arma o pendente, como 'd' faria
+
+        app.handle_key(key(KeyCode::Char(';'))); // completa: apaga 1 caractere à direita
+        assert_eq!(text(&app), "bc");
+
+        app.handle_key(key(KeyCode::Char('.'))); // repete o composto
+        assert_eq!(text(&app), "c");
     }
 
     #[test]
