@@ -31,15 +31,19 @@
 use std::collections::HashMap;
 
 use crate::key::{Key, KeyCode};
-use crate::keymap::{Binding, Keymap};
+use crate::keymap::{Binding, KeyResolution, Keymap};
 use crate::layout::{self, Layout};
 
-/// Em qual dos três estados a máquina está.
+/// Em qual dos quatro estados a máquina está. `Review`
+/// (docs/decisions/0008-modo-de-revisao.md §4) é o quarto, mais novo:
+/// um buffer somente leitura, com sua própria tabela (`[review]`,
+/// consultada antes de `[visual]`) — ver [`Machine::handle_review`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalState {
     Insert,
     Visual,
     Sequential,
+    Review,
 }
 
 /// Um verbo (docs/keys.md §4.2): espera um objeto, ou age na hora
@@ -66,11 +70,16 @@ impl Verb {
 
 /// Uma unidade (docs/keys.md §4.1): sozinha, espera uma direção pra
 /// mover; depois de um verbo, espera uma direção pra formar um objeto
-/// composto (`d w ;`).
+/// composto (`d w ;`). `Hunk`/`File` (docs/decisions/0008-modo-de-revisao.md
+/// §4) seguem o mesmo mecanismo genérico, só que nunca depois de um
+/// verbo — `[review]` é a única tabela que as liga, e lá não há verbo
+/// nenhum (bloqueado por nome de ação, ver `Keymap::review_resolution`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Unit {
     Word,
     Paragraph,
+    Hunk,
+    File,
 }
 
 impl Unit {
@@ -78,6 +87,8 @@ impl Unit {
         match self {
             Unit::Word => "word",
             Unit::Paragraph => "paragraph",
+            Unit::Hunk => "hunk",
+            Unit::File => "file",
         }
     }
 }
@@ -104,6 +115,13 @@ pub enum Object {
     ParagraphBackward,
     CurrentLine,
     WholeBuffer,
+    /// Direção da unidade "trecho" (`h`), só em `[review]` —
+    /// docs/decisions/0008-modo-de-revisao.md §4.
+    HunkForward,
+    HunkBackward,
+    /// Direção da unidade "arquivo" (`H`), só em `[review]`.
+    FileForward,
+    FileBackward,
 }
 
 impl Object {
@@ -126,6 +144,10 @@ impl Object {
             Object::ParagraphBackward => "paragraph-backward",
             Object::CurrentLine => "current-line",
             Object::WholeBuffer => "whole-buffer",
+            Object::HunkForward => "hunk-forward",
+            Object::HunkBackward => "hunk-backward",
+            Object::FileForward => "file-forward",
+            Object::FileBackward => "file-backward",
         }
     }
 }
@@ -165,6 +187,12 @@ pub enum SystemAction {
     /// `Ctrl+t m` — abre o histórico de mensagens (a echo area,
     /// docs/keys.md regra 8) numa visualização — "mensagens".
     MessageHistory,
+    /// `Ctrl+t v` — abre a revisão **direto**, no padrão (sessão de
+    /// IA mais recente) — docs/decisions/0008-modo-de-revisao.md §1/§4.
+    ReviewOpen,
+    /// `Ctrl+t V` (Shift) — abre a revisão com a lista de checkpoints
+    /// pra escolher qual usar como "antes" — mesma ADR, §1/§4.
+    ReviewOpenPicker,
 }
 
 impl SystemAction {
@@ -184,6 +212,8 @@ impl SystemAction {
             SystemAction::CheckpointBlame => "checkpoint-blame",
             SystemAction::HistoryDelete => "history-delete",
             SystemAction::MessageHistory => "message-history",
+            SystemAction::ReviewOpen => "review-open",
+            SystemAction::ReviewOpenPicker => "review-open-picker",
         }
     }
 }
@@ -246,6 +276,45 @@ pub enum Action {
     /// como mostrar e executar a paleta — a máquina só sabe que foi
     /// pedida.
     OpenCommandPalette,
+    /// `Enter`, dentro de `Review` — aceita o trecho sob o cursor
+    /// (docs/decisions/0008-modo-de-revisao.md §3/§4). Reaproveita o
+    /// significado que `Enter` já tem em todo outro estado (avançar/
+    /// confirmar o que está pendente), não uma redefinição isolada.
+    ReviewAccept,
+    /// `u`, dentro de `Review` — rejeita o trecho sob o cursor. Não é
+    /// uma tecla nova: é o `u` de sempre (desfazer), com o alvo "o
+    /// trecho atual" em vez de "a última transação" — por isso não
+    /// entra no bloqueio por nome de ação (§4).
+    ReviewReject,
+    /// Próximo/anterior trecho (`h k`/`h l`) e próximo/anterior
+    /// arquivo (`H k`/`H l`) — produzidos por
+    /// [`plain_motion_for`] a partir de [`Object::HunkForward`] etc.,
+    /// do mesmo jeito que `w ;`/`W k` já produzem `MoveWordForward`/
+    /// `MoveParagraphForward`.
+    ReviewNextHunk,
+    ReviewPrevHunk,
+    ReviewNextFile,
+    ReviewPrevFile,
+    /// `Esc` dentro de `Review`, sem nada pendente e sem seleção — um
+    /// degrau a mais na mesma cascata de cancelamento que `Esc` já
+    /// segue (verbo/prefixo/unidade pendente, depois seleção, depois
+    /// isto). Quem chama (`nas-term`) fecha o buffer de revisão e
+    /// registra o fim da sessão (ADR 0008 §5); a própria `Machine` já
+    /// volta pro estado `Visual` antes de devolver esta ação.
+    ReviewExit,
+    /// Uma tecla que, em `Review`, resolveria pra um verbo (apagar/
+    /// copiar/recortar), `start-selection`, `select-all`, `paste` ou
+    /// `repeat` — bloqueada por nome de ação, não por tecla física
+    /// (ADR 0008 §4): essas ações não fazem sentido num buffer
+    /// somente leitura. Quem chama mostra um aviso na echo area,
+    /// nunca falha em silêncio.
+    ReviewActionBlocked,
+    /// `g h`, em `[prefixes.go]` (global, não só em `Review`): "ir até
+    /// lá" — abre, no arquivo real, a linha do trecho sob o cursor.
+    /// Sem um trecho atual (fora da revisão), quem chama não tem o
+    /// que fazer com isto — mesma ideia de tecla válida sem alvo que
+    /// já existe noutros compostos (ADR 0008 §4).
+    GotoHunk,
 }
 
 impl Action {
@@ -274,6 +343,13 @@ impl Action {
             Action::SelectAll => "select-all",
             Action::Paste => "paste",
             Action::OpenCommandPalette => "open-command-palette",
+            Action::ReviewAccept => "review-accept",
+            Action::ReviewReject => "review-reject",
+            Action::ReviewNextHunk => "review-next-hunk",
+            Action::ReviewPrevHunk => "review-prev-hunk",
+            Action::ReviewNextFile => "review-next-file",
+            Action::ReviewPrevFile => "review-prev-file",
+            Action::GotoHunk => "goto-hunk",
             Action::DeleteForward
             | Action::DeleteBackward
             | Action::InsertChar(_)
@@ -282,7 +358,9 @@ impl Action {
             | Action::Cut
             | Action::DeleteSelection
             | Action::VerbObject(_, _)
-            | Action::ClearSelection => return None,
+            | Action::ClearSelection
+            | Action::ReviewExit
+            | Action::ReviewActionBlocked => return None,
         })
     }
 
@@ -547,9 +625,17 @@ impl Machine {
     /// dentro). Determinístico: mesma entrada, mesma ordem, sempre
     /// (ver `Keymap::catalog`) — quem chama decide a ordem de exibição
     /// (recência, busca) por conta própria.
+    ///
+    /// **Filtrado pelo estado atual** desde a ADR 0008 §4: comandos
+    /// que só existem em `[review]` (aceitar, navegar por trecho/
+    /// arquivo) só aparecem quando o estado é `Review` — fora da
+    /// revisão não há trecho nenhum pra essas ações agirem sobre.
+    /// Comandos globais (`[visual]`, classe sistema, `[prefixes.go]`
+    /// — incluindo `goto-hunk`) continuam aparecendo em qualquer
+    /// estado, como antes.
     pub fn command_catalog(&self) -> Vec<CatalogEntry> {
         self.keymap
-            .catalog()
+            .catalog(self.state)
             .into_iter()
             .map(|mut entry| {
                 for key in &mut entry.keys {
@@ -558,6 +644,26 @@ impl Machine {
                 entry
             })
             .collect()
+    }
+
+    /// A dica which-key **persistente** de `[review]` — ao contrário
+    /// de [`Machine::pending_hint`] (só enquanto algo está pendente),
+    /// esta vale o tempo todo em que o estado for `Review`
+    /// (docs/decisions/0008-modo-de-revisao.md §4: "a dica fica
+    /// persistente enquanto o estado for Review"). `None` fora de
+    /// `Review`. Não inclui `g h` (vive em `[prefixes.go]`, global,
+    /// não em `[review]`) nem `Esc` (universal) — quem exibe
+    /// (`nas-term`) acrescenta os dois por conta própria.
+    pub fn review_hint(&self) -> Option<PendingHint> {
+        if self.state != ModalState::Review {
+            return None;
+        }
+        Some(PendingHint {
+            keys: String::new(),
+            label: self.keymap.describe("review"),
+            entries: without_destructive(self.keymap.hint_for_review()),
+            ordered: false,
+        })
     }
 
     /// Executa diretamente o que a tecla ligada a `binding` faria —
@@ -649,6 +755,7 @@ impl Machine {
         match self.state {
             ModalState::Insert => "I".to_string(),
             ModalState::Visual => "V".to_string(),
+            ModalState::Review => "Revisão".to_string(),
             ModalState::Sequential => {
                 if self.sequence.is_empty() {
                     "S".to_string()
@@ -678,6 +785,7 @@ impl Machine {
             ModalState::Insert => self.handle_insert(key),
             ModalState::Visual => self.handle_visual(key, has_selection),
             ModalState::Sequential => self.handle_sequential(key, has_selection),
+            ModalState::Review => self.handle_review(key, has_selection),
         }
     }
 
@@ -694,6 +802,20 @@ impl Machine {
     fn enter_sequential(&mut self) {
         self.sequence.clear();
         self.state = ModalState::Sequential;
+        self.pending = None;
+    }
+
+    /// Entra em `Review` — chamado por `nas-term` ao abrir a revisão
+    /// (`Ctrl+t v`/`Ctrl+t V`, classe sistema, fora desta máquina),
+    /// nunca pela máquina modal sozinha: montar o buffer sintético é
+    /// responsabilidade de quem chama, não desta crate (ADR 0008 §2).
+    pub fn enter_review(&mut self) {
+        self.state = ModalState::Review;
+        self.pending = None;
+    }
+
+    fn exit_review(&mut self) {
+        self.state = ModalState::Visual;
         self.pending = None;
     }
 
@@ -747,6 +869,39 @@ impl Machine {
         }
 
         universal_action(key).into_iter().collect()
+    }
+
+    /// `Review` (docs/decisions/0008-modo-de-revisao.md §4): `[review]`
+    /// é consultada **primeiro**; o que ela não menciona cai no
+    /// `[visual]` já resolvido (com o `keymap.toml` do usuário
+    /// aplicado) — exceto o que `Keymap::review_resolution` bloqueia
+    /// por nome de ação (verbo, `start-selection`, `select-all`,
+    /// `paste`, `repeat`), que nunca chega a rodar aqui. `Esc` ganha
+    /// um degrau a mais na mesma cascata de sempre: sem nada pendente
+    /// e sem seleção, sai da revisão.
+    fn handle_review(&mut self, key: Key, has_selection: bool) -> Vec<Action> {
+        if matches!(key.code, KeyCode::Escape) && !key.alt {
+            if self.pending.is_some() {
+                self.pending = None;
+                return Vec::new();
+            }
+            if has_selection {
+                return vec![Action::ClearSelection];
+            }
+            self.exit_review();
+            return vec![Action::ReviewExit];
+        }
+
+        if let Some(pending) = self.pending.clone() {
+            return self.resolve_pending(pending, key);
+        }
+
+        match self.keymap.review_resolution(&key) {
+            KeyResolution::Blocked => vec![Action::ReviewActionBlocked],
+            KeyResolution::Found(Binding::Verb(verb)) => self.enter_verb(verb, has_selection),
+            KeyResolution::Found(binding) => self.run_binding(binding),
+            KeyResolution::None => universal_action(key).into_iter().collect(),
+        }
     }
 
     /// `d`/`c`/`x`: com seleção ativa, age na hora; senão, começa a
@@ -951,6 +1106,10 @@ pub(crate) fn plain_motion_for(object: Object) -> Option<Action> {
         Object::WordForward => Some(Action::MoveWordForward),
         Object::ParagraphForward => Some(Action::MoveParagraphForward),
         Object::ParagraphBackward => Some(Action::MoveParagraphBackward),
+        Object::HunkForward => Some(Action::ReviewNextHunk),
+        Object::HunkBackward => Some(Action::ReviewPrevHunk),
+        Object::FileForward => Some(Action::ReviewNextFile),
+        Object::FileBackward => Some(Action::ReviewPrevFile),
         _ => None,
     }
 }
@@ -1665,5 +1824,214 @@ mod tests {
         // dois layouts.
         let mut machine = Machine::with_layout(Layout::QwertyAbnt);
         assert_eq!(run(&mut machine, "gg"), vec![Action::MoveBufferStart]);
+    }
+
+    // --- ADR 0008 (modo de revisão) ---
+
+    #[test]
+    fn enter_review_troca_estado_e_mostra_dica_persistente() {
+        let mut machine = Machine::new();
+        assert!(machine.review_hint().is_none());
+        machine.enter_review();
+        assert_eq!(machine.state(), ModalState::Review);
+        assert_eq!(machine.status_label(), "Revisão");
+        let hint = machine.review_hint().expect("deveria ter dica em Review");
+        assert!(!hint.entries.is_empty());
+    }
+
+    #[test]
+    fn review_enter_aceita_o_trecho() {
+        let mut machine = Machine::new();
+        machine.enter_review();
+        assert_eq!(
+            machine.handle_key(Key::enter(), false),
+            vec![Action::ReviewAccept]
+        );
+        // RET em Review nunca entra no Insert — é redefinido, não cai
+        // no [visual] (que teria RET = "enter-insert").
+        assert_eq!(machine.state(), ModalState::Review);
+    }
+
+    #[test]
+    fn review_u_rejeita_em_vez_de_desfazer() {
+        let mut machine = Machine::new();
+        machine.enter_review();
+        assert_eq!(
+            machine.handle_key(Key::char('u'), false),
+            vec![Action::ReviewReject]
+        );
+    }
+
+    #[test]
+    fn review_h_e_unidade_trecho_k_l_navegam() {
+        let mut machine = Machine::new();
+        machine.enter_review();
+        assert_eq!(run(&mut machine, "hk"), vec![Action::ReviewNextHunk]);
+        assert_eq!(run(&mut machine, "hl"), vec![Action::ReviewPrevHunk]);
+    }
+
+    #[test]
+    fn review_h_maiusculo_e_unidade_arquivo() {
+        let mut machine = Machine::new();
+        machine.enter_review();
+        assert_eq!(run(&mut machine, "Hk"), vec![Action::ReviewNextFile]);
+        assert_eq!(run(&mut machine, "Hl"), vec![Action::ReviewPrevFile]);
+    }
+
+    #[test]
+    fn review_movimento_de_caractere_e_linha_cai_no_visual() {
+        // j/k/l/;/J/:/K/L não são redefinidos em [review] — caem no
+        // [visual], exatamente com o mesmo significado de sempre
+        // (ADR 0008 §4: "o que não estiver nela cai no [visual]").
+        let mut machine = Machine::new();
+        machine.enter_review();
+        assert_eq!(
+            run(&mut machine, "j;kl"),
+            vec![
+                Action::MoveLeft,
+                Action::MoveRight,
+                Action::MoveDown,
+                Action::MoveUp
+            ]
+        );
+        assert_eq!(
+            machine.handle_key(Key::char('J'), false),
+            vec![Action::MoveLineStart]
+        );
+    }
+
+    #[test]
+    fn review_bloqueia_verbo_selecao_colar_e_repetir_por_nome_de_acao() {
+        let mut machine = Machine::new();
+        machine.enter_review();
+        for key in ['d', 'c', 'x', 's', 'S', 'y', '.'] {
+            assert_eq!(
+                machine.handle_key(Key::char(key), false),
+                vec![Action::ReviewActionBlocked],
+                "{key} deveria ser bloqueada em Review"
+            );
+            assert!(
+                machine.pending_hint().is_none(),
+                "bloquear não deveria deixar nada pendente"
+            );
+        }
+        assert_eq!(machine.state(), ModalState::Review);
+    }
+
+    #[test]
+    fn review_esc_sem_pendente_sai_para_visual() {
+        let mut machine = Machine::new();
+        machine.enter_review();
+        assert_eq!(
+            machine.handle_key(Key::escape(), false),
+            vec![Action::ReviewExit]
+        );
+        assert_eq!(machine.state(), ModalState::Visual);
+    }
+
+    #[test]
+    fn review_esc_cancela_pendente_antes_de_sair() {
+        let mut machine = Machine::new();
+        machine.enter_review();
+        run(&mut machine, "h"); // unidade "trecho" pendente, esperando k/l
+        assert!(machine.pending_hint().is_some());
+        assert_eq!(
+            machine.handle_key(Key::escape(), false),
+            Vec::<Action>::new()
+        );
+        assert_eq!(
+            machine.state(),
+            ModalState::Review,
+            "o primeiro Esc só cancela o pendente, não sai da revisão"
+        );
+        assert_eq!(
+            machine.handle_key(Key::escape(), false),
+            vec![Action::ReviewExit]
+        );
+    }
+
+    #[test]
+    fn review_g_prefixo_ir_para_continua_funcionando_por_queda() {
+        // "g" não está em [review] — cai no [visual], que o liga ao
+        // prefixo "go" (global); "g h" é uma entrada nova desse
+        // prefixo, não de [review] (ADR 0008 §4).
+        let mut machine = Machine::new();
+        machine.enter_review();
+        assert_eq!(run(&mut machine, "gh"), vec![Action::GotoHunk]);
+    }
+
+    #[test]
+    fn goto_hunk_funciona_fora_da_revisao_tambem_pois_e_global() {
+        let mut machine = Machine::new();
+        assert_eq!(run(&mut machine, "gh"), vec![Action::GotoHunk]);
+    }
+
+    #[test]
+    fn review_remapeamento_do_usuario_em_movimento_tambem_vale_na_revisao() {
+        // "ADR 0008 §4: uma tecla de movimento remapeada pelo usuário
+        // tem que valer na revisão também" — simulado aqui com um
+        // keymap.toml que troca "move-right" de ";" para "z".
+        let mut machine = Machine::new();
+        machine.set_keymap(
+            crate::keymap::Keymap::from_toml_str(
+                r#"[visual]
+z = "move-right"
+"#,
+            )
+            .unwrap(),
+        );
+        machine.enter_review();
+        assert_eq!(
+            machine.handle_key(Key::char('z'), false),
+            vec![Action::MoveRight]
+        );
+    }
+
+    #[test]
+    fn review_bloqueio_vale_mesmo_se_usuario_remapear_o_verbo_pra_outra_tecla() {
+        // O bloqueio é por NOME de ação, não por tecla física — um
+        // keymap.toml que move "apagar" pra "z" continua bloqueado em
+        // Review, porque o que importa é que "z" resolveria pra um
+        // verbo (ADR 0008 §4).
+        let mut machine = Machine::new();
+        machine.set_keymap(
+            crate::keymap::Keymap::from_toml_str(
+                r#"[visual]
+z = { verb = "delete" }
+"#,
+            )
+            .unwrap(),
+        );
+        machine.enter_review();
+        assert_eq!(
+            machine.handle_key(Key::char('z'), false),
+            vec![Action::ReviewActionBlocked]
+        );
+    }
+
+    #[test]
+    fn command_catalog_so_mostra_comandos_de_review_dentro_da_revisao() {
+        let mut machine = Machine::new();
+        let outside = machine.command_catalog();
+        assert!(
+            !outside.iter().any(|entry| entry.name == "review-accept"),
+            "review-accept não deveria aparecer fora da revisão"
+        );
+        assert!(
+            outside.iter().any(|entry| entry.name == "goto-hunk"),
+            "goto-hunk é global (vive em [prefixes.go]) — deveria aparecer sempre"
+        );
+
+        machine.enter_review();
+        let inside = machine.command_catalog();
+        assert!(
+            inside.iter().any(|entry| entry.name == "review-accept"),
+            "review-accept deveria aparecer dentro da revisão"
+        );
+        let accept = inside
+            .iter()
+            .find(|entry| entry.name == "review-accept")
+            .unwrap();
+        assert_eq!(accept.keys, vec![Key::enter()]);
     }
 }
