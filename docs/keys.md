@@ -72,9 +72,11 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
    Sequential — uma frase inteira de comandos. Com Alt (`Alt+Espaço`),
    alterna entre escrever texto e dar comandos (Insert ↔ Visual) — o
    exemplo central da classe alternar (§4). `Espaço t` fica reservado
-   para falar com a IA (a "tia"); `Shift+Espaço`, para uma futura
-   paleta de comandos — essa combinação depende do protocolo de
-   teclado do Kitty pra distinguir de um `Espaço` comum (ver §6/§7).
+   para falar com a IA (a "tia"); `Shift+Espaço` abre a paleta de
+   comandos, só no Visual — essa combinação depende do protocolo de
+   teclado do Kitty pra distinguir de um `Espaço` comum (sem ele,
+   continua sendo só o líder). `Espaço p`, dentro do próprio líder,
+   abre a mesma paleta em qualquer terminal (ver §5.9).
 3. **Shift intensifica.** Leva o significado ao extremo — tanto a
    *distância* de uma direção (`j` → `J`: um caractere → o início da
    linha) quanto o *tamanho* de uma unidade (`w` → `W`: palavra →
@@ -225,6 +227,7 @@ dois lugares.
 | Teclas | Ação |
 |---|---|
 | `Espaço f` | buscar |
+| `Espaço p` | paleta de comandos (ver §5.9) |
 | `Espaço r` | substituir (reservado, não implementado — ver §7) |
 | `Espaço h` | ajuda (reservado, não implementado — ver §7) |
 | `Espaço Espaço` | entrar no Sequential |
@@ -300,6 +303,27 @@ janelas, a mesma ideia aplicada à tela:
 O nas ainda não tem janelas: `Alt+direção` fica só documentado — ver
 §7. Ver também §10 (decisão em aberto sobre `Ctrl+b`).
 
+### 5.9 Paleta de comandos (Visual)
+
+| Atalho | Ação |
+|---|---|
+| `Shift+Espaço` | abre a paleta de comandos — só no Visual; depende do protocolo de teclado do Kitty (`supports_keyboard_enhancement`) pra distinguir de um `Espaço` comum |
+| `Espaço p` | abre a mesma paleta, em qualquer terminal — a entrada que funciona sem o protocolo do Kitty |
+
+Com a paleta aberta: `↑`/`↓` movem a seleção na lista (dando a volta
+nas duas pontas), `Enter` executa o comando selecionado — exatamente
+como apertar a tecla dele, incluindo abrir um prompt se o comando
+pedir algo (ex.: "ir para uma linha") — e `Esc` fecha sem executar
+nada. Qualquer outra tecla normal entra na busca (aproximada, por
+nome ou descrição, sem diferenciar acentos nem maiúsculas); nenhuma
+tecla chega à máquina modal enquanto a paleta está ativa, do mesmo
+jeito que um prompt (regra 8, "a dica which-key segue a mesma ideia
+de camada por cima da barra de status").
+
+Em `Espaço`, no líder, `p` é livre pra isto: diferente do `p`
+sozinho em `[visual]` (reservado pra "dentro de"/"em volta de", §6),
+o namespace do líder é independente, e nada mais usa essa letra ali.
+
 ## 6. Teclas reservadas (não implementadas)
 
 | Teclas | Reservadas para |
@@ -313,7 +337,6 @@ O nas ainda não tem janelas: `Alt+direção` fica só documentado — ver
 | `Espaço r` | substituir (query-replace) |
 | `Espaço h` | ajuda |
 | `Espaço t` | falar com a IA (a "tia") |
-| `Shift+Espaço` | futura paleta de comandos (depende do protocolo de teclado do Kitty) |
 | `Alt+j`/`;`/`k`/`l` | gerência de janelas |
 
 ## 7. O que não está implementado, e por quê
@@ -322,19 +345,17 @@ O nas ainda não tem janelas: `Alt+direção` fica só documentado — ver
   confirmação por ocorrência (como `query-replace` do Emacs) — maior
   que uma linha de entrada simples. Fica pra quando esse fluxo
   existir.
-- **`Espaço h` (ajuda):** não tem pra onde apontar ainda — não há um
-  catálogo de comandos navegável no nas-term. As dicas de verbo/
-  prefixo/unidade (regra 8) já cobrem boa parte da necessidade
-  imediata.
+- **`Espaço h` (ajuda):** a paleta de comandos (§5.9) e as dicas de
+  verbo/prefixo/unidade (regra 8) já cobrem boa parte da descoberta
+  por busca — o que falta é uma ajuda mais rica (docstring completa,
+  exemplos), além do nome e da descrição curta que a paleta já
+  mostra.
 - **Gerência de janelas (classe alternar, `Alt+direção`):** `nas-term`
   não tem múltiplos painéis — só um buffer visível por vez (trocar de
   buffer não divide a tela).
-- **`Espaço t` (falar com a IA) e `Shift+Espaço` (paleta de
-  comandos):** não há IA integrada neste marco (ver README, Marco 4);
-  a paleta de comandos, além de não ter interface ainda, depende de
-  diferenciar `Shift+Espaço` de `Espaço`, o que só o protocolo de
-  teclado do Kitty permite (`supports_keyboard_enhancement`, já usado
-  em `nas-term` para outra coisa).
+- **`Espaço t` (falar com a IA):** não há IA integrada neste marco
+  (ver README, Marco 4) — não tem pra onde apontar ainda, igual
+  `Espaço h`.
 - **`g c` / `g f`:** `g c` (posição em caracteres) não tem um caso de
   uso claro ainda; `g f` depende de um cliente LSP, que não existe
   neste marco.
