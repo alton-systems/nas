@@ -19,7 +19,22 @@ struct McpProcess {
 }
 
 impl McpProcess {
-    fn spawn(project_dir: &Path, state_home: &Path, approve_writes: bool) -> Self {
+    /// `allow_write_file`: escreve, de antemão, um `permissions.toml`
+    /// liberando `write-file` na pasta de histórico do projeto (ADR
+    /// 0006 §5, etapa 3d) — o jeito de testar um comando que precisa
+    /// de aprovação sem depender de pergunta interativa nenhuma (que
+    /// esta etapa não implementa: o `rmcp` fixado no workspace não
+    /// suporta `elicitation`).
+    fn spawn(project_dir: &Path, state_home: &Path, allow_write_file: bool) -> Self {
+        if allow_write_file {
+            let history_dir = history_dir_for(project_dir, state_home);
+            std::fs::write(
+                nas_history::permissions_path(&history_dir),
+                "write-file = true\n",
+            )
+            .expect("escrever permissions.toml de teste");
+        }
+
         let mut command = Command::new(env!("CARGO_BIN_EXE_nas"));
         command
             .arg("--mcp")
@@ -28,9 +43,6 @@ impl McpProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if approve_writes {
-            command.arg("--approve-writes");
-        }
         let mut child = command.spawn().expect("iniciar nas --mcp");
         let stdin = child.stdin.take().expect("stdin do processo");
         let stdout = BufReader::new(child.stdout.take().expect("stdout do processo"));
@@ -300,13 +312,13 @@ fn journal_sobrevive_a_um_encerramento_a_forca_depois_de_cada_chamada() {
 }
 
 #[test]
-fn save_file_recusado_sem_approve_writes() {
+fn save_file_recusado_sem_permissions_toml() {
     let project_dir = tempfile::tempdir().expect("diretório do projeto");
     let state_home = tempfile::tempdir().expect("diretório de estado");
     std::fs::write(project_dir.path().join("foo.txt"), "ola\n").expect("escrever foo.txt");
 
     let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), false);
-    mcp.initialize("teste-sem-flag");
+    mcp.initialize("teste-sem-politica");
 
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
@@ -314,10 +326,13 @@ fn save_file_recusado_sem_approve_writes() {
         json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
     );
     let (is_error, text) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
-    assert!(is_error, "save_file deveria recusar sem --approve-writes");
     assert!(
-        text.contains("3d") || text.to_lowercase().contains("aprova"),
-        "mensagem de recusa não menciona aprovação: {text}"
+        is_error,
+        "save_file deveria recusar sem permissions.toml liberando write-file"
+    );
+    assert!(
+        text.to_lowercase().contains("aprova") && text.contains("nas --permissions"),
+        "mensagem de recusa não menciona aprovação/nas --permissions: {text}"
     );
 
     let disk_content =
@@ -325,6 +340,118 @@ fn save_file_recusado_sem_approve_writes() {
     assert_eq!(
         disk_content, "ola\n",
         "save_file não deveria ter escrito nada"
+    );
+
+    let history_dir = history_dir_for(project_dir.path(), state_home.path());
+    let decisions =
+        nas_history::read_permission_decisions(&history_dir).expect("ler decisões registradas");
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.command == "save_file"
+                && d.decision == nas_history::PermissionDecision::Denied),
+        "a recusa deveria ter sido registrada no journal de permissões: {decisions:?}"
+    );
+
+    mcp.kill();
+}
+
+#[test]
+fn save_file_recusado_com_permissions_toml_invalido() {
+    let project_dir = tempfile::tempdir().expect("diretório do projeto");
+    let state_home = tempfile::tempdir().expect("diretório de estado");
+    std::fs::write(project_dir.path().join("foo.txt"), "ola\n").expect("escrever foo.txt");
+    let history_dir = history_dir_for(project_dir.path(), state_home.path());
+    std::fs::write(nas_history::permissions_path(&history_dir), "voar = 1\n")
+        .expect("escrever permissions.toml inválido");
+
+    let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), false);
+    mcp.initialize("teste-politica-invalida");
+
+    mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
+    mcp.call_tool_text(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+    );
+    let (is_error, text) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
+    assert!(
+        is_error,
+        "save_file deveria recusar com permissions.toml inválido"
+    );
+    assert!(
+        text.to_lowercase().contains("inválido"),
+        "mensagem de recusa não menciona o arquivo inválido: {text}"
+    );
+
+    mcp.kill();
+}
+
+/// Um `permissions.toml` dentro do próprio projeto (nunca em
+/// `history_dir`) liberando tudo precisa ser ignorado por completo —
+/// nada dentro do repositório pode conceder permissão a si mesmo (ADR
+/// 0006 §5).
+#[test]
+fn permissions_toml_dentro_do_projeto_e_ignorado() {
+    let project_dir = tempfile::tempdir().expect("diretório do projeto");
+    let state_home = tempfile::tempdir().expect("diretório de estado");
+    std::fs::write(project_dir.path().join("foo.txt"), "ola\n").expect("escrever foo.txt");
+    std::fs::write(
+        project_dir.path().join("permissions.toml"),
+        "write-file = true\n",
+    )
+    .expect("escrever permissions.toml falso dentro do projeto");
+
+    let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), false);
+    mcp.initialize("teste-politica-no-projeto");
+
+    mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
+    mcp.call_tool_text(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+    );
+    let (is_error, _) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
+    assert!(
+        is_error,
+        "um permissions.toml dentro do projeto nunca deveria liberar nada"
+    );
+
+    mcp.kill();
+}
+
+#[test]
+fn decisao_aprovada_pelo_arquivo_e_registrada_no_journal_de_permissoes() {
+    let project_dir = tempfile::tempdir().expect("diretório do projeto");
+    let state_home = tempfile::tempdir().expect("diretório de estado");
+    std::fs::write(project_dir.path().join("foo.txt"), "ola\n").expect("escrever foo.txt");
+
+    let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), true);
+    mcp.initialize("teste-aprovado");
+
+    mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
+    mcp.call_tool_text(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+    );
+    let (is_error, _) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
+    assert!(
+        !is_error,
+        "save_file deveria aceitar com write-file liberado"
+    );
+
+    let history_dir = history_dir_for(project_dir.path(), state_home.path());
+    let decisions =
+        nas_history::read_permission_decisions(&history_dir).expect("ler decisões registradas");
+    let decision = decisions
+        .iter()
+        .find(|d| d.command == "save_file")
+        .expect("deveria ter uma decisão pra save_file");
+    assert_eq!(decision.agent, "teste-aprovado");
+    assert_eq!(decision.effect, "write-file");
+    assert_eq!(
+        decision.decision,
+        nas_history::PermissionDecision::Allowed {
+            source: nas_history::PermissionSource::File,
+        }
     );
 
     mcp.kill();

@@ -14,10 +14,12 @@ mod commands;
 mod context;
 mod effect;
 mod error;
+mod permission;
 mod registry;
 
 pub use commands::register_all;
 pub use context::{CommandContext, Workspace};
 pub use effect::Effect;
 pub use error::CommandError;
+pub use permission::allowed_by_policy;
 pub use registry::{CommandSpec, Registry, typed_command};

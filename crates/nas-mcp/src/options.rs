@@ -11,10 +11,4 @@ pub struct McpOptions {
     /// `checkpoint_create`, `checkpoint_restore`) recusam nesse caso,
     /// mas o servidor ainda sobe.
     pub history_dir: Option<PathBuf>,
-    /// `--approve-writes` (ADR 0006-ia-trabalha-pelo-nas.md, revisão
-    /// da etapa 3c): libera só `Effect::WriteFile`, nunca
-    /// `Shell`/`Network` — temporário, só pra testar antes da
-    /// aprovação de verdade (etapa 3d); remover ou substituir lá.
-    /// Desligada por padrão.
-    pub approve_writes: bool,
 }

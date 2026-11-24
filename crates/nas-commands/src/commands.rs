@@ -1002,7 +1002,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("diretório temporário");
         let path = write(dir.path(), "a.txt", "ola");
         let mut ws = workspace(dir.path());
-        let mut context = ctx(&mut ws, Author::User);
+        let author = Author::Ai {
+            agent: "teste".to_string(),
+            session: "s1".to_string(),
+        };
+        let mut context = ctx(&mut ws, author);
         let mut registry = Registry::new();
         register_all(&mut registry);
 
@@ -1032,6 +1036,37 @@ mod tests {
                 serde_json::json!({ "path": path_str }),
             )
             .expect("devia aceitar com a aprovação concedida");
+    }
+
+    /// ADR 0006 §5 (etapa 3d): a checagem de aprovação só existe pra
+    /// `Author::Ai` — uma ação do usuário, editando direto, nunca
+    /// pede aprovação de si mesma, mesmo pra um efeito que pediria de
+    /// um agente (`save_file`, `WriteFile`).
+    #[test]
+    fn acao_do_usuario_nunca_pede_aprovacao() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+
+        let path_str = path.to_string_lossy().into_owned();
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+
+        registry
+            .run(
+                "save_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("usuário nunca precisa de aprovação, mesmo sem approved_effects");
     }
 
     #[test]

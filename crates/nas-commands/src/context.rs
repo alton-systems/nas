@@ -326,12 +326,12 @@ fn canonicalize_lenient(path: &Path) -> io::Result<PathBuf> {
 pub struct CommandContext<'a> {
     pub workspace: &'a mut Workspace,
     pub author: Author,
-    /// Efeitos que já têm aprovação pra esta chamada — vazio por
-    /// padrão, porque a aprovação de verdade só chega na etapa 3d
-    /// (ADR 0006 §5): até lá, `Registry::run` recusa qualquer
-    /// comando com efeito `WriteFile`/`Shell`/`Network` a menos que
-    /// o efeito esteja aqui. `nas --mcp --approve-writes`
-    /// (temporário, só pra testar enquanto 3d não existe) é o único
-    /// jeito de colocar `WriteFile` aqui — nunca `Shell`/`Network`.
+    /// Efeitos já aprovados pra esta chamada específica — quem monta
+    /// o `CommandContext` (hoje, `nas-mcp`) decide o que entra aqui,
+    /// consultando a política de permissões do projeto
+    /// (`nas_history::load_permissions`, ADR 0006 §5, etapa 3d) antes
+    /// de chamar `Registry::run`; sem o efeito aqui, um comando
+    /// `WriteFile`/`Shell`/`Network` pedido por um agente de IA é
+    /// recusado (`CommandError::NeedsApproval`).
     pub approved_effects: std::collections::HashSet<crate::effect::Effect>,
 }

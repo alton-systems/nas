@@ -38,11 +38,12 @@ pub enum CommandError {
     /// (ADR 0006, revisão da etapa 3c). Quem chama precisa reabrir
     /// com `open_file` antes de tentar salvar de novo.
     DiskChanged(String),
-    /// O comando declara um efeito que ainda pede aprovação (ADR
-    /// 0006 §5: `WriteFile`, `Shell`, `Network`) e esta etapa (3c)
-    /// ainda não tem onde pedir — a aprovação de verdade chega na
-    /// etapa 3d. Sem a flag `--approve-writes` (que só libera
-    /// `WriteFile`, nunca `Shell`/`Network`), o comando é recusado.
+    /// O comando declara um efeito que pede aprovação (ADR 0006 §5:
+    /// `WriteFile`, `Shell`, `Network`), pedido por um agente de IA,
+    /// e o efeito não está entre os já aprovados desta chamada
+    /// (`CommandContext::approved_effects`) — quem monta o contexto
+    /// (`nas-mcp`) já devia ter recusado antes de chegar aqui; este é
+    /// só o cinto de segurança do `Registry` em si (etapa 3d).
     NeedsApproval { command: String, effect: Effect },
 }
 
@@ -75,7 +76,7 @@ impl fmt::Display for CommandError {
             }
             CommandError::NeedsApproval { command, effect } => write!(
                 f,
-                "{command:?} tem efeito {effect:?}, que pede aprovação — a aprovação chega na etapa 3d; rode com --approve-writes (só libera WriteFile, nunca Shell/Network) pra testar enquanto isso"
+                "{command:?} tem efeito {effect:?}, que pede aprovação e não foi liberado — rode nas --permissions neste projeto pra ver ou liberar o que falta"
             ),
         }
     }
