@@ -135,6 +135,14 @@ fn hash_bytes(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// O mesmo hash de conteúdo usado em `objects/` — exposto pra quem
+/// precisa comparar conteúdo sem duplicar o algoritmo nem depender de
+/// `store_object` (que também grava o objeto, o que `crate::last_save`
+/// não quer: só compara, nunca guarda o conteúdo de novo).
+pub fn hash_content(bytes: &[u8]) -> String {
+    hash_bytes(bytes)
+}
+
 /// Cria um checkpoint com o conteúdo atual de `files` (caminho,
 /// bytes) — desde a correção do restaurar parcial, isto é sempre
 /// **todo arquivo rastreado** do projeto (ver `crate::originals`),

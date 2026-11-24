@@ -459,22 +459,77 @@ declara, com um padrão de configuração se o cliente não declarar
 nada); `session` é gerado uma vez por conexão ao núcleo.
 
 **Revisar e desfazer uma sessão inteira não precisa de mecanismo
-novo.** Na primeira mudança efetiva de um `(agent, session)`, o núcleo
-cria um checkpoint automático ("antes da sessão de `<agent>`") — o
-mesmo padrão que a restauração já usa pra se tornar desfazível (ADR
-0005 §7). Depois disso:
+novo (implementado na etapa 3e).** Na primeira chamada efetiva de um
+`(agent, session)` — um comando com efeito `WriteBuffer`/`WriteFile`
+que de fato muda algo, nunca uma tentativa que falhou —
+`Registry::run` cria um checkpoint automático **antes** de aplicar a
+mudança, chamado `"antes da sessão de <agent> (<data e hora>)"`, com
+o estado de todo arquivo já rastreado (buffer aberto, se houver;
+senão o disco) — o mesmo padrão que a restauração já usa pra se
+tornar desfazível (ADR 0005 §7). Um só por `(agent, session)`, nunca
+repetido — chamadas seguintes da mesma sessão não criam outro. `Ctrl+t
+l`, no `nas-term`, já identifica o autor de cada checkpoint na própria
+linha (`você`/`IA (agente)`/...), não só pelo nome.
+
+Depois disso:
 
 - `Ctrl+t a` (autoria) já mostra, linha a linha, o que foi daquela
-  sessão.
+  sessão — sem duplicar como `Author::External` quando a IA salva
+  (issue #28, abaixo).
 - `Ctrl+t e` entre o checkpoint automático e agora mostra o diff
   inteiro da sessão.
 - `Ctrl+t r` nesse mesmo checkpoint desfaz a sessão inteira de uma vez
   — a mesma composição que ADR 0005 §7 já usa ("desfazer uma
   restauração é só restaurar o checkpoint automático que ela mesma
-  criou").
+  criou"), reaproveitando `nas_history::restore` sem nenhuma mudança:
+  o checkpoint de sessão é um checkpoint automático como qualquer
+  outro pra esse algoritmo.
 
 Nenhuma dessas três teclas precisa saber que existe um agente — elas
 já tratam `Author::Ai` igual a qualquer outro autor.
+
+**Restaurar o checkpoint de sessão volta o projeto inteiro àquele
+momento — não só os arquivos que a sessão tocou.** `nas_history::restore`
+já funciona assim pra qualquer checkpoint (docs/decisions/0005 §4): tudo
+que foi tocado por qualquer autor, depois do checkpoint, é revertido ao
+original ou jogado na lixeira (nunca apagado de vez), mesmo que não
+tenha sido a sessão quem tocou. Na prática, isso inclui edições suas
+feitas durante a sessão, em arquivos que a IA nunca abriu — **elas não
+se perdem**: o próprio `restore` cria, antes de mexer em qualquer
+coisa, o checkpoint automático "antes de restaurar", com o estado de
+tudo naquele instante (a sua edição incluída). Desfazer *seletivamente*
+só a parte da IA, preservando edições suas feitas depois sem tocar
+nelas, é trabalho da futura etapa de revisão (§8) — não desta. Mesmo
+aviso em `docs/mcp.md`.
+
+**Issue #28 (sem autoria duplicada):** uma edição salva pela IA
+(`save_file`/`create_file`/restaurar um checkpoint, via `nas --mcp`)
+não pode aparecer duas vezes no journal — uma como `Author::Ai`, no
+momento do `save`, e outra como `Author::External` quando um
+`nas-term` aberto no mesmo arquivo detecta a escrita no disco (ADR
+0005 §1). A correção: toda escrita de verdade em disco
+(`Workspace::record_last_save`) registra o hash do conteúdo gravado,
+por autor, num registro compartilhado (`nas_history::record_last_save`/
+`get_last_save`, sobrescrito a cada gravação — "a última", não "a
+primeira", diferente de `originals`). Ao detectar uma mudança
+externa, `nas-term` confere esse registro antes de journalar: bate o
+hash? então já foi journalada por outro autor, e `nas-term` só
+recarrega/avisa, sem gravar uma segunda entrada. Mudanças externas de
+verdade (outro programa, `git checkout`, etc.) continuam registradas
+como `Author::External` normalmente — nada muda pra elas.
+
+**Issue #24 (sem falha em silêncio):** `ensure_tracked` e o flush do
+journal usavam `let _ =` em três lugares (`nas-term::app`,
+`nas-commands::context`, `nas-commands::registry`) — uma falha ali
+nunca impedia o comando (não deveria: o texto já foi editado/salvo de
+verdade), mas também não podia desaparecer: sem o original guardado,
+um checkpoint futuro (nomeado, automático, ou o de sessão desta
+etapa) não consegue restaurar aquele arquivo de volta. Agora: no
+`nas-term`, aparece na echo area; no MCP, `Registry::run` mescla o
+aviso no resultado da própria ferramenta (campo `warning`, o mesmo
+canal que já existia pra avisos de sincronização com o disco) — nunca
+um erro que recuse o comando (o efeito real já aconteceu), mas nunca
+descartado em silêncio tampouco.
 
 ### 7. Teste comparativo
 
@@ -636,9 +691,16 @@ depois.
   parte de 3d. **Remove `--approve-writes`** (a flag temporária de 3c,
   §5), substituída pelo arquivo de política — a flag não sobrevive a
   esta etapa.
-- **3e** — autoria de sessão: o checkpoint automático por
-  `(agent, session)`, um teste de ponta a ponta provando que `Ctrl+t
-  r` nesse checkpoint desfaz a sessão inteira.
+- **3e** (pronta) — autoria de sessão: o checkpoint automático por
+  `(agent, session)` (§6), um teste de ponta a ponta provando que
+  `Ctrl+t r` nesse checkpoint desfaz a sessão inteira (reverte o que
+  já existia, joga na lixeira o que a sessão criou), sem perder uma
+  edição concorrente do usuário (recuperável pelo "antes de
+  restaurar"). Também corrige as issues #24 (falha de `ensure_tracked`/
+  flush do journal não pode passar em silêncio) e #28 (edição salva
+  pela IA não pode aparecer duplicada como `Author::External`) — as
+  duas ficaram pendentes pra esta etapa porque dependiam da autoria de
+  sessão estar implementada pra fazer sentido testar de ponta a ponta.
 - **revisão** — uma tela pra revisar o trabalho de uma sessão de IA
   (ou de um período) antes de confiar nele, trecho a trecho:
   - um buffer único com todos os trechos alterados, de todos os

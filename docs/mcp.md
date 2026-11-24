@@ -1,9 +1,9 @@
 # MCP no nas
 
 Referência de `nas --mcp` — a decisão está em
-`docs/decisions/0006-ia-trabalha-pelo-nas.md` (§3, §5, §8: etapa 3c);
-este documento é só como usar o que já existe, não as razões por
-trás.
+`docs/decisions/0006-ia-trabalha-pelo-nas.md` (§3, §5, §6, §8: etapas
+3c-3e); este documento é só como usar o que já existe, não as razões
+por trás.
 
 **Limitações conhecidas desta etapa** (leia antes de testar, pra não
 confundir com defeito):
@@ -24,10 +24,6 @@ confundir com defeito):
   (`nas --permissions`, abaixo) — nunca uma pergunta no meio da
   sessão, nem "sempre nesta sessão" (ADR 0006 §5, revisão da etapa
   3d).
-- **Sem checkpoint automático de sessão (até a etapa 3e).** Cada
-  sessão de IA ainda não ganha um checkpoint próprio no começo; use
-  `checkpoint_create` manualmente se quiser um ponto pra voltar antes
-  de deixar a IA trabalhar.
 
 ## Como registrar no Claude Code
 
@@ -131,4 +127,35 @@ Toda mudança feita por aqui é journalada como `Author::Ai { agent,
 session }` (`docs/decisions/0005` §1): `agent` é o `clientInfo.name`
 que o cliente MCP declarou no `initialize`; `session` é gerado uma
 vez quando o processo `nas --mcp` sobe. `Ctrl+t a` no `nas-term`
-mostra essas edições como de qualquer outro autor.
+mostra essas edições como de qualquer outro autor — uma edição salva
+por aqui (`save_file`/`create_file`/restaurar um checkpoint) nunca
+aparece duplicada como `Author::External` quando um `nas-term` aberto
+no mesmo arquivo percebe a escrita no disco (issue #28): o hash do
+que foi gravado fica registrado por autor, e `nas-term` reconhece a
+mudança como já journalada antes de gravar uma segunda entrada.
+
+## Checkpoint automático de sessão
+
+Na primeira chamada que de fato muda algo (`edit`, `create_file`,
+`save_file` ou `checkpoint_restore`), cada sessão ganha, automática e
+sozinha, um checkpoint chamado `antes da sessão de <agent>
+(<data e hora>)` — sem precisar chamar `checkpoint_create` à mão. Um
+só por sessão, nunca repetido. `Ctrl+t l`, no `nas-term`, já identifica
+o autor de cada checkpoint na própria linha, então esse checkpoint
+aparece reconhecível mesmo sem procurar pelo nome.
+
+`Ctrl+t r` nesse checkpoint (pelo nome ou pelo id, mostrados em `Ctrl+t
+l`) desfaz a sessão inteira de uma vez: reverte ao estado anterior
+qualquer arquivo que a sessão tenha mudado, e manda pra lixeira
+(nunca apaga de vez) qualquer arquivo que ela tenha criado.
+
+**Importante:** restaurar o checkpoint de sessão volta o **projeto
+inteiro** àquele momento — não só os arquivos que a sessão tocou
+(mesma regra de qualquer restauração, `docs/decisions/0005` §4). Se
+você editou alguma coisa durante a sessão, em paralelo, essa edição
+também é revertida ou jogada na lixeira junto. Ela não se perde: o
+próprio `Ctrl+t r` cria, antes de tocar em qualquer arquivo, o
+checkpoint automático "antes de restaurar" — é lá que a sua edição
+fica recuperável (`Ctrl+t r` de novo, nesse checkpoint). Desfazer só
+a parte da IA, preservando o resto sem precisar recuperar nada à mão,
+é trabalho da futura etapa de revisão — ainda não existe.

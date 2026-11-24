@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nas_editor::{Document, OpenError, RegionObject};
-use nas_history::{Author, CheckpointManifest, ExcludedReason, FileChange, Journal, ProjectId};
+use nas_history::{
+    Author, CheckpointManifest, ExcludedReason, FileChange, Journal, ProjectId, format_timestamp,
+};
 use nas_keys::{
     Action, Key, KeyCode as NasKeyCode, Layout, Machine, ModalState, Object, SystemAction, Verb,
 };
@@ -1365,6 +1367,17 @@ impl App {
         if change.from == change.to && change.removed.is_empty() && change.inserted.is_empty() {
             return;
         }
+        // Issue #28: se o conteúdo novo bate com o último `save` que
+        // o histórico conhece pra este arquivo (gravado por
+        // `nas-commands::Workspace::record_last_save`, chamado por
+        // `nas --mcp` em `save_file`/`create_file`/restaurar um
+        // checkpoint), esta "mudança externa" já foi journalada por
+        // outro autor — não duplica a autoria de uma única edição.
+        // Continua recarregando/avisando normalmente (acima e abaixo
+        // deste método), só não grava uma segunda entrada no journal.
+        if self.matches_last_known_save(&file, &change.inserted) {
+            return;
+        }
         let Ok(mut guard) = self.history.lock() else {
             return;
         };
@@ -1382,6 +1395,22 @@ impl App {
             change.removed,
             change.inserted,
         );
+    }
+
+    /// O conteúdo novo de uma mudança externa (`change.inserted`,
+    /// sempre o arquivo inteiro — ver `Document::check_external_change`)
+    /// bate com o último `save` que o histórico compartilhado conhece
+    /// pra `file` (issue #28)? Sem histórico, ou sem nenhum `save`
+    /// conhecido ainda pra este arquivo, devolve `false` — trata como
+    /// externa de verdade (comportamento de antes desta etapa).
+    fn matches_last_known_save(&self, file: &str, new_content: &str) -> bool {
+        let Some(history_dir) = self.history_dir() else {
+            return false;
+        };
+        match nas_history::get_last_save(&history_dir, file) {
+            Ok(Some(last)) => last.hash == nas_history::hash_content(new_content.as_bytes()),
+            _ => false,
+        }
     }
 
     fn undo(&mut self) {
@@ -1447,7 +1476,10 @@ impl App {
     }
 
     /// `Ctrl+t l`: lista os checkpoints do projeto, mais recente
-    /// primeiro, num `Overlay`.
+    /// primeiro, num `Overlay` — cada linha já identifica o autor
+    /// (`você`/`IA (agente)`/...), pra reconhecer de cara o
+    /// checkpoint automático "antes da sessão de `<agent>`" de uma
+    /// sessão de IA (ADR 0006 §6, etapa 3e), não só pelo nome.
     fn checkpoint_list(&mut self) {
         let Some(history_dir) = self.history_dir() else {
             self.set_status_message("Histórico não disponível.".to_string());
@@ -1468,10 +1500,11 @@ impl App {
                             "nomeado"
                         };
                         format!(
-                            "{}  {} ({}, {} arquivo(s))",
+                            "{}  {} ({}, {}, {} arquivo(s))",
                             format_timestamp(c.created_at),
                             c.name,
                             kind,
+                            format_author(&c.author),
                             c.files.len()
                         )
                     })
@@ -1873,36 +1906,6 @@ fn format_author(author: &Author) -> String {
         Author::Extension { name } => format!("extensão ({name})"),
         Author::External => "externo".to_string(),
     }
-}
-
-/// `secs` (desde a época Unix, UTC) como `AAAA-MM-DD HH:MM:SS` —
-/// implementado sem nenhuma dependência de data (a única nova que
-/// docs/decisions/0005 autoriza é `similar`, em `nas-history`, pro
-/// diff de linhas). O algoritmo (`civil_from_days`) é o de Howard
-/// Hinnant pra converter dias desde a época em ano/mês/dia
-/// proléptico-gregoriano, amplamente reproduzido e verificado.
-fn format_timestamp(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let secs_of_day = secs % 86400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if month <= 2 { y + 1 } else { y };
-    (year, month, day)
 }
 
 fn verb_label(verb: Verb) -> &'static str {
@@ -2938,14 +2941,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn format_timestamp_bate_com_datas_conhecidas() {
-        // conferido com `date -u -d @<segundos>`.
-        assert_eq!(format_timestamp(0), "1970-01-01 00:00:00");
-        assert_eq!(format_timestamp(1_609_459_200), "2021-01-01 00:00:00");
-        assert_eq!(format_timestamp(1_732_000_000), "2024-11-19 07:06:40");
-    }
-
     fn journal_entries(dir: &std::path::Path) -> Vec<nas_history::JournalEntry> {
         nas_history::read_entries(&nas_history::journal_path(dir)).expect("ler journal")
     }
@@ -3239,6 +3234,191 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "conteudo original");
+    }
+
+    /// Teste de ponta a ponta da etapa 3e (ADR 0006 §6): uma sessão
+    /// de IA — simulada aqui pelo mesmo `nas_commands::Registry` que
+    /// `nas --mcp` usa por dentro (ADR 0006 §3), sem subir o processo
+    /// de verdade — edita e salva dois arquivos e cria um terceiro,
+    /// enquanto o usuário edita um quarto no `nas-term`. A sessão
+    /// ganha exatamente um checkpoint automático; `Ctrl+t a` no
+    /// arquivo da sessão não duplica a autoria (issue #28); e
+    /// restaurar o checkpoint da sessão desfaz tudo que ela mudou,
+    /// deixando a edição do usuário recuperável só pelo checkpoint
+    /// "antes de restaurar" (item 2 da etapa).
+    #[test]
+    fn sessao_de_ia_convive_com_usuario_e_e_restauravel_pelo_checkpoint_de_sessao() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let path_a = project_dir.path().join("a.txt");
+        let path_b = project_dir.path().join("b.txt");
+        let path_c = project_dir.path().join("c.txt");
+        let path_d = project_dir.path().join("d.txt");
+        fs::write(&path_a, "a original").unwrap();
+        fs::write(&path_b, "b original").unwrap();
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        // O usuário já tem a.txt aberto quando a sessão de IA começa
+        // a editá-lo por fora (via nas-mcp) — o cenário exato da
+        // issue #28.
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path_a.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // "Sessão MCP": o mesmo registro/workspace que `nas --mcp`
+        // usa por dentro — session checkpoint, aprovação e autoria
+        // são do registro (`nas-commands`), não do transporte.
+        let mut registry = nas_commands::Registry::new();
+        nas_commands::register_all(&mut registry);
+        let journal = nas_history::Journal::open(&history_dir).expect("abrir journal");
+        let mut mcp_workspace = nas_commands::Workspace::new(project_dir.path())
+            .with_history_dir(history_dir.clone())
+            .with_journal(journal);
+        let session_author = Author::Ai {
+            agent: "claude-code".to_string(),
+            session: "sessao-1".to_string(),
+        };
+        let mut mcp_ctx = nas_commands::CommandContext {
+            workspace: &mut mcp_workspace,
+            author: session_author.clone(),
+            approved_effects: [nas_commands::Effect::WriteFile].into_iter().collect(),
+            warnings: Vec::new(),
+        };
+
+        for (path, old, new) in [
+            (&path_a, "a original", "a editado pela ia"),
+            (&path_b, "b original", "b editado pela ia"),
+        ] {
+            let path_str = path.to_string_lossy().into_owned();
+            registry
+                .run(
+                    "open_file",
+                    &mut mcp_ctx,
+                    serde_json::json!({ "path": path_str }),
+                )
+                .expect("abrir");
+            registry
+                .run(
+                    "edit",
+                    &mut mcp_ctx,
+                    serde_json::json!({ "path": path_str, "old_text": old, "new_text": new }),
+                )
+                .expect("editar");
+            registry
+                .run(
+                    "save_file",
+                    &mut mcp_ctx,
+                    serde_json::json!({ "path": path_str }),
+                )
+                .expect("salvar");
+        }
+        registry
+            .run(
+                "create_file",
+                &mut mcp_ctx,
+                serde_json::json!({
+                    "path": path_c.to_string_lossy(),
+                    "content": "arquivo novo da sessão",
+                }),
+            )
+            .expect("criar");
+
+        // Enquanto isso, o usuário edita um quarto arquivo — sem
+        // relação nenhuma com a sessão de IA.
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path_d.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "d do usuario");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        // `nas-term` percebe a.txt mudado por fora (ainda aberto como
+        // buffer) — sem o fix da issue #28, isto journalaria de novo
+        // como `Author::External`.
+        app.check_external_changes();
+
+        // 3. Ctrl+t a em a.txt mostra a edição da sessão uma vez só,
+        //    com autor Ai — nunca duplicada como External.
+        app.handle_key(ctrl_key(KeyCode::Char('o')));
+        type_str(&mut app, path_a.to_str().unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('a')));
+        let overlay = app.overlay.as_ref().expect("overlay de autoria");
+        let ai_lines: Vec<&String> = overlay
+            .lines
+            .iter()
+            .filter(|l| l.contains("IA (claude-code)"))
+            .collect();
+        assert_eq!(
+            ai_lines.len(),
+            1,
+            "a edição da sessão não deveria aparecer duplicada: {:?}",
+            overlay.lines
+        );
+        assert!(
+            !overlay.lines.iter().any(|l| l.contains("externo")),
+            "não deveria haver nenhuma entrada External pra a.txt: {:?}",
+            overlay.lines
+        );
+        app.handle_key(key(KeyCode::Esc));
+
+        // 4. Restaurar o checkpoint da sessão volta a.txt/b.txt, joga
+        //    c.txt na lixeira, e a edição de d.txt fica recuperável
+        //    só pelo checkpoint "antes de restaurar".
+        let checkpoints = nas_history::list_checkpoints(&history_dir).expect("listar checkpoints");
+        let session_checkpoint = checkpoints
+            .iter()
+            .find(|c| c.automatic && c.author == session_author)
+            .expect("deveria existir um checkpoint automático de sessão");
+        assert!(
+            session_checkpoint
+                .name
+                .contains("antes da sessão de claude-code"),
+            "{}",
+            session_checkpoint.name
+        );
+
+        // Isola a lixeira de verdade do usuário rodando o teste.
+        let trash_home = tempfile::tempdir().expect("diretório temporário");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", trash_home.path());
+        }
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, &session_checkpoint.id);
+        app.handle_key(key(KeyCode::Enter));
+        // c.txt/d.txt não estão no checkpoint de sessão — pede
+        // confirmação; repete com o mesmo id pra confirmar.
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('r')));
+        type_str(&mut app, &session_checkpoint.id);
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(fs::read_to_string(&path_a).unwrap(), "a original");
+        assert_eq!(fs::read_to_string(&path_b).unwrap(), "b original");
+        assert!(
+            !path_c.exists(),
+            "c.txt (criado pela sessão) deveria ter ido pra lixeira"
+        );
+
+        let checkpoints_depois =
+            nas_history::list_checkpoints(&history_dir).expect("listar checkpoints");
+        let antes_de_restaurar = checkpoints_depois
+            .iter()
+            .find(|c| c.automatic && c.name.starts_with("antes de restaurar"))
+            .expect("deveria ter criado o checkpoint \"antes de restaurar\"");
+        assert!(
+            antes_de_restaurar
+                .files
+                .iter()
+                .any(|f| f.path == path_d.to_str().unwrap()),
+            "a edição do usuário em d.txt deveria estar recuperável no checkpoint \"antes de restaurar\": {:?}",
+            antes_de_restaurar.files
+        );
     }
 
     #[test]
