@@ -325,37 +325,122 @@ fn diff_file(
     match (from, to) {
         (None, Some(t)) => {
             let content = read_file_text(history_dir, t)?;
-            Ok(FileDiff {
-                path: path.to_string(),
-                change: FileChange::Added,
-                unified: unified_text(path, "", &content),
-            })
+            Ok(diff_texts(path, None, Some(&content)))
         }
         (Some(f), None) => {
             let content = read_file_text(history_dir, f)?;
-            Ok(FileDiff {
-                path: path.to_string(),
-                change: FileChange::Removed,
-                unified: unified_text(path, &content, ""),
-            })
+            Ok(diff_texts(path, Some(&content), None))
         }
         (Some(f), Some(t)) => {
             if f.content_hash == t.content_hash {
-                return Ok(FileDiff {
-                    path: path.to_string(),
-                    change: FileChange::Unchanged,
-                    unified: String::new(),
-                });
+                return Ok(unchanged(path));
             }
             let old = read_file_text(history_dir, f)?;
             let new = read_file_text(history_dir, t)?;
-            Ok(FileDiff {
-                path: path.to_string(),
-                change: FileChange::Modified,
-                unified: unified_text(path, &old, &new),
-            })
+            Ok(diff_texts(path, Some(&old), Some(&new)))
         }
         (None, None) => unreachable!("todo caminho vem de um dos dois manifestos"),
+    }
+}
+
+/// Diff entre um checkpoint já gravado e conteúdo **atual**, ainda
+/// não registrado em nenhum checkpoint — docs/decisions/0008-modo-de-revisao.md
+/// §2. `current` é `(caminho, conteúdo)` de todo arquivo rastreado,
+/// vindo do buffer aberto (se houver) ou do disco — quem chama monta
+/// essa lista (mesma regra que `prepare_session_checkpoint`, em
+/// `nas-commands`, já usa pro lado "antes"). Reaproveita o mesmo
+/// cálculo de [`diff`] (via [`diff_texts`]); só o lado "to" vem de
+/// memória em vez de um segundo manifesto.
+pub fn diff_against_current(
+    history_dir: &Path,
+    checkpoint_id: &str,
+    current: &[(String, String)],
+) -> io::Result<Vec<FileDiff>> {
+    let manifests = list(history_dir)?;
+    let from = manifests
+        .iter()
+        .find(|m| m.id == checkpoint_id)
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("checkpoint não encontrado: {checkpoint_id}"),
+            )
+        })?;
+
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for path in from
+        .files
+        .iter()
+        .map(|f| f.path.clone())
+        .chain(current.iter().map(|(path, _)| path.clone()))
+    {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let from_file = from.files.iter().find(|f| f.path == path);
+            let now_text = current
+                .iter()
+                .find(|(p, _)| p == &path)
+                .map(|(_, content)| content.as_str());
+            match (from_file, now_text) {
+                (None, Some(new)) => Ok(diff_texts(&path, None, Some(new))),
+                (Some(f), None) => {
+                    let old = read_file_text(history_dir, f)?;
+                    Ok(diff_texts(&path, Some(&old), None))
+                }
+                (Some(f), Some(new)) => {
+                    let old = read_file_text(history_dir, f)?;
+                    if old == new {
+                        Ok(unchanged(&path))
+                    } else {
+                        Ok(diff_texts(&path, Some(&old), Some(new)))
+                    }
+                }
+                (None, None) => unreachable!("todo caminho vem de um dos dois lados"),
+            }
+        })
+        .collect()
+}
+
+fn unchanged(path: &str) -> FileDiff {
+    FileDiff {
+        path: path.to_string(),
+        change: FileChange::Unchanged,
+        unified: String::new(),
+    }
+}
+
+/// O `FileDiff` entre dois lados de texto, já sabendo que não são
+/// iguais (quem chama decidiu isso — via hash ou comparação direta,
+/// o que for mais barato no caso dele) — compartilhado entre [`diff`]
+/// (lê os dois lados de `objects/`) e [`diff_against_current`] (um
+/// lado vem de memória).
+fn diff_texts(path: &str, old: Option<&str>, new: Option<&str>) -> FileDiff {
+    match (old, new) {
+        (None, Some(new)) => FileDiff {
+            path: path.to_string(),
+            change: FileChange::Added,
+            unified: unified_text(path, "", new),
+        },
+        (Some(old), None) => FileDiff {
+            path: path.to_string(),
+            change: FileChange::Removed,
+            unified: unified_text(path, old, ""),
+        },
+        (Some(old), Some(new)) => FileDiff {
+            path: path.to_string(),
+            change: FileChange::Modified,
+            unified: unified_text(path, old, new),
+        },
+        (None, None) => unreachable!("todo caminho vem de pelo menos um lado"),
     }
 }
 
@@ -689,6 +774,45 @@ mod tests {
         let cp = create(dir.path(), "cp", Author::User, 100, false, &[]).unwrap();
 
         let err = diff(dir.path(), &cp.manifest.id, "999-fantasma").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn diff_against_current_compara_checkpoint_contra_memoria() {
+        // docs/decisions/0008-modo-de-revisao.md §2: o "depois" é o
+        // estado vivo (buffer/disco), nunca um segundo checkpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let before = [
+            file("modificado.txt", "linha um\nlinha dois\n"),
+            file("removido.txt", "vai sair\n"),
+            file("igual.txt", "nunca muda\n"),
+        ];
+        let from = create(dir.path(), "antes", Author::User, 100, false, &before).unwrap();
+
+        let current = vec![
+            (
+                "modificado.txt".to_string(),
+                "linha um\nlinha dois mudou\n".to_string(),
+            ),
+            ("igual.txt".to_string(), "nunca muda\n".to_string()),
+            ("adicionado.txt".to_string(), "chegou agora\n".to_string()),
+        ];
+
+        let diffs = diff_against_current(dir.path(), &from.manifest.id, &current).unwrap();
+        let find = |path: &str| diffs.iter().find(|d| d.path == path).unwrap();
+
+        assert_eq!(find("adicionado.txt").change, FileChange::Added);
+        assert_eq!(find("removido.txt").change, FileChange::Removed);
+        assert_eq!(find("modificado.txt").change, FileChange::Modified);
+        assert!(find("modificado.txt").unified.contains("linha dois mudou"));
+        assert_eq!(find("igual.txt").change, FileChange::Unchanged);
+        assert!(find("igual.txt").unified.is_empty());
+    }
+
+    #[test]
+    fn diff_against_current_com_checkpoint_inexistente_e_erro() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = diff_against_current(dir.path(), "999-fantasma", &[]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 

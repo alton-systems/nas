@@ -34,6 +34,7 @@ mod originals;
 mod permissions;
 mod project;
 mod restore;
+mod review;
 mod time;
 mod trash;
 
@@ -41,8 +42,8 @@ pub use author::Author;
 pub use checkpoint::{
     CheckpointFile, CheckpointManifest, CreatedCheckpoint, ExcludedFile, ExcludedReason,
     FileChange, FileDiff, MAX_AUTOMATIC_CHECKPOINTS, MAX_FILE_SIZE, MAX_TOTAL_SIZE_BYTES,
-    PruneReport, create as create_checkpoint, diff, hash_content, list as list_checkpoints, prune,
-    prune_with_limits, read_object,
+    PruneReport, create as create_checkpoint, diff, diff_against_current, hash_content,
+    list as list_checkpoints, prune, prune_with_limits, read_object,
 };
 pub use journal::{Journal, JournalEntry, file_history, journal_path, now_unix, read_entries};
 pub use last_save::{LastSave, get_last_save, record_last_save};
@@ -55,5 +56,10 @@ pub use permissions::{
 };
 pub use project::{ProjectId, delete_project_history, state_home};
 pub use restore::{RestoreReport, RestoreTarget, restore};
+pub use review::{
+    ReviewDecision, ReviewLogEntry, ReviewMark, attribute_hunk, hunk_hash,
+    marks_for_checkpoint, read_log_entries, read_marks, record_log_entry, record_mark,
+    review_marks_path, reviews_log_path,
+};
 pub use time::format_timestamp;
 pub use trash::move_to_trash;
