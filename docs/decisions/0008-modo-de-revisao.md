@@ -61,16 +61,16 @@ introduz um arquivo novo em `~/.local/state/nas/`.
   usa exatamente a mesma semântica, pelo mesmo motivo.
 - **Issue #9** (modos: contexto + capacidades): propõe, pra depois da
   fase 3, um mecanismo genérico de "capacidades" declaradas como
-  dados, com contexto, contribuição única e resolução de conflito.
-  Esta ADR **não implementa** esse mecanismo — ele não existe ainda e
-  a própria issue diz que não bloqueia a fase 3. O que esta ADR faz é
-  construir o modo de revisão como um **quarto estado dedicado** da
-  máquina de teclas (ao lado de Insert/Visual/Sequential), da forma
-  mais simples que já respeita as regras que a issue #9 exige de
-  qualquer modo futuro (um radical, um significado; só usa teclas
-  ainda livres) — servindo, como o próprio pedido desta tarefa
-  nomeia, de **modelo concreto** pro que a issue #9 vai generalizar
-  depois. §4 detalha e volta a essa relação.
+  dados, com contexto, contribuição única e resolução de conflito —
+  nada disso existe ainda, e a própria issue diz que não bloqueia a
+  fase 3. Esta ADR não implementa esse mecanismo genérico, mas
+  implementa o **primeiro passo concreto** na direção que ele pede:
+  uma camada de teclas (`[review]`) consultada antes de `[visual]`,
+  que só pode acrescentar teclas novas ou bloquear ações por nome —
+  nunca redefinir o que uma tecla não bloqueada já significa, porque
+  o que não está na camada simplesmente cai no keymap resolvido (com
+  o `keymap.toml` do usuário já aplicado) de baixo. §4 detalha e volta
+  a essa relação.
 
 ## Decisão
 
@@ -84,17 +84,20 @@ checkpoint lista: o buffer aberto, se houver; senão o disco — a mesma
 regra que `prepare_session_checkpoint` já usa pra montar o conteúdo
 do próprio checkpoint, agora do lado do "depois" em vez do "antes".
 
-**Escolher outro ponto de partida**: ao abrir a revisão (§4), uma
-lista selecionável mostra os mesmos checkpoints que `Ctrl+t l` já
-lista (nome, quando, autor, quantos arquivos) — não uma listagem
-nova, os mesmos dados de `nas_history::list_checkpoints`. O checkpoint
-padrão (acima) vem pré-selecionado; mover a seleção e confirmar troca
-o "antes" por qualquer outro checkpoint do projeto, nomeado ou
-automático, de qualquer autor — revisar não é exclusivo de sessão de
-IA, só o é por padrão. **O "depois" é sempre "agora"**, nunca um
-segundo checkpoint escolhido — comparar dois checkpoints fixos **já**
-existe (`Ctrl+t e`); esta ADR não duplica isso, só cobre o caso que
-falta (um checkpoint contra o estado vivo).
+**Dois jeitos de abrir, dois escopos** (§4 detalha as teclas):
+`Ctrl+t v` abre a revisão **direto** no padrão acima — sem lista, sem
+pergunta, pro caso comum (revisar o que a sessão de IA acabou de
+fazer). `Ctrl+t V` (Shift) abre uma lista selecionável com os mesmos
+checkpoints que `Ctrl+t l` já lista (nome, quando, autor, quantos
+arquivos) — não uma listagem nova, os mesmos dados de
+`nas_history::list_checkpoints` — com o checkpoint padrão
+pré-selecionado; escolher outro troca o "antes" por qualquer
+checkpoint do projeto, nomeado ou automático, de qualquer autor —
+revisar não é exclusivo de sessão de IA, só o é por padrão. **O
+"depois" é sempre "agora"**, nunca um segundo checkpoint escolhido —
+comparar dois checkpoints fixos **já** existe (`Ctrl+t e`); esta ADR
+não duplica isso, só cobre o caso que falta (um checkpoint contra o
+estado vivo).
 
 **Base = último commit do Git**: registrado aqui como opção futura,
 fora desta ADR (§6). Pediria uma forma de ler o conteúdo de um blob do
@@ -209,11 +212,18 @@ selecionado, §4):
   com uma mensagem clara em vez de aplicar sobre o lugar errado —
   nunca adivinha. Depois de rejeitar com sucesso, o trecho marca como
   revisado também (rejeitar é uma forma de revisar, não um terceiro
-  estado "pendente").
+  estado "pendente") — e, como o texto volta a ser igual ao do
+  checkpoint, o trecho deixa de aparecer na próxima vez que a
+  revisão recalcular os trechos (§2): não há mais diferença ali pra
+  mostrar. A tecla que aciona isto dentro da revisão é `u` (§4) — a
+  mesma tecla que, no arquivo real, desfaz a última transação
+  (inclusive, se for o caso, a que o próprio rejeitar acabou de
+  criar): dois contextos, não dois significados.
 - **Ir até lá**: abre o arquivo (buffer já aberto, ou abre um novo)
   na linha do trecho (lado "depois") e **sai da revisão** — não há
-  "voltar pra revisão" automático; reabrir é `Ctrl+t v` de novo, que
-  retoma de onde a persistência do `aceitar`/`rejeitar` deixou.
+  "voltar pra revisão" automático; reabrir é `Ctrl+t v` (ou `Ctrl+t
+  V`, se o checkpoint "antes" não for o padrão) de novo, que retoma
+  de onde a persistência do `aceitar`/`rejeitar` deixou.
 
 Um trecho sem seleção/cursor sobre ele (cursor no resumo, por
 exemplo) não tem uma ação válida — as três teclas abaixo não fazem
@@ -221,45 +231,68 @@ nada fora de um trecho, e a echo area avisa isso.
 
 ### 4. Teclas
 
-**Este é o primeiro modo com teclas próprias do nas.** A decisão
-central: a revisão é um **quarto `ModalState`** (`Review`, ao lado de
-`Insert`/`Visual`/`Sequential`, docs/keys.md §2/§4.4) — não o
-mecanismo genérico de "capacidades" que a issue #9 propõe (esse não
-existe ainda, e a própria issue diz que não bloqueia a fase 3).
-`Review` tem sua própria tabela em `default.toml`, `[review]`, nova
-— **não** uma tabela derivada automaticamente de `[visual]` por
-herança (`machine.rs` não ganha um mecanismo de "modo que estende
-outro modo" ainda; isso fica pra quando a issue #9 chegar). Em vez
-disso, `[review]` **declara de novo**, como dado duplicado e
-deliberado, só o subconjunto de `[visual]` que ainda faz sentido num
-buffer sem edição — movimento por caractere/linha/extremo (`j k l ;`,
-`J : K L`) e os prefixos `g` (ir pra início do buffer, ir pra linha) e
-`Espaço f` (buscar no texto do diff). **Fora** de `[review]`: os
-verbos (`d c x`), seleção/colar (`s S y`), undo (`u`, não há nada pra
-desfazer *no próprio buffer* — desfazer uma rejeição é `u` no arquivo
-de destino, não aqui) e repetir (`.`). Essa duplicação é pequena (meia
-dúzia de linhas de TOML) e evita inventar herança de tabela antes de
-precisar — exatamente a regra do `CLAUDE.md` de não abstrair
-antecipando o que ainda não existe.
+**Este é o primeiro modo com teclas próprias do nas.** `Review` ainda
+é um **quarto `ModalState`** (ao lado de `Insert`/`Visual`/`Sequential`,
+docs/keys.md §2/§4.4) — mas sua tabela, `[review]`, **não é uma
+cópia** de `[visual]`. É uma **camada consultada primeiro**: só
+declara o que é novo (as unidades de navegação, aceitar) ou precisa
+ser **bloqueado por não fazer sentido num buffer somente leitura**
+(verbos, seleção/colar, repetir). Qualquer tecla que `[review]` não
+menciona cai no `[visual]` **já resolvido com o `keymap.toml` do
+usuário aplicado** — nunca no `default.toml` cru. Isso importa de
+verdade: se o usuário remapeou um movimento (trocou `j`/`k`/`l`/`;`
+por outra coisa em `keymap.toml`, docs/config.md), essa troca precisa
+valer dentro da revisão também, sem que `[review]` precise saber que
+ela existe — uma tabela duplicada (o desenho de um rascunho anterior
+desta ADR) quebraria justo esse caso, porque o movimento duplicado
+ficaria sempre congelado no `default.toml`.
+
+**O bloqueio é por nome de ação, não por tecla física.** `[review]`
+não proíbe "a tecla `d`" — proíbe os **comandos** que não fazem
+sentido num buffer somente leitura: qualquer verbo
+(`delete`/`copy`/`cut`), `start-selection`, `select-all`, `paste` e
+`repeat`. Pelo mesmo motivo do parágrafo acima: se o usuário remapeou
+o verbo "apagar" pra uma tecla que não é `d`, o bloqueio ainda precisa
+valer — é o nome do comando que está fora da revisão, não uma tecla
+física específica. Uma tecla bloqueada avisa na echo area que aquela
+ação não está disponível ali, nunca falha em silêncio.
+
+`u` (desfazer) **não entra no bloqueio — é redefinido dentro da
+camada**, de propósito, e não é uma tecla nova: `u` já significa
+"desfazer"; rejeitar um trecho **é** desfazer aquela mudança
+específica da IA, só que o alvo é "o trecho sob o cursor" em vez de
+"a última transação de qualquer autor" (`Visual`). Não é um radical
+ganhando um segundo significado — é o mesmo significado, com o alvo
+que faz sentido numa tela que mostra trechos, não transações soltas.
 
 | Teclas | Ação | Por que essa escolha, contra `docs/keys.md` |
 |---|---|---|
-| `Ctrl+t v` | abre a revisão (lista de checkpoints, §1) | `v` — "ver/revisar"; livre em `[system_prefixes.tempo]` (hoje usa `n l e r a m z`) |
-| `h k` / `h l` | próximo / trecho anterior | `h` como **unidade** nova ("trecho"), seguindo exatamente o padrão de `w`/`W` (unidade + direção, §5.1 de `docs/keys.md`): a direção vem das mesmas teclas que já significam "abaixo"/"acima" (`k`/`l`), igual a `W k`/`W l` pra parágrafo — regra 1 (`k`/`l` continuam significando a mesma coisa), nenhum radical de movimento é redefinido |
-| `H k` / `H l` | próximo / arquivo anterior | `H` (Shift de `h`) — regra 3 do `docs/keys.md`: Shift intensifica a **escala** do mesmo radical, do mesmo jeito que `w`→`W` escala palavra→parágrafo; aqui trecho→arquivo é a escala natural seguinte |
-| `Enter` | aceitar o trecho sob o cursor | reaproveita o significado que `Enter` já tem em **todo** outro estado — "avançar/confirmar o que está pendente" (`Visual`: entra no Insert; `Sequential`: executa a frase) — nunca uma redefinição isolada só pra este modo |
-| `r` | rejeitar o trecho sob o cursor | letra livre em `[visual]` hoje (não ligada a nada, só `Ctrl+r` existe, classe diferente — mesmo raciocínio que a ADR 0005 §8 já usa pra `Ctrl+t a` vs `Ctrl+b`: modificadores diferentes reduzem o risco de confundir, por isso o nas já aceita esse tipo de reuso entre classes) |
-| `v` | ir até lá (abre o arquivo na linha) | letra livre; eco deliberado do `v` de `Ctrl+t v` (mesma ideia — "ver" —, classes diferentes, mesmo raciocínio da linha acima) |
-| `Esc` | sai da revisão, volta pro Visual | reaproveita o significado que `Esc` já tem em qualquer estado: cancelar a camada atual — aqui, a camada é a revisão inteira |
+| `Ctrl+t v` | abre a revisão **direto**, no padrão (§1) — sem lista | `v` — "ver/revisar"; livre em `[system_prefixes.tempo]` (hoje usa `n l e r a m z`) |
+| `Ctrl+t V` | abre a revisão com a **lista** de checkpoints pra escolher (§1) | Shift aplicando a regra 3 de `docs/keys.md` fora de `[visual]`: leva a ação ao seu extremo — em vez do caminho direto, mostra **todas** as opções antes de decidir; primeiro uso de Shift dentro de um prefixo de sistema, mas a mesma ideia de escala |
+| `h k` / `h l` | próximo / trecho anterior | `h` como **unidade** nova — "trecho alterado" — seguindo o padrão de `w`/`W` (unidade + direção, §5.1): a direção usa as mesmas teclas que já significam "abaixo"/"acima" (`k`/`l`), igual a `W k`/`W l` pra parágrafo; `k`/`l` continuam significando a mesma coisa (regra 1) |
+| `H k` / `H l` | próximo / arquivo anterior | `H` (Shift de `h`) — regra 3: escala trecho → arquivo, o degrau seguinte depois de um trecho; só faz sentido com mais de um arquivo em jogo, por isso fica só em `[review]` (`h` generaliza, `H` não — ver nota abaixo) |
+| `Enter` | aceitar o trecho sob o cursor | reaproveita o significado que `Enter` já tem em todo outro estado — avançar/confirmar o que está pendente (`Visual`: entra no Insert; `Sequential`: executa a frase) |
+| `u` | rejeitar o trecho sob o cursor | **não é uma tecla nova** — é o `u` de sempre (desfazer), com o alvo "o trecho atual" em vez de "a última transação" (ver acima); por isso não entra no bloqueio nem precisa de uma letra livre |
+| `g h` | ir até lá — abre o arquivo real na linha do trecho | **nem é uma entrada de `[review]`**: é uma entrada nova em `[prefixes.go]`, global (§5.5), compondo o prefixo que já significa "ir para" (`g`) com o radical novo "trecho" (`h`) — "ir para [o lugar d]o trecho atual". Fora da revisão, sem um trecho atual, a tecla não tem efeito — mesma ideia de tecla válida sem alvo que já existe noutros compostos |
+| `Esc` | sai da revisão, volta pro Visual | a mesma cascata que `Esc` já segue hoje (cancela verbo/prefixo/unidade pendente; sem nada pendente, desfaz seleção; sem seleção, não faz nada) ganha mais um degrau no final, específico de `Review`: sem nada pendente e sem seleção, sai da revisão |
 
-`Ctrl+t v`, como qualquer entrada no prefixo "tempo", lista o resultado
-de `nas_history::list_checkpoints` numa seleção — a **mesma** listagem
-de `Ctrl+t l`, agora navegável com `↑`/`↓` (como a paleta já faz,
-§5.9) em vez de só mostrada (como o overlay hoje usado por `Ctrl+t
-l`/`a`/`m`, que fecha em qualquer tecla). Isso é a primeira lista
-selecionável fora da paleta de comandos — reaproveita o mesmo widget
-de seleção (`↑`/`↓` dando a volta nas pontas, `Enter` confirma, `Esc`
-cancela), não inventa um terceiro jeito de escolher de uma lista.
+**`h` é um radical do nas inteiro — não só da revisão.** O
+significado de `h` fica fixado agora como "trecho alterado", pra
+qualquer buffer, não só dentro de `Review` — ainda que, hoje, só
+`[review]` de fato ligue `h` a uma ação (limitação reconhecida no
+critério de pronto, abaixo). `docs/keys.md` §6 (teclas reservadas)
+ganha uma linha: `h k`/`h l`, em buffers comuns, reservado pra um
+futuro "próxima/anterior mudança" (contra o checkpoint mais recente,
+presumivelmente — não decidido aqui, só reservado, do mesmo jeito que
+`p` já é reservado por outro motivo). **`H` não generaliza**: "o
+próximo arquivo" só faz sentido com mais de um arquivo em jogo ao
+mesmo tempo, o que só a revisão tem; fica só em `[review]`, sem
+entrada em §6.
+
+`Ctrl+t V`, ao abrir a lista, reaproveita o mesmo widget de seleção
+que a paleta de comandos já usa (`↑`/`↓` dando a volta nas pontas,
+`Enter` confirma, `Esc` cancela) — a primeira lista selecionável fora
+da paleta, mas o mesmo mecanismo, não um terceiro jeito de escolher.
 
 **Echo area e paleta.** A dica which-key (`docs/keys.md` regra 8), ao
 entrar em `Review`, mostra as teclas de `[review]` do mesmo jeito que
@@ -273,32 +306,37 @@ A paleta de comandos (§5.9 de `docs/keys.md`) hoje lista **todo**
 `[commands]` do keymap, sem olhar o estado ativo — nunca precisou,
 porque só `Visual` tinha comandos "soltos" de verdade (Insert e
 Sequential não usam a paleta). Com `[review]` como uma quarta tabela
-de comandos reais (aceitar, rejeitar, ir até lá, navegar por
-trecho/arquivo), listar esses comandos na paleta **fora** da revisão
-seria mostrar ações sem nenhum trecho pra agir — por isso **o
-catálogo da paleta passa a filtrar por `ModalState` atual**
-(`Machine::command_catalog` ganha o estado como parâmetro, ou um
-catálogo por estado em vez de um só global) — uma extensão pequena e
-necessária, não uma rearquitetura: antes desta ADR, filtrar não fazia
-diferença nenhuma (só havia uma tabela de comandos "soltos"); agora
-há duas.
+de comandos reais (aceitar, navegar por trecho/arquivo — `u`
+continua sendo "desfazer", não um nome de comando novo), listar esses
+comandos na paleta **fora** da revisão seria mostrar ações sem nenhum
+trecho pra agir — por isso **o catálogo da paleta passa a filtrar por
+`ModalState` atual** (`Machine::command_catalog` ganha o estado como
+parâmetro, ou um catálogo por estado em vez de um só global) — uma
+extensão pequena e necessária, não uma rearquitetura: antes desta
+ADR, filtrar não fazia diferença nenhuma (só havia uma tabela de
+comandos "soltos"); agora há duas. `g h` (ir até lá), por viver em
+`[prefixes.go]` — global, não em `[review]` — continua aparecendo na
+paleta em qualquer estado, como o resto do prefixo "ir para"; fora da
+revisão ela só não tem efeito (mesma ideia de tecla válida sem alvo
+já registrada na tabela acima).
 
 **Relação com a issue #9.** A issue propõe, pra depois da fase 3, um
-mecanismo genérico onde "um modo pode acrescentar teclas novas, mas
-nunca pode mudar o significado de um radical que já existe" e "só
-podem usar teclas ainda não ligadas a nada". `Review`, como
-implementado aqui, **já obedece as duas regras** — só que à mão
-(tabela duplicada, estado dedicado) em vez de através do mecanismo de
-capacidades (contexto + contribuição única + resolução de conflito,
-ainda não construído). Esta ADR não implementa a generalização: é o
-**primeiro caso concreto** que a issue #9 pode usar como teste,
-quando chegar a hora de generalizar — "um modo principal cuja
-condição de contexto é 'o buffer atual é uma revisão'" é, na linguagem
-da própria issue, exatamente um "modo principal" (major-mode). Nada
-nesta ADR impede essa migração futura; `[review]` como tabela
-separada é dado, não código, então mover essa tabela pra dentro de um
-manifesto de capacidade (quando existir) é uma mudança de onde o dado
-vive, não do que ele diz.
+mecanismo genérico de camadas: "um modo pode acrescentar teclas
+novas, mas nunca pode mudar o significado de um radical que já
+existe" e "só podem usar teclas ainda não ligadas a nada". O desenho
+de `[review]` acima — camada consultada primeiro, bloqueio por nome
+de ação, o resto cai no keymap resolvido — **já é**, em miniatura,
+esse mecanismo: não uma analogia que a issue #9 precisaria
+reconstruir do zero depois, mas o **primeiro código real** de "uma
+camada de teclas sobre outra" que existe no nas. O que esta ADR
+**não** faz é generalizar: `[review]` continua sendo a única camada
+possível (não há como declarar uma segunda, nem compor duas), o
+bloqueio por nome de ação é uma lista fixa em Rust (não um dado de
+manifesto), e não há resolução de conflito nenhuma, porque só existe
+uma camada pra conflitar com `[visual]`. Isso tudo fica pra quando a
+issue #9 generalizar — trocando esta camada única por N camadas
+declaradas como dados, com contexto e resolução de conflito — sem
+precisar mudar o que `Review` *faz*, só como ela está montada.
 
 ### 5. Métrica para o benchmark
 
@@ -310,14 +348,32 @@ pasta por projeto que journal/checkpoints/permissões já usam, ADR
   (aceitar ou rejeitar), nunca podada automaticamente (é pequena,
   só texto, como `permissions_log.jsonl`):
   ```json
-  {"ts": 1732000000, "reviewer": "você", "from_checkpoint": "<id>", "file": "crates/foo/src/lib.rs", "hunk_hash": "<sha256 do texto 'antes' do trecho>", "decision": "accepted"}
+  {"ts": 1732000000, "reviewer": {"kind": "user"}, "from_checkpoint": "<id>", "file": "crates/foo/src/lib.rs", "hunk_hash": "<sha256 de caminho + checkpoint + texto 'antes' + texto 'depois' + linha de início no 'antes'>", "decision": "accepted"}
   ```
-  `hunk_hash` identifica o trecho por um hash do seu conteúdo **do
-  lado "antes"** (mais o caminho e o id do checkpoint) — estável
-  entre reaberturas da mesma revisão mesmo que outras partes do
-  arquivo mudem depois, porque o lado "antes" nunca muda (é um
-  checkpoint já gravado). Reabrir a revisão recalcula os trechos do
-  zero (§2) e cruza cada um contra as marcas já existentes pra esse
+  `reviewer` é a **mesma serialização de `Author`** que o journal e os
+  checkpoints já usam (`Author::User` aqui, igual ao que `ADR 0005
+  §1` já define) — não um texto livre como "você"; a revisão já sabe
+  o autor de quem está revisando (o `Author` corrente do processo), e
+  inventar uma segunda representação só pra esta marca não ganharia
+  nada.
+
+  `hunk_hash` **não pode ser só o texto "antes"**: um trecho que
+  **só insere** linhas (comum — a IA acrescentando uma função nova)
+  tem o lado "antes" vazio, e **duas inserções diferentes no mesmo
+  arquivo colidiriam** no mesmo hash — aceitar uma marcaria a outra
+  como revisada por engano. O hash cobre cinco coisas: caminho do
+  arquivo, id do checkpoint ("antes"), o texto do lado "antes", o
+  texto do lado "depois" e a linha de início do trecho no "antes" (o
+  que desempata duas inserções vazias que também inserissem
+  exatamente o mesmo texto em dois lugares — a posição, aí, ainda
+  diferencia). Isso continua estável entre reaberturas da **mesma**
+  revisão (mesmo `from_checkpoint`): o lado "antes" nunca muda (é um
+  checkpoint já gravado), e a linha de início de um trecho específico
+  no "antes" também não, mesmo que outros trechos do arquivo sejam
+  aceitos ou rejeitados entre uma abertura e outra — cada trecho é
+  identificado pela própria posição no "antes", nunca pela posição
+  relativa aos outros. Reabrir a revisão recalcula os trechos do zero
+  (§2) e cruza cada um contra as marcas já existentes pra esse
   `from_checkpoint`, mostrando o que já foi visto.
 - **`reviews_log.jsonl`** — append-only, uma linha por sessão de
   revisão (não de IA — de uso do próprio modo de revisão), aberta ao
@@ -359,11 +415,19 @@ nas não tem equivalente), sem precisar de nenhuma contagem manual.
   (§2), `review_marks`/`reviews_log` — leitura e escrita (§5). Nenhuma
   dependência nova; `similar` e o próprio `helix_core::ChangeSet` (já
   usado indiretamente via `nas-editor`) bastam.
-- **`nas-keys`**: `ModalState::Review`, tabela `[review]` em
-  `default.toml`, a unidade nova "trecho" (`h`/`H`) ao lado de
-  "word"/"paragraph" em `machine.rs` — genérica (não hardcoded pra
-  revisão: o mecanismo de unidade já existe, só ganha mais um par de
-  nomes possíveis) — e `command_catalog` filtrado por estado.
+- **`nas-keys`**: `ModalState::Review`; a resolução de tecla em
+  `Review` passa a ser "consulta `[review]`, senão cai no `[visual]`
+  já resolvido" — um mecanismo genérico de camada (uma tabela sobre
+  outra), não específico de revisão, reaproveitável pela issue #9
+  depois — com um bloqueio por **nome de ação** (verbos,
+  `start-selection`, `select-all`, `paste`, `repeat`), não por tecla
+  física, pra valer sobre um keymap remapeado pelo usuário. A unidade
+  "trecho" (`h`) e, só dentro de `[review]`, "arquivo" (`H`) entram
+  no mesmo mecanismo genérico de unidade que já existe
+  (`word`/`paragraph`) — mais dois nomes possíveis, não lógica nova.
+  `[prefixes.go]` (global) ganha a entrada `h` ("ir até o trecho
+  atual" — sem efeito fora da revisão). `command_catalog` filtrado
+  por estado, como antes.
 - **`nas-term`**: `Buffer::read_only`, a geração do `Document`
   sintético da revisão, a renderização do diff colorido, o widget de
   seleção reaproveitado pra listar checkpoints (§4), e o despacho das
@@ -372,28 +436,45 @@ nas não tem equivalente), sem precisar de nenhuma contagem manual.
 - **`nas-commands`**: nenhuma mudança — revisão é uma funcionalidade
   do `nas-term` sobre o histórico, não um comando do registro (§6,
   "fora de escopo": nenhuma ferramenta MCP nova).
-- **`docs/keys.md`**: ganha uma seção `5.10` documentando `[review]`
-  e o estado `Review`, e a entrada de `Ctrl+t v` na tabela do prefixo
-  "tempo" (§5.7) — parte da implementação, não desta ADR.
+- **`docs/keys.md`**: ganha uma seção `5.10` documentando a camada
+  `[review]` e o estado `Review` (o mecanismo "consulta primeiro,
+  senão cai no de baixo" e o bloqueio por nome de ação); `Ctrl+t v` e
+  `Ctrl+t V` na tabela do prefixo "tempo" (§5.7 — primeiro uso de
+  Shift dentro de um prefixo de sistema); `g h` em `[prefixes.go]`
+  (§5.5); e uma linha nova em §6 (teclas reservadas) pra `h k`/`h l`
+  fora da revisão. Tudo parte da implementação, não desta ADR.
 
 ## Critério de pronto
 
 1. Com uma sessão de IA simulada (`Author::Ai`, como a ADR 0006 §6 já
-   testa) tendo editado dois arquivos, `Ctrl+t v` sem escolher nada
-   abre a revisão no checkpoint automático daquela sessão contra o
-   estado atual — mostrando os trechos certos, com autoria correta.
-2. Editar manualmente, por cima da IA, uma faixa dentro de um dos
+   testa) tendo editado dois arquivos, `Ctrl+t v` abre **direto** a
+   revisão no checkpoint automático daquela sessão contra o estado
+   atual — mostrando os trechos certos, com autoria correta, sem
+   nenhuma lista.
+2. `Ctrl+t V`, no mesmo projeto com mais de um checkpoint, abre a
+   lista com o checkpoint da sessão pré-selecionado; escolher outro
+   (mais antigo, ou nomeado pelo usuário) abre a revisão a partir dele.
+3. Editar manualmente, por cima da IA, uma faixa dentro de um dos
    trechos (sem passar pelo `aceitar`) faz aquele trecho aparecer como
    "misto" na reabertura da revisão.
-3. Aceitar um trecho, fechar o nas, reabrir a mesma revisão: o trecho
+4. Aceitar um trecho, fechar o nas, reabrir a mesma revisão: o trecho
    aparece marcado como já revisado.
-4. Rejeitar um trecho cujo texto ainda é o que a IA deixou desfaz só
-   aquele trecho, journalado como `Author::User`, desfazível com `u`;
-   rejeitar um trecho já alterado por outra edição recusa com uma
-   mensagem, sem tocar no arquivo.
-5. `h`/`H` navegam entre trechos e arquivos sem jamais mudar o
-   significado de `j k l ; J : K L` em `Review` comparado a `Visual`.
-6. `reviews_log.jsonl` registra início, fim e as contagens de uma
+5. **Duas inserções distintas no mesmo arquivo** (cada uma com o lado
+   "antes" vazio, mas textos "depois" diferentes) geram `hunk_hash`
+   diferentes; aceitar uma não marca a outra como revisada.
+6. Rejeitar um trecho cujo texto ainda é o que a IA deixou aplica `u`
+   e desfaz só aquele trecho, journalado como `Author::User` (comando
+   `review-reject`) — e essa rejeição, por sua vez, é desfazível com
+   `u` no arquivo real, como qualquer edição do usuário; rejeitar um
+   trecho já alterado por outra edição recusa com uma mensagem, sem
+   tocar no arquivo.
+7. `h`/`H` navegam entre trechos e arquivos sem jamais mudar o
+   significado de `j k l ; J : K L` em `Review` comparado a `Visual`;
+   remapear um desses movimentos em `keymap.toml` continua valendo
+   dentro da revisão, sem precisar editar `[review]`.
+8. `g h`, fora de qualquer revisão, não tem efeito (sem trecho atual);
+   dentro da revisão, abre o arquivo real na linha do trecho.
+9. `reviews_log.jsonl` registra início, fim e as contagens de uma
    sessão de revisão completa.
 
 ## Consequências
@@ -411,8 +492,16 @@ nas não tem equivalente), sem precisar de nenhuma contagem manual.
 - `~/.local/state/nas/history/<hash>/` ganha dois arquivos
   (`review_marks.jsonl`, `reviews_log.jsonl`), mesma pasta, mesmo
   padrão append-only já usado por `journal.jsonl`/`permissions_log.jsonl`.
-- Prepara terreno pra issue #9 sem implementá-la: `Review` é o
-  primeiro "modo" de verdade do nas, construído da forma mais simples
-  possível hoje (estado dedicado, tabela duplicada) — candidato
-  natural a migrar pro mecanismo de capacidades quando ele existir,
-  sem precisar mudar o que o modo *faz*, só onde ele é declarado.
+- Prepara terreno pra issue #9 sem implementá-la por completo:
+  `Review` constrói, pela primeira vez no nas, uma camada de teclas de
+  verdade (`[review]` sobre `[visual]` resolvido, bloqueio por nome
+  de ação) — não um modo isolado que a issue #9 precisaria
+  reconstruir do zero, mas o primeiro caso real que ela generaliza
+  (de uma camada fixa pra N camadas declaradas como dados, com
+  contexto e resolução de conflito), sem precisar mudar o que
+  `Review` *faz*, só como ela está montada.
+- `[prefixes.go]` ganha uma entrada (`h`) que só tem efeito dentro da
+  revisão — primeira vez que uma entrada de um prefixo global é
+  condicional ao estado de um jeito visível pro usuário (fora disso,
+  os prefixos de hoje sempre fazem algo quando a tecla existe na
+  tabela).
