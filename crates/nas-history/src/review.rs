@@ -209,9 +209,18 @@ pub fn attribute_hunk(
     // autor" até a primeira entrada depois do checkpoint tocar ali.
     let mut spans: Vec<(usize, usize, Author)> = Vec::new();
 
+    // `>=`, não `>`: o timestamp tem resolução de segundo
+    // (`now_unix`), e o checkpoint da sessão e a primeira entrada
+    // dela (a edição que de fato disparou o checkpoint, ADR 0006 §6)
+    // costumam cair no mesmo segundo — `>` excluiria exatamente a
+    // entrada que a revisão mais precisa (a própria mudança da IA).
+    // O preço é incluir, no raro caso de uma entrada de outro autor
+    // cair no mesmo segundo por coincidência, uma atribuição de mais
+    // — aceitável, mesma ordem de limitação que outros números de
+    // resolução por segundo já têm no histórico (ADR 0005 §5).
     for entry in entries
         .into_iter()
-        .filter(|entry| entry.ts_start > since_ts)
+        .filter(|entry| entry.ts_start >= since_ts)
     {
         let from = entry.from;
         let to = entry.to;
