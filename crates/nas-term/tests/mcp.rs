@@ -356,6 +356,51 @@ fn save_file_recusado_sem_permissions_toml() {
     mcp.kill();
 }
 
+/// Revisão do PR #31: `permissions.toml` é relido em toda chamada que
+/// pede aprovação, não só ao iniciar `nas --mcp` — editar o arquivo
+/// com o processo já rodando libera o efeito já na próxima tentativa,
+/// sem reiniciar nada.
+#[test]
+fn permissions_toml_editado_com_o_processo_rodando_vale_na_proxima_chamada() {
+    let project_dir = tempfile::tempdir().expect("diretório do projeto");
+    let state_home = tempfile::tempdir().expect("diretório de estado");
+    std::fs::write(project_dir.path().join("foo.txt"), "ola\n").expect("escrever foo.txt");
+
+    let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), false);
+    mcp.initialize("teste-releitura");
+
+    mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
+    mcp.call_tool_text(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+    );
+    let (is_error, _) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
+    assert!(
+        is_error,
+        "save_file deveria recusar sem write-file liberado"
+    );
+
+    // Libera `write-file` com o processo já rodando — nenhum restart.
+    let history_dir = history_dir_for(project_dir.path(), state_home.path());
+    std::fs::write(
+        nas_history::permissions_path(&history_dir),
+        "write-file = true\n",
+    )
+    .expect("liberar write-file depois do processo já ter iniciado");
+
+    let (is_error, text) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
+    assert!(
+        !is_error,
+        "save_file deveria aceitar depois que o arquivo mudou, sem reiniciar o processo: {text}"
+    );
+
+    let disk_content =
+        std::fs::read_to_string(project_dir.path().join("foo.txt")).expect("ler foo.txt do disco");
+    assert_eq!(disk_content, "oi\n");
+
+    mcp.kill();
+}
+
 #[test]
 fn save_file_recusado_com_permissions_toml_invalido() {
     let project_dir = tempfile::tempdir().expect("diretório do projeto");

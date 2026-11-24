@@ -39,8 +39,9 @@ pub enum CommandError {
     /// com `open_file` antes de tentar salvar de novo.
     DiskChanged(String),
     /// O comando declara um efeito que pede aprovação (ADR 0006 §5:
-    /// `WriteFile`, `Shell`, `Network`), pedido por um agente de IA,
-    /// e o efeito não está entre os já aprovados desta chamada
+    /// `WriteFile`, `Shell`, `Network`), pedido por um autor que não é
+    /// `Author::User`, e o efeito não está entre os já aprovados desta
+    /// chamada
     /// (`CommandContext::approved_effects`) — quem monta o contexto
     /// (`nas-mcp`) já devia ter recusado antes de chegar aqui; este é
     /// só o cinto de segurança do `Registry` em si (etapa 3d).

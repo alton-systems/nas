@@ -1039,9 +1039,9 @@ mod tests {
     }
 
     /// ADR 0006 §5 (etapa 3d): a checagem de aprovação só existe pra
-    /// `Author::Ai` — uma ação do usuário, editando direto, nunca
-    /// pede aprovação de si mesma, mesmo pra um efeito que pediria de
-    /// um agente (`save_file`, `WriteFile`).
+    /// quem não é `Author::User` — uma ação do usuário, editando
+    /// direto, nunca pede aprovação de si mesma, mesmo pra um efeito
+    /// que pediria de qualquer outro autor (`save_file`, `WriteFile`).
     #[test]
     fn acao_do_usuario_nunca_pede_aprovacao() {
         let dir = tempfile::tempdir().expect("diretório temporário");
@@ -1067,6 +1067,47 @@ mod tests {
                 serde_json::json!({ "path": path_str }),
             )
             .expect("usuário nunca precisa de aprovação, mesmo sem approved_effects");
+    }
+
+    /// ADR 0006 §5 (revisão da etapa 3d): a checagem vale pra **todo**
+    /// autor que não seja `Author::User` — não só `Author::Ai`. Uma
+    /// extensão (`Extension`) ou uma mudança detectada por fora
+    /// (`External`) nascem bloqueadas por padrão igual a um agente,
+    /// sem precisar de uma exceção própria no dia em que algo de
+    /// verdade as produzir.
+    #[test]
+    fn extensao_e_externo_tambem_pedem_aprovacao_como_um_agente() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+
+        for author in [
+            Author::Extension {
+                name: "rustfmt".to_string(),
+            },
+            Author::External,
+        ] {
+            let mut context = ctx(&mut ws, author.clone());
+            let path_str = path.to_string_lossy().into_owned();
+            registry
+                .run(
+                    "open_file",
+                    &mut context,
+                    serde_json::json!({ "path": path_str }),
+                )
+                .expect("abrir");
+
+            let err = registry
+                .run(
+                    "save_file",
+                    &mut context,
+                    serde_json::json!({ "path": path_str }),
+                )
+                .expect_err(&format!("{author:?} devia precisar de aprovação"));
+            assert!(matches!(err, CommandError::NeedsApproval { .. }));
+        }
     }
 
     #[test]
