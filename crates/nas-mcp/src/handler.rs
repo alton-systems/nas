@@ -381,6 +381,7 @@ impl ServerHandler for NasMcpHandler {
             workspace: &mut workspace,
             author,
             approved_effects,
+            warnings: Vec::new(),
         };
 
         match self.registry.run(&request.name, &mut ctx, args) {

@@ -84,20 +84,36 @@ impl Workspace {
     /// igual a `App::journal_record_for` em `nas-term`. `path` já
     /// deve ser o resultado de `resolve` — este método não valida de
     /// novo contra a raiz.
+    ///
+    /// Devolve `Some(aviso)` se `ensure_tracked` falhar — nunca
+    /// ignorado em silêncio (issue #24): sem o original guardado, um
+    /// checkpoint futuro (nomeado, automático, ou o de sessão da ADR
+    /// 0006 §6) não consegue restaurar `path` de volta se ele for
+    /// tocado pela primeira vez só depois deste erro. Quem chama
+    /// acrescenta o aviso a `CommandContext::warnings` —
+    /// `Registry::run` é quem de fato o entrega no resultado da
+    /// ferramenta.
     pub fn record_change(
         &mut self,
         author: Author,
         command: &str,
         path: &Path,
         change: &TextChange,
-    ) -> Result<(), CommandError> {
+    ) -> Result<Option<String>, CommandError> {
         if change.from == change.to && change.removed.is_empty() && change.inserted.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let file = path.to_string_lossy().into_owned();
+        let mut warning = None;
         if let Some(history_dir) = &self.history_dir {
             let disk_content = std::fs::read(path).ok();
-            let _ = nas_history::ensure_tracked(history_dir, &file, disk_content.as_deref());
+            if let Err(err) =
+                nas_history::ensure_tracked(history_dir, &file, disk_content.as_deref())
+            {
+                warning = Some(format!(
+                    "não foi possível guardar o original de {file} no histórico — um checkpoint futuro pode não conseguir restaurá-lo: {err}"
+                ));
+            }
         }
         if let Some(journal) = &mut self.journal {
             journal.record(
@@ -111,7 +127,29 @@ impl Workspace {
                 change.inserted.clone(),
             )?;
         }
-        Ok(())
+        Ok(warning)
+    }
+
+    /// Registra, no histórico, o hash do que acabou de ser gravado em
+    /// `path` (issue #28) — é isto que permite a um `nas-term` aberto
+    /// no mesmo arquivo, ao detectar esta escrita no disco, reconhecer
+    /// que ela já foi journalada por este autor, e não a journalar de
+    /// novo como `Author::External`. Sem efeito se não houver
+    /// `history_dir`. Chamado depois de todo `Document::save` de
+    /// verdade (`save_file`, `create_file`, restaurar um checkpoint) —
+    /// nunca depois de só editar um buffer, que não toca o disco.
+    ///
+    /// Uma falha aqui só é descartada: o comando que gravou a
+    /// mudança de verdade já teve sucesso, e a pior consequência é a
+    /// duplicação de autoria que este registro existe pra evitar —
+    /// não um erro que deva recusar um comando que já se aplicou.
+    pub fn record_last_save(&self, path: &Path, content: &str, author: &Author) {
+        let Some(history_dir) = &self.history_dir else {
+            return;
+        };
+        let file = path.to_string_lossy().into_owned();
+        let _ =
+            nas_history::record_last_save(history_dir, &file, content.as_bytes(), author.clone());
     }
 
     /// `path` já deve ser o resultado de `resolve`.
@@ -177,7 +215,19 @@ impl Workspace {
     /// já estiver aberto, pra `create_file` nunca sobrescrever algo
     /// sem querer (quem quer sobrescrever usa `edit`/`open_file`).
     /// `path` já deve ser o resultado de `resolve`.
-    pub fn create(&mut self, path: &Path) -> Result<(), CommandError> {
+    ///
+    /// Rastreia `path` como `existed: false` **antes** de escrever
+    /// nada nele — se isto esperasse até `record_change` (chamado só
+    /// depois, se houver conteúdo inicial), `ensure_tracked` já leria
+    /// de volta o conteúdo que este próprio método acabou de
+    /// escrever, achando que o arquivo "já existia" com esse
+    /// conteúdo; restaurar um checkpoint de antes desta criação
+    /// nunca saberia que devia jogar o arquivo na lixeira, não
+    /// reescrevê-lo com o próprio conteúdo (ADR 0006 §6, etapa 3e —
+    /// é o que `checkpoint_restore`/a sessão de IA precisam pra
+    /// desfazer um `create_file`). Devolve `Some(aviso)` se isto
+    /// falhar, pelo mesmo motivo de `record_change` (issue #24).
+    pub fn create(&mut self, path: &Path) -> Result<Option<String>, CommandError> {
         // `symlink_metadata` (não `exists`, que segue o link): um
         // link pendurado (apontando pra um destino que ainda não
         // existe, inclusive fora da raiz) não aparece em `exists()`,
@@ -190,6 +240,15 @@ impl Workspace {
                 format!("{} já existe", path.display()),
             )));
         }
+        let mut warning = None;
+        if let Some(history_dir) = &self.history_dir {
+            let file = path.to_string_lossy().into_owned();
+            if let Err(err) = nas_history::ensure_tracked(history_dir, &file, None) {
+                warning = Some(format!(
+                    "não foi possível guardar {file} como criado nesta sessão no histórico — um checkpoint futuro pode não conseguir desfazer esta criação: {err}"
+                ));
+            }
+        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -198,7 +257,7 @@ impl Workspace {
         std::fs::write(path, "")?;
         let document = Document::open(path)?;
         self.documents.insert(path.to_path_buf(), document);
-        Ok(())
+        Ok(warning)
     }
 
     /// O conteúdo atual de um caminho rastreado — do documento aberto,
@@ -334,4 +393,15 @@ pub struct CommandContext<'a> {
     /// `WriteFile`/`Shell`/`Network` pedido por qualquer autor que não
     /// seja `Author::User` é recusado (`CommandError::NeedsApproval`).
     pub approved_effects: std::collections::HashSet<crate::effect::Effect>,
+    /// Avisos acumulados durante esta chamada — ex.: `ensure_tracked`
+    /// falhou (issue #24, `Workspace::record_change`), ou o
+    /// checkpoint automático de sessão não pôde ser criado (ADR 0006
+    /// §6, etapa 3e). Nunca um erro de verdade (isso continua sendo
+    /// `CommandError`, que recusa o comando); um aviso não impede o
+    /// comando de ter funcionado, mas também não pode passar em
+    /// silêncio. Quem monta o `CommandContext` começa com a lista
+    /// vazia; `Registry::run` é quem drena isto e mescla no resultado
+    /// final, no fim de cada chamada — nenhum comando precisa saber
+    /// que este campo existe pra usar `record_change`.
+    pub warnings: Vec<String>,
 }

@@ -28,21 +28,24 @@ mod atomic;
 mod author;
 mod checkpoint;
 mod journal;
+mod last_save;
 mod lock;
 mod originals;
 mod permissions;
 mod project;
 mod restore;
+mod time;
 mod trash;
 
 pub use author::Author;
 pub use checkpoint::{
     CheckpointFile, CheckpointManifest, CreatedCheckpoint, ExcludedFile, ExcludedReason,
     FileChange, FileDiff, MAX_AUTOMATIC_CHECKPOINTS, MAX_FILE_SIZE, MAX_TOTAL_SIZE_BYTES,
-    PruneReport, create as create_checkpoint, diff, list as list_checkpoints, prune,
+    PruneReport, create as create_checkpoint, diff, hash_content, list as list_checkpoints, prune,
     prune_with_limits, read_object,
 };
 pub use journal::{Journal, JournalEntry, file_history, journal_path, now_unix, read_entries};
+pub use last_save::{LastSave, get_last_save, record_last_save};
 pub use originals::{OriginalEntry, ensure_tracked, get as get_tracked, list as list_tracked};
 pub use permissions::{
     PermissionDecision, PermissionDecisionEntry, PermissionSource, PermissionsError,
@@ -52,4 +55,5 @@ pub use permissions::{
 };
 pub use project::{ProjectId, delete_project_history, state_home};
 pub use restore::{RestoreReport, RestoreTarget, restore};
+pub use time::format_timestamp;
 pub use trash::move_to_trash;

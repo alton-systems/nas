@@ -331,8 +331,12 @@ fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandE
 
     let document = ctx.workspace.document_mut(&path).expect("checado acima");
     let change = document.replace_region(from, to, &args.new_text);
-    ctx.workspace
-        .record_change(ctx.author.clone(), "edit", &path, &change)?;
+    if let Some(tracking_warning) =
+        ctx.workspace
+            .record_change(ctx.author.clone(), "edit", &path, &change)?
+    {
+        ctx.warnings.push(tracking_warning);
+    }
 
     Ok(EditResult { from, to, warning })
 }
@@ -391,7 +395,9 @@ fn create_file(
     args: CreateFileArgs,
 ) -> Result<CreateFileResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
-    ctx.workspace.create(&path)?;
+    if let Some(tracking_warning) = ctx.workspace.create(&path)? {
+        ctx.warnings.push(tracking_warning);
+    }
     if let Some(content) = &args.content
         && !content.is_empty()
     {
@@ -401,8 +407,13 @@ fn create_file(
             .expect("acabou de ser criado");
         let change = document.replace_all(content);
         document.save()?;
-        ctx.workspace
-            .record_change(ctx.author.clone(), "create-file", &path, &change)?;
+        ctx.workspace.record_last_save(&path, content, &ctx.author);
+        if let Some(tracking_warning) =
+            ctx.workspace
+                .record_change(ctx.author.clone(), "create-file", &path, &change)?
+        {
+            ctx.warnings.push(tracking_warning);
+        }
     }
     Ok(CreateFileResult {
         path: path.to_string_lossy().into_owned(),
@@ -436,6 +447,8 @@ fn save_file(ctx: &mut CommandContext, args: SaveFileArgs) -> Result<SaveFileRes
         return Err(CommandError::DiskChanged(path.display().to_string()));
     }
     ctx.workspace.save(&path)?;
+    let content = ctx.workspace.document(&path)?.full_text();
+    ctx.workspace.record_last_save(&path, &content, &ctx.author);
     Ok(SaveFileResult {
         path: path.to_string_lossy().into_owned(),
     })
@@ -502,17 +515,25 @@ impl nas_history::RestoreTarget for CommandContext<'_> {
     }
 
     fn write(&mut self, path: &str, content: &str) -> std::io::Result<()> {
-        self.workspace
+        let change = self
+            .workspace
             .write_file(path, content)
-            .and_then(|change| {
-                self.workspace.record_change(
-                    self.author.clone(),
-                    "restore-checkpoint",
-                    Path::new(path),
-                    &change,
-                )
-            })
-            .map_err(command_error_to_io)
+            .map_err(command_error_to_io)?;
+        self.workspace
+            .record_last_save(Path::new(path), content, &self.author);
+        let tracking_warning = self
+            .workspace
+            .record_change(
+                self.author.clone(),
+                "restore-checkpoint",
+                Path::new(path),
+                &change,
+            )
+            .map_err(command_error_to_io)?;
+        if let Some(tracking_warning) = tracking_warning {
+            self.warnings.push(tracking_warning);
+        }
+        Ok(())
     }
 }
 
@@ -581,6 +602,7 @@ mod tests {
             workspace,
             author,
             approved_effects: std::collections::HashSet::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -1224,6 +1246,225 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "mudou por fora, e a IA editou por cima",
             "o conteúdo do outro processo devia continuar na base do arquivo final"
+        );
+    }
+
+    /// ADR 0006 §6 (etapa 3e): a primeira mudança efetiva de uma
+    /// sessão de IA cria um checkpoint automático "antes da sessão de
+    /// <agent>" — uma segunda mudança efetiva, na mesma sessão, não
+    /// cria um segundo.
+    #[test]
+    fn primeira_mudanca_efetiva_de_uma_sessao_cria_checkpoint_automatico_uma_vez_so() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let author = Author::Ai {
+            agent: "claude-code".to_string(),
+            session: "s1".to_string(),
+        };
+        let mut context = ctx(&mut ws, author.clone());
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+        let path_str = path.to_string_lossy().into_owned();
+
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi" }),
+            )
+            .expect("editar");
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo" }),
+            )
+            .expect("editar de novo, mesma sessão");
+
+        let history_dir = ws.history_dir().expect("history_dir").to_path_buf();
+        let checkpoints = nas_history::list_checkpoints(&history_dir).expect("listar checkpoints");
+        let session_checkpoints: Vec<_> = checkpoints
+            .iter()
+            .filter(|c| c.automatic && c.author == author)
+            .collect();
+        assert_eq!(
+            session_checkpoints.len(),
+            1,
+            "deveria existir exatamente um checkpoint de sessão, mesmo com duas edições: {checkpoints:?}"
+        );
+        assert!(
+            session_checkpoints[0]
+                .name
+                .starts_with("antes da sessão de claude-code"),
+            "{}",
+            session_checkpoints[0].name
+        );
+    }
+
+    /// ADR 0006 §6 (etapa 3e): o autor é `Author::User`, nunca ganha
+    /// o checkpoint automático de sessão — só sessão de IA tem um.
+    #[test]
+    fn usuario_editando_direto_nao_cria_checkpoint_de_sessao() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+        let path_str = path.to_string_lossy().into_owned();
+
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi" }),
+            )
+            .expect("editar");
+
+        let history_dir = ws.history_dir().expect("history_dir").to_path_buf();
+        let checkpoints = nas_history::list_checkpoints(&history_dir).expect("listar checkpoints");
+        assert!(
+            checkpoints.is_empty(),
+            "usuário editando direto não deveria criar checkpoint algum: {checkpoints:?}"
+        );
+    }
+
+    /// ADR 0006 §6: restaurar o checkpoint de sessão desfaz tudo que
+    /// a sessão mudou — reverte o que já existia (`a.txt`) e manda
+    /// pra lixeira o que a sessão criou (`b.txt`).
+    #[test]
+    fn restaurar_checkpoint_de_sessao_desfaz_tudo_que_ela_mudou() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path_a = write(dir.path(), "a.txt", "a original");
+        let mut ws = workspace(dir.path());
+        let history_dir = ws.history_dir().expect("history_dir").to_path_buf();
+        let author = Author::Ai {
+            agent: "claude-code".to_string(),
+            session: "s1".to_string(),
+        };
+        let mut context = ctx(&mut ws, author.clone());
+        context.approved_effects.insert(Effect::WriteFile);
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+        let path_a_str = path_a.to_string_lossy().into_owned();
+
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_a_str }),
+            )
+            .expect("abrir");
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_a_str, "old_text": "a original", "new_text": "a editado" }),
+            )
+            .expect("editar");
+        registry
+            .run(
+                "save_file",
+                &mut context,
+                serde_json::json!({ "path": path_a_str }),
+            )
+            .expect("salvar");
+
+        let path_b = dir.path().join("b.txt");
+        let path_b_str = path_b.to_string_lossy().into_owned();
+        registry
+            .run(
+                "create_file",
+                &mut context,
+                serde_json::json!({ "path": path_b_str, "content": "arquivo novo da sessão" }),
+            )
+            .expect("criar");
+
+        let checkpoints = nas_history::list_checkpoints(&history_dir).expect("listar checkpoints");
+        let session_checkpoint = checkpoints
+            .iter()
+            .find(|c| c.automatic && c.author == author)
+            .expect("deveria existir um checkpoint de sessão")
+            .clone();
+
+        // Isola a lixeira de verdade do usuário rodando o teste — a
+        // restauração abaixo vai mover "b.txt" pra ela (criado só
+        // depois do checkpoint de sessão).
+        let trash_home = tempfile::tempdir().expect("diretório temporário");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", trash_home.path());
+        }
+
+        let report = nas_history::restore(
+            &history_dir,
+            &session_checkpoint,
+            Author::User,
+            nas_history::now_unix(),
+            &mut context,
+        )
+        .expect("restaurar");
+
+        assert_eq!(report.restored, vec![path_a_str.clone()]);
+        assert_eq!(report.trashed, vec![path_b_str]);
+        assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "a original");
+        assert!(
+            !path_b.exists(),
+            "b.txt deveria ter sido movido pra lixeira"
+        );
+    }
+
+    /// Issue #24: `ensure_tracked` falhando (aqui, forçado: um
+    /// arquivo comum no lugar de `originals/`) não trava o comando
+    /// nem é descartado em silêncio — o resultado continua de
+    /// sucesso, com o aviso no campo `warning`.
+    #[test]
+    fn ensure_tracked_falhando_aparece_como_aviso_no_resultado() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let history_dir = ws.history_dir().expect("history_dir").to_path_buf();
+        std::fs::write(history_dir.join("originals"), "não é uma pasta").expect("forçar a colisão");
+
+        let mut context = ctx(&mut ws, Author::User);
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+        let path_str = path.to_string_lossy().into_owned();
+
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+        let result = registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi" }),
+            )
+            .expect("editar deveria funcionar mesmo com o aviso");
+
+        assert!(
+            result["warning"]
+                .as_str()
+                .is_some_and(|w| w.to_lowercase().contains("histórico")),
+            "deveria avisar que não conseguiu guardar o original: {result}"
         );
     }
 
