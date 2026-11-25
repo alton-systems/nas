@@ -276,7 +276,7 @@ fn journal_sobrevive_a_um_encerramento_a_forca_depois_de_cada_chamada() {
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "ola", "new_text": "primeira"}),
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "primeira", "save": false}),
     );
     // Duas chamadas em sequência rápida, bem dentro da mesma janela
     // de lote do journal (`BATCH_INTERVAL_SECONDS`) — sem o flush
@@ -286,7 +286,7 @@ fn journal_sobrevive_a_um_encerramento_a_forca_depois_de_cada_chamada() {
     // roda `Drop`, que é só melhor esforço mesmo quando roda).
     let (is_error, _) = mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "mundo", "new_text": "segunda"}),
+        json!({"path": "foo.txt", "old_text": "mundo", "new_text": "segunda", "save": false}),
     );
     assert!(!is_error, "a segunda edição devia funcionar");
 
@@ -323,7 +323,7 @@ fn save_file_recusado_sem_permissions_toml() {
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi", "save": false}),
     );
     let (is_error, text) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
     assert!(
@@ -372,7 +372,7 @@ fn permissions_toml_editado_com_o_processo_rodando_vale_na_proxima_chamada() {
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi", "save": false}),
     );
     let (is_error, _) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
     assert!(
@@ -416,7 +416,7 @@ fn save_file_recusado_com_permissions_toml_invalido() {
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi", "save": false}),
     );
     let (is_error, text) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
     assert!(
@@ -452,7 +452,7 @@ fn permissions_toml_dentro_do_projeto_e_ignorado() {
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi", "save": false}),
     );
     let (is_error, _) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
     assert!(
@@ -475,7 +475,7 @@ fn decisao_aprovada_pelo_arquivo_e_registrada_no_journal_de_permissoes() {
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi", "save": false}),
     );
     let (is_error, _) = mcp.call_tool_text("save_file", json!({"path": "foo.txt"}));
     assert!(
@@ -515,7 +515,7 @@ fn save_file_recusa_quando_o_disco_mudou() {
     mcp.call_tool_text("open_file", json!({"path": "foo.txt"}));
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi"}),
+        json!({"path": "foo.txt", "old_text": "ola", "new_text": "oi", "save": false}),
     );
 
     // Mudança externa concorrente, depois da leitura da IA — um
@@ -572,7 +572,8 @@ fn save_file_recusa_quando_o_disco_mudou() {
         json!({
             "path": "foo.txt",
             "old_text": "mudou por fora",
-            "new_text": "mudou por fora, e a IA editou por cima"
+            "new_text": "mudou por fora, e a IA editou por cima",
+            "save": false
         }),
     );
     assert!(
@@ -652,7 +653,7 @@ fn leituras_devolvem_texto_puro_e_aviso_num_segundo_bloco() {
     // misturado ao texto (que continua sendo o do buffer, intacto).
     mcp.call_tool_text(
         "edit",
-        json!({"path": "foo.txt", "old_text": "linha um", "new_text": "linha um editada"}),
+        json!({"path": "foo.txt", "old_text": "linha um", "new_text": "linha um editada", "save": false}),
     );
     std::fs::write(&file_path, "mudou por fora\n").expect("simular mudança externa");
 

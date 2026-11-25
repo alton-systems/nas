@@ -128,6 +128,27 @@ qualquer tecla do usuário), não salva no disco por conta própria —
 foi a IA. Qual desses efeitos pede aprovação — e qual não — é decidido
 pelo risco real de cada um, não só pela classe; ver §5.
 
+**Revisão pós-benchmark (ensaio da etapa 3f-prep, §7): `edit` passa a
+salvar por padrão.** O parágrafo acima descrevia a etapa 3a, antes do
+MCP existir de verdade. Na prática (§3, `save`, etapa 3f-prep), quem
+chama `edit` **é sempre um agente de IA** — não existe ainda um
+caminho do usuário até o registro de comandos (3g, unificação de
+despacho, continua não implementada) — e, sem o núcleo em segundo
+plano (§2, etapa 3b) compartilhando o buffer com um `nas-term` aberto,
+uma edição que fica só em memória do processo `nas --mcp` é invisível
+pra qualquer um: ninguém vê o resultado até alguém chamar `save_file`
+(ou `edit` com `save: true`) numa chamada seguinte. O ensaio comparativo
+mostrou isso custando chamadas extras de verdade (uma `save_file`
+separada por arquivo, nenhuma vantagem em troca). A correção: o efeito
+de repouso de `edit` passa a ser `WriteFile`, não `WriteBuffer` — o
+parâmetro `save` (§3) agora vale `true` por padrão, com a mesma
+aprovação e a mesma regra de conflito de disco de antes; `save: false`
+continua existindo pra quem quer só editar o buffer, sem gravar (um
+caso que ainda faz sentido, por exemplo, pra várias edições em
+sequência antes de salvar uma vez só). `save_file` continua existindo,
+sem mudança — ainda é como salvar depois de uma chamada com
+`save: false`, ou salvar algo que não foi tocado nesta mesma chamada.
+
 ### 2. Núcleo em segundo plano
 
 **Revisão da ordem (§8): isto é a etapa 3b, agora depois do benchmark
@@ -296,7 +317,12 @@ vira uma chamada ao `Registry` (§1); nada de `rmcp` aparece em
   do buffer (não no que a IA leu por último — sempre o texto de
   agora, já que o núcleo é a única fonte de verdade, §2) e:
   - se não encontrar, recusa com um erro dizendo isso — nunca cria
-    texto novo do nada;
+    texto novo do nada. **Revisão pós-benchmark (ensaio da etapa
+    3f-prep):** o erro passa a incluir até três linhas (já numeradas)
+    da região pesquisada, as mais parecidas com a primeira linha de
+    `old_text` (por palavras em comum) — só uma pista pra uma segunda
+    tentativa, nunca usada pra decidir uma correspondência de verdade;
+    vazio quando nenhuma linha tem nada em comum;
   - se encontrar **mais de uma vez**, recusa pedindo pra desambiguar
     com `line_range` (um intervalo de linhas que contém a ocorrência
     certa) — nunca adivinha qual;
@@ -401,6 +427,17 @@ que algo de verdade as produzir.
   gravar no disco sem passar pela aprovação de `write-file`, mesmo
   chamando o registro direto (como um teste faz), sem o adaptador MCP
   no meio.
+  **Revisão pós-benchmark (ensaio da etapa 3f-prep, §1/§3): o valor
+  padrão de `save`, quando o argumento não vem na chamada, passa de
+  `false` pra `true`** — `edit` sem `save` nenhum agora tem o mesmo
+  efeito (`WriteFile`) que `edit(save: true)` tinha antes; `effect`
+  nominal de `edit` também passa a ser `WriteFile` (era `WriteBuffer`),
+  já que esse é o caso comum agora; `max_effect` continua `WriteFile`,
+  sem mudança (já era o pior caso). O cálculo de `effective_effect`
+  (acima) muda só o valor do `.unwrap_or(...)` — de `false` pra
+  `true` — exatamente no mesmo lugar, lendo o mesmo argumento cru;
+  nada na arquitetura de aprovação muda, só o que acontece quando
+  `save` está ausente.
   **`--approve-writes` (revisão da etapa 3c, temporário)**: até a
   etapa 3d existir de verdade, `nas --mcp --approve-writes` foi o
   único jeito de liberar `WriteFile` (nunca `Shell`/`Network`, que não

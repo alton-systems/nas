@@ -51,16 +51,23 @@ pub fn register_all(registry: &mut Registry) {
     registry.register(
         typed_command(
             "edit",
-            "Substitui um texto exato por outro num arquivo; recusa se o texto não existir ou repetir. Com save, grava no disco na mesma chamada.",
-            Effect::WriteBuffer,
+            "Substitui um texto exato por outro num arquivo; recusa se o texto não existir ou repetir. Por padrão grava no disco na mesma chamada (save: false para só editar o buffer).",
+            Effect::WriteFile,
             true,
             edit,
         )
         .with_dynamic_effect(Effect::WriteFile, |args| {
+            // Mesmo padrão `true` do campo `EditArgs::save` (revisão
+            // pós-benchmark) — lido aqui direto do JSON crú, sem
+            // passar pelo `Deserialize` de `EditArgs`, porque é usado
+            // pra decidir aprovação *antes* de validar o resto dos
+            // argumentos (ADR 0006 §5). Os dois precisam concordar: se
+            // só um mudasse, `save` ausente poderia executar com um
+            // efeito diferente do que foi aprovado.
             if args
                 .get("save")
                 .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
+                .unwrap_or(true)
             {
                 Effect::WriteFile
             } else {
@@ -180,6 +187,53 @@ fn char_range_for_lines(text: &str, from_line: usize, to_line: usize) -> std::op
     let start = offsets.get(from_line - 1).copied().unwrap_or(total);
     let end = offsets.get(to_line).copied().unwrap_or(total);
     start..end.max(start)
+}
+
+/// Até três linhas de `text`, dentro de `bounds` (o mesmo intervalo de
+/// caracteres que `edit` pesquisou por `old_text`), mais parecidas com
+/// a primeira linha de `needle` — compõe a mensagem de
+/// `CommandError::NoMatch` pra ajudar numa segunda tentativa, nunca
+/// pra decidir uma correspondência de verdade (ADR 0006 §3: "nunca
+/// adivinha"). Similaridade = Jaccard sobre o conjunto de palavras de
+/// cada linha (`split_whitespace`); uma linha sem nenhuma palavra em
+/// comum com `needle` nunca aparece — zero pistas é melhor que uma
+/// pista sem relação nenhuma. Em caso de empate, a linha mais cedo no
+/// arquivo vence, pra um resultado estável entre chamadas.
+fn closest_lines(text: &str, bounds: &std::ops::Range<usize>, needle: &str) -> Vec<String> {
+    let anchor = needle.lines().next().unwrap_or(needle);
+    let anchor_words: std::collections::HashSet<&str> = anchor.split_whitespace().collect();
+    if anchor_words.is_empty() {
+        return Vec::new();
+    }
+
+    let total_chars = text.chars().count();
+    let start_line = line_number_for_offset(text, bounds.start.min(total_chars));
+    let end_line = line_number_for_offset(text, bounds.end.min(total_chars));
+
+    let mut scored: Vec<(usize, usize, &str)> = text
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| (idx + 1, line))
+        .filter(|(line_no, _)| *line_no >= start_line && *line_no <= end_line)
+        .filter_map(|(line_no, line)| {
+            let words: std::collections::HashSet<&str> = line.split_whitespace().collect();
+            let intersection = anchor_words.intersection(&words).count();
+            if intersection == 0 {
+                return None;
+            }
+            // Jaccard escalado por 1000 pra comparar como inteiro, sem
+            // depender de `f64: Ord` (não existe, por causa de `NaN`).
+            let union = anchor_words.union(&words).count().max(1);
+            Some((intersection * 1000 / union, line_no, line))
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(3)
+        .map(|(_, line_no, line)| format!("{line_no} {line}"))
+        .collect()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -364,13 +418,24 @@ pub struct EditArgs {
         description = "[linha inicial, linha final] (1-based) para desambiguar quando old_text se repete"
     )]
     pub line_range: Option<[usize; 2]>,
-    // Muda o efeito desta chamada de `WriteBuffer` pra `WriteFile`
-    // (`CommandSpec::effective_effect`) e vale a mesma regra de
-    // conflito de `save_file` (`DiskChanged` se o disco mudou) — ver
-    // ADR 0006 §5/§8.
-    #[serde(default)]
-    #[schemars(description = "grava no disco após editar; pede permissão de escrita")]
+    // Padrão `true` (revisão pós-benchmark, ADR 0006 §3/§5): sem o
+    // núcleo em segundo plano (§2, etapa 3b), o buffer do processo
+    // MCP é invisível pro usuário — uma edição não salva não tem uso
+    // nenhum enquanto essa etapa não existir. Muda o efeito desta
+    // chamada de `WriteBuffer` pra `WriteFile` por padrão
+    // (`CommandSpec::effective_effect`), com a mesma aprovação e a
+    // mesma regra de conflito de `save_file` (`DiskChanged` se o
+    // disco mudou). `save: false` continua existindo pra quem quer só
+    // editar o buffer sem gravar.
+    #[serde(default = "default_save")]
+    #[schemars(
+        description = "grava no disco após editar (padrão true); pede permissão de escrita — use false para só editar o buffer"
+    )]
     pub save: bool,
+}
+
+fn default_save() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -408,7 +473,7 @@ fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandE
     let haystack: Vec<char> = text.chars().collect();
     let needle: Vec<char> = args.old_text.chars().collect();
     if needle.is_empty() {
-        return Err(CommandError::NoMatch);
+        return Err(CommandError::NoMatch(Vec::new()));
     }
 
     let mut occurrences = Vec::new();
@@ -424,7 +489,13 @@ fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandE
     }
 
     let from = match occurrences.len() {
-        0 => return Err(CommandError::NoMatch),
+        0 => {
+            return Err(CommandError::NoMatch(closest_lines(
+                &text,
+                &bounds,
+                &args.old_text,
+            )));
+        }
         1 => occurrences[0],
         count => return Err(CommandError::Ambiguous(count)),
     };
@@ -1011,7 +1082,64 @@ mod tests {
             },
         )
         .expect_err("devia recusar");
-        assert!(matches!(err, CommandError::NoMatch));
+        assert!(
+            matches!(&err, CommandError::NoMatch(candidates) if candidates.is_empty()),
+            "sem nenhuma palavra em comum com 'ola mundo', não devia sugerir nada: {err:?}"
+        );
+    }
+
+    /// Correção pós-benchmark (ADR 0006 §3): `NoMatch` mostra até três
+    /// linhas parecidas da região pesquisada, pra ajudar numa segunda
+    /// tentativa — nunca aplica nada nelas, só sugere.
+    #[test]
+    fn edit_recusa_mostrando_linhas_parecidas_quando_old_text_nao_existe() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let file_path = write(
+            dir.path(),
+            "a.txt",
+            "fn soma_dois(a: i32) -> i32 {\nfn soma_tres(a: i32) -> i32 {\nqualquer outra coisa aqui\n",
+        );
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path = file_path.to_string_lossy().into_owned();
+        open_file(&mut context, OpenFileArgs { path: path.clone() }).expect("abrir");
+
+        let err = edit(
+            &mut context,
+            EditArgs {
+                path,
+                old_text: "fn soma_dois(a: i32, b: i32) -> i32 {".to_string(),
+                new_text: "".to_string(),
+                line_range: None,
+                save: false,
+            },
+        )
+        .expect_err("devia recusar — old_text não bate com nenhuma linha exata");
+
+        let CommandError::NoMatch(candidates) = &err else {
+            panic!("esperava NoMatch, veio {err:?}");
+        };
+        assert!(
+            !candidates.is_empty(),
+            "devia sugerir ao menos uma linha parecida"
+        );
+        assert!(
+            candidates.len() <= 3,
+            "no máximo três sugestões: {candidates:?}"
+        );
+        assert_eq!(
+            candidates[0], "1 fn soma_dois(a: i32) -> i32 {",
+            "a linha mais parecida (mesmo nome de função) devia vir primeiro: {candidates:?}"
+        );
+        assert!(
+            !candidates.iter().any(|c| c.contains("qualquer")),
+            "linha sem nenhuma palavra em comum não devia aparecer: {candidates:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "fn soma_dois(a: i32) -> i32 {\nfn soma_tres(a: i32) -> i32 {\nqualquer outra coisa aqui\n",
+            "uma sugestão nunca aplica nada — o arquivo continua intacto"
+        );
     }
 
     #[test]
@@ -1439,6 +1567,7 @@ mod tests {
                     "path": path_str,
                     "old_text": "ola",
                     "new_text": "ola editado",
+                    "save": false,
                 }),
             )
             .expect("editar");
@@ -1513,6 +1642,7 @@ mod tests {
                     "path": path_str,
                     "old_text": "mudou por fora",
                     "new_text": "mudou por fora, e a IA editou por cima",
+                    "save": false,
                 }),
             )
             .expect("editar devia funcionar depois de reabrir");
@@ -1665,15 +1795,18 @@ mod tests {
         );
     }
 
-    /// ADR 0006 §5/§8 (etapa 3f-prep): `edit` com `save: true`, pedido
-    /// por um autor que não é o usuário, pede aprovação de
-    /// `write-file` como `save_file` já pedia — e, sem aprovação, nem
-    /// chega a gravar no disco (a edição em memória continuaria
-    /// isolada caso a chamada tivesse sido aceita só parcialmente, o
-    /// que nunca acontece aqui: o `Registry` recusa antes de chamar
-    /// `edit` de verdade).
+    /// ADR 0006 §5/§8 (etapa 3f-prep, revisão pós-benchmark): `edit`
+    /// por padrão (sem `save`, que agora vale `true`), pedido por um
+    /// autor que não é o usuário, pede aprovação de `write-file` como
+    /// `save_file` já pedia — e, sem aprovação, nem chega a gravar no
+    /// disco (a edição em memória continuaria isolada caso a chamada
+    /// tivesse sido aceita só parcialmente, o que nunca acontece aqui:
+    /// o `Registry` recusa antes de chamar `edit` de verdade).
+    /// `save: false` explícito é o único jeito de editar sem aprovação
+    /// — e, nesse caso, nada vai pro disco mesmo com o efeito liberado
+    /// depois.
     #[test]
-    fn edit_com_save_pede_aprovacao_de_write_file_pra_quem_nao_e_usuario() {
+    fn edit_por_padrao_pede_aprovacao_de_write_file_pra_quem_nao_e_usuario() {
         let dir = tempfile::tempdir().expect("diretório temporário");
         let path = write(dir.path(), "a.txt", "ola");
         let mut ws = workspace(dir.path());
@@ -1694,24 +1827,15 @@ mod tests {
             )
             .expect("abrir");
 
-        // Sem save: edita livremente, sem aprovação nenhuma — o
-        // efeito continua WriteBuffer.
-        registry
+        // Sem save (o padrão): pede aprovação de write-file, nada vai
+        // pro disco sem ela.
+        let err = registry
             .run(
                 "edit",
                 &mut context,
                 serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi" }),
             )
-            .expect("editar sem save não devia precisar de aprovação");
-
-        // Com save: true, pede aprovação de write-file.
-        let err = registry
-            .run(
-                "edit",
-                &mut context,
-                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo", "save": true }),
-            )
-            .expect_err("devia recusar sem aprovação de write-file");
+            .expect_err("sem aprovação, o padrão (save implícito) devia recusar");
         assert!(matches!(
             err,
             CommandError::NeedsApproval {
@@ -1725,13 +1849,29 @@ mod tests {
             "nada devia ter ido pro disco"
         );
 
-        // Com a aprovação concedida, grava no disco na mesma chamada.
+        // Com save: false explícito, edita livremente, sem aprovação
+        // nenhuma — o efeito volta a ser WriteBuffer.
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi", "save": false }),
+            )
+            .expect("save: false não devia precisar de aprovação");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ola",
+            "save: false nunca grava no disco, aprovado ou não"
+        );
+
+        // Com a aprovação concedida, o padrão (sem save) grava no
+        // disco na mesma chamada.
         context.approved_effects.insert(Effect::WriteFile);
         let result = registry
             .run(
                 "edit",
                 &mut context,
-                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo", "save": true }),
+                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo" }),
             )
             .expect("devia aceitar com a aprovação concedida");
         assert_eq!(result["saved"], true);
@@ -1962,14 +2102,14 @@ mod tests {
             .run(
                 "edit",
                 &mut context,
-                serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi" }),
+                serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi", "save": false }),
             )
             .expect("editar");
         registry
             .run(
                 "edit",
                 &mut context,
-                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo" }),
+                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo", "save": false }),
             )
             .expect("editar de novo, mesma sessão");
 
@@ -2159,7 +2299,7 @@ mod tests {
 
         assert_eq!(registry.specs().len(), 12);
         let edit_spec = registry.get("edit").expect("edit deveria existir");
-        assert_eq!(edit_spec.effect, Effect::WriteBuffer);
+        assert_eq!(edit_spec.effect, Effect::WriteFile);
         assert!(registry.get("comando-que-nao-existe").is_none());
         assert!(
             registry.specs().iter().all(|spec| spec.exposed_to_ai),
@@ -2167,10 +2307,13 @@ mod tests {
         );
     }
 
-    /// ADR 0006 §5/§8 (etapa 3f-prep): o efeito de `edit` depende do
-    /// argumento `save` — `max_effect` (usado só pra anotação MCP
-    /// estática) é sempre o pior caso (`WriteFile`), mas
-    /// `effective_effect` por chamada muda com o argumento.
+    /// ADR 0006 §5/§8 (etapa 3f-prep, revisão pós-benchmark): o
+    /// efeito de `edit` depende do argumento `save`, que agora é
+    /// `true` por padrão — `max_effect` (usado só pra anotação MCP
+    /// estática) é sempre o pior caso (`WriteFile`, que também é o
+    /// efeito de repouso agora), mas `effective_effect` por chamada
+    /// muda com o argumento, caindo pra `WriteBuffer` só quando
+    /// `save: false` é passado explicitamente.
     #[test]
     fn edit_tem_efeito_dependente_do_argumento_save() {
         let mut registry = Registry::new();
@@ -2180,7 +2323,8 @@ mod tests {
         assert_eq!(edit_spec.max_effect, Effect::WriteFile);
         assert_eq!(
             edit_spec.effective_effect(&serde_json::json!({})),
-            Effect::WriteBuffer
+            Effect::WriteFile,
+            "sem save, o padrão agora é gravar no disco"
         );
         assert_eq!(
             edit_spec.effective_effect(&serde_json::json!({ "save": false })),
