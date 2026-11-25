@@ -96,12 +96,21 @@ awk '
 echo "== tarefa $TAREFA, lado $LADO, rodada $RODADA ==" >&2
 echo "worktree: $WORKTREE" >&2
 
+# Aviso igual nos dois lados (pedido explícito, registrado em
+# docs/benchmark-fase3.md §4): numa rodada automatizada não há
+# ninguém pra aprovar nada no meio do caminho — sem isto, um lado
+# pode parar mais cedo "esperando revisão" (como o lado nas fez no
+# ensaio, por ter lido o CLAUDE.md do próprio worktree) e o outro não,
+# o que mediria estilo de parada, não a tarefa em si.
+AVISO_BENCHMARK="Execução automatizada de benchmark: não há ninguém para aprovar. Conclua a tarefa por completo, sem pedir confirmação. Não faça commit nem push."
+
 COMMON_ARGS=(
     --output-format stream-json
     --verbose
     --include-partial-messages
     --model "$BENCH_MODEL"
     --strict-mcp-config
+    --append-system-prompt "$AVISO_BENCHMARK"
 )
 
 # Shell liberado igual nos dois lados: só cargo e git (ADR 0006 §7 —

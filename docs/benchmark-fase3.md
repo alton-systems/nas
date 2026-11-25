@@ -86,6 +86,19 @@ por último.
   `write-file = true` (as cinco tarefas são edição de código; nenhuma
   chama shell nem rede a partir de uma ferramenta do nas), copiada
   pro `permissions.toml` de cada worktree antes da rodada.
+- **Aviso de execução não assistida, igual nos dois lados**
+  (`--append-system-prompt` em `bench/rodar.sh`): *"Execução
+  automatizada de benchmark: não há ninguém para aprovar. Conclua a
+  tarefa por completo, sem pedir confirmação. Não faça commit nem
+  push."* Sem isso, o ensaio mostrou um risco real de viés: o lado nas
+  leu o próprio `CLAUDE.md` do worktree (que é, afinal, uma cópia de
+  trabalho do repositório do nas) e parou antes de terminar, "esperando
+  revisão" — um comportamento que mediria estilo de parada entre os
+  lados, não a tarefa em si, se um lado parasse mais cedo que o outro
+  por esse motivo. O aviso não dispensa a verificação objetiva de cada
+  tarefa (`bench/verificar.py`) nem muda a política de permissões
+  acima — só deixa explícito que, nesta execução, parar pra pedir
+  aprovação não é uma opção válida.
 - **Coleta automatizada**: `claude -p --output-format stream-json`
   (transcrição completa) — nunca transcrita à mão.
 - **"Tokens no total"** (critério de decisão, abaixo) = tokens de
