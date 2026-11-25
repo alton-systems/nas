@@ -710,6 +710,221 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    // --- ADR 0008 (modo de revisão): snapshots da tela ---
+
+    /// Monta um projeto com um checkpoint automático de sessão de IA
+    /// (`before`) e o conteúdo atual em disco (`after`), um por
+    /// arquivo em `files` — sem abrir a revisão ainda (quem chama
+    /// decide `Ctrl+t v`/`Ctrl+t V`).
+    fn setup_review_project(
+        files: &[(&str, &str, &str)],
+    ) -> (tempfile::TempDir, tempfile::TempDir, App) {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+
+        let project =
+            nas_history::ProjectId::discover(project_dir.path()).expect("descobrir projeto");
+        let history_dir = project
+            .ensure_history_dir(state_home.path())
+            .expect("criar pasta de histórico");
+        let journal = nas_history::Journal::open(&history_dir).expect("abrir journal");
+        app.attach_history(std::sync::Arc::new(std::sync::Mutex::new(Some(journal))));
+        app.attach_project(project, state_home.path().to_path_buf());
+
+        let mut checkpoint_files = Vec::new();
+        for (name, before, _) in files {
+            let path = project_dir.path().join(name);
+            std::fs::write(&path, before).expect("escrever antes");
+            checkpoint_files.push((
+                path.to_string_lossy().into_owned(),
+                before.as_bytes().to_vec(),
+            ));
+        }
+        let author = nas_history::Author::Ai {
+            agent: "claude-code".to_string(),
+            session: "sessao-1".to_string(),
+        };
+        nas_history::create_checkpoint(
+            &history_dir,
+            "antes da sessão de claude-code (teste)",
+            author,
+            100,
+            true,
+            &checkpoint_files,
+        )
+        .expect("criar checkpoint");
+        for (name, _, after) in files {
+            std::fs::write(project_dir.path().join(name), after).expect("escrever depois");
+        }
+
+        (project_dir, state_home, app)
+    }
+
+    /// O caminho do projeto é um diretório temporário, com um nome
+    /// aleatório a cada execução — sem normalizar, o snapshot nunca
+    /// seria estável entre rodadas. Troca o caminho de verdade por um
+    /// fixo, só pra exibição no snapshot.
+    fn normalize_project_path(rendered: String, project: &tempfile::TempDir) -> String {
+        rendered.replace(project.path().to_str().expect("caminho utf-8"), "/projeto")
+    }
+
+    #[test]
+    fn tela_de_revisao_com_dois_arquivos_e_varios_trechos() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (project, _state, mut app) = setup_review_project(&[
+            (
+                "a.txt",
+                "um\ndois\ntres\nquatro\ncinco\n",
+                "um\nDOIS\ntres\nquatro\nCINCO\n",
+            ),
+            ("b.txt", "b original\n", "b editado pela ia\n"),
+        ]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+
+        let rendered = normalize_project_path(render_to_string(&mut app, 80, 24), &project);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_de_revisao_com_trecho_misto() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (project, state, mut app) = setup_review_project(&[(
+            "a.txt",
+            "linha1\nlinha2\nlinha3\n",
+            "linha1\nlinha2\nlinha3\n",
+        )]);
+        let path = project.path().join("a.txt");
+
+        // A sessão de IA edita o arquivo via o registro de comandos de
+        // verdade — mesmo caminho que journala com Author::Ai.
+        let history_dir = {
+            let proj = nas_history::ProjectId::discover(project.path()).unwrap();
+            proj.ensure_history_dir(state.path()).unwrap()
+        };
+        let mut registry = nas_commands::Registry::new();
+        nas_commands::register_all(&mut registry);
+        let journal = nas_history::Journal::open(&history_dir).unwrap();
+        let mut workspace = nas_commands::Workspace::new(project.path())
+            .with_history_dir(history_dir.clone())
+            .with_journal(journal);
+        let mut ctx = nas_commands::CommandContext {
+            workspace: &mut workspace,
+            author: nas_history::Author::Ai {
+                agent: "claude-code".to_string(),
+                session: "sessao-1".to_string(),
+            },
+            approved_effects: [nas_commands::Effect::WriteFile].into_iter().collect(),
+            warnings: Vec::new(),
+        };
+        let path_str = path.to_string_lossy().into_owned();
+        registry
+            .run(
+                "open_file",
+                &mut ctx,
+                serde_json::json!({ "path": path_str }),
+            )
+            .unwrap();
+        registry
+            .run(
+                "edit",
+                &mut ctx,
+                serde_json::json!({ "path": path_str, "old_text": "linha2", "new_text": "LINHA2" }),
+            )
+            .unwrap();
+        registry
+            .run(
+                "save_file",
+                &mut ctx,
+                serde_json::json!({ "path": path_str }),
+            )
+            .unwrap();
+
+        // O usuário edita por cima, na mesma linha.
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        for c in path.to_str().unwrap().chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.document_mut().goto_line(2);
+        app.document_mut().move_to_line_end();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // Visual -> Insert
+        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::ALT)); // Insert -> Visual
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.flush_history();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+
+        let rendered = normalize_project_path(render_to_string(&mut app, 80, 20), &project);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn tela_de_revisao_com_trecho_ja_aceito() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (project, _state, mut app) =
+            setup_review_project(&[("a.txt", "antes\n", "depois da ia\n")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        // "h k" leva ao único trecho.
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // aceita
+
+        let rendered = normalize_project_path(render_to_string(&mut app, 80, 20), &project);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn echo_area_da_revisao_e_persistente_mesmo_sem_nada_pendente() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (project, _state, mut app) =
+            setup_review_project(&[("a.txt", "antes\n", "depois da ia\n")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+
+        let rendered = normalize_project_path(render_to_string(&mut app, 80, 14), &project);
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn lista_do_ctrl_t_v_mostra_os_checkpoints_selecionaveis() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (project, state, mut app) =
+            setup_review_project(&[("a.txt", "antes\n", "depois da ia\n")]);
+
+        // Um segundo checkpoint, nomeado pelo usuário, pra ter mais de
+        // uma opção na lista.
+        let proj = nas_history::ProjectId::discover(project.path()).unwrap();
+        let history_dir = proj.ensure_history_dir(state.path()).unwrap();
+        nas_history::create_checkpoint(
+            &history_dir,
+            "marco manual",
+            nas_history::Author::User,
+            200,
+            false,
+            &[],
+        )
+        .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+
+        let rendered = render_to_string(&mut app, 80, 10);
+        insta::assert_snapshot!(rendered);
+    }
+
     #[test]
     fn tela_com_mensagem_longa_cortada() {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

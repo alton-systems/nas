@@ -1,0 +1,28 @@
+---
+source: crates/nas-term/src/ui.rs
+expression: rendered
+---
+ 1 Revisão — 2 arquivo(s), 3 trecho(s), 0 já revisado(s)                        
+ 2                                                                              
+ 3 === /projeto/a.txt ===                                                
+ 4 /projeto/a.txt:2  autoria desconhecida                                
+ 5 -dois                                                                        
+ 6 +DOIS                                                                        
+ 7 /projeto/a.txt:5  autoria desconhecida                                
+ 8 -cinco                                                                       
+ 9 +CINCO                                                                       
+10                                                                              
+11 === /projeto/b.txt ===                                                
+12 /projeto/b.txt:1  autoria desconhecida                                
+13 -b original                                                                  
+14 +b editado pela ia                                                           
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+[Revisão] [sem nome] [+]                                                     1:1
+  revisão                                                                       
+H arquivo             RET aceitar o trecho  h trecho                            
+u rejeitar o trecho                                                             
+g h ir até lá  ·  Esc sair da revisão

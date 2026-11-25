@@ -1013,7 +1013,7 @@ impl App {
     /// (Ctrl+Q), fechar um buffer (Ctrl+K) e salvar (Ctrl+S). Um
     /// pânico também força o flush, via o mesmo `Arc` compartilhado
     /// com o panic hook de `main.rs`.
-    fn flush_history(&mut self) {
+    pub(crate) fn flush_history(&mut self) {
         if let Ok(mut guard) = self.history.lock()
             && let Some(journal) = guard.as_mut()
         {

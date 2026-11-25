@@ -1,0 +1,7 @@
+---
+source: crates/nas-term/src/ui.rs
+expression: rendered
+---
+Revisar — escolha um checkpoint  »  ↑/↓ escolhe, Enter confirma, Esc cancela    
+1970-01-01 00:03:20  marco manual (nomeado, você, 0 arquivo(s))                 
+1970-01-01 00:01:40  antes da sessão de claude-code (teste) (automático, IA (cla
