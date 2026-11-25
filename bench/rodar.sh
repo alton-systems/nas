@@ -2,53 +2,55 @@
 # Roda uma rodada do benchmark comparativo (ADR 0006 §7, etapa 3f).
 #
 # Uso:
-#   bench/rodar.sh <tarefa> <lado> <rodada>
+#   bench/rodar.sh <tarefa> <cenario> <rodada>
 #
 #   tarefa  — "01".."05" (o prefixo do arquivo em bench/tarefas/)
-#   lado    — "normal" (ferramentas próprias do Claude Code) ou
-#             "nas" (só as ferramentas do nas-mcp, Read/Edit/Write/
-#             MultiEdit/NotebookEdit desligadas)
+#   cenario — "A" (normal: ferramentas do Claude Code, sem nas),
+#             "B" (nas obrigatório: Read/Edit/Write/MultiEdit/
+#             NotebookEdit desligadas, só as ferramentas do nas-mcp) ou
+#             "C" (híbrido: ferramentas do Claude Code ligadas, e as do
+#             nas-mcp disponíveis também via MCP, sem obrigar nenhuma)
 #   rodada  — um número (1, 2, 3, ...) ou "ensaio" (pra validar o
 #             script sem contar no resultado — ADR 0006 §7, passo 1
 #             da etapa 3f-prep)
 #
 # Variáveis de ambiente:
-#   BENCH_MODEL           modelo fixo nos dois lados (default: claude-sonnet-5)
+#   BENCH_MODEL           modelo fixo nos três cenários (default: claude-sonnet-5)
 #   BENCH_COMMIT          commit de partida (default: 3bfc9bb — o topo
 #                         da main quando as tarefas foram escolhidas)
 #   BENCH_WORKTREES_DIR   onde criar os worktrees efêmeros (default:
 #                         /tmp/nas-bench-worktrees — fora do próprio
 #                         repositório, nunca commitados)
 #   BENCH_NAS_BIN         caminho do binário `nas` já compilado, usado
-#                         como servidor MCP no lado "nas" — construído
-#                         UMA VEZ a partir de BENCH_COMMIT (ver
-#                         `bench/build-nas.sh`), não a cada rodada: é a
-#                         versão fixa do nas sendo testada, igual pra
-#                         toda rodada de todo lado "nas". Obrigatório
-#                         se lado == nas.
+#                         como servidor MCP nos cenários B/C —
+#                         construído UMA VEZ a partir de BENCH_COMMIT
+#                         (ver `bench/build-nas.sh`), não a cada
+#                         rodada: é a versão fixa do nas sendo testada,
+#                         igual pra toda rodada de todo cenário que usa
+#                         nas. Obrigatório se cenário == B ou C.
 #
 # Cada rodada:
 #   1. cria um worktree Git limpo em BENCH_COMMIT;
-#   2. no lado "nas", grava permissions.toml (bench/permissoes-benchmark.toml)
-#      no diretório de estado daquele worktree, e monta um
-#      --mcp-config apontando pra BENCH_NAS_BIN;
+#   2. nos cenários B/C, grava permissions.toml
+#      (bench/permissoes-benchmark.toml) no diretório de estado daquele
+#      worktree, e monta um --mcp-config apontando pra BENCH_NAS_BIN;
 #   3. chama `claude -p` com o texto de bench/tarefas/<tarefa>-*.md,
 #      --output-format stream-json (transcrição completa) e
 #      --model fixo;
 #   4. salva a transcrição e o resumo em
-#      bench/resultados/<tarefa>/<lado>/<rodada>/;
+#      bench/resultados/<tarefa>/<cenario>/<rodada>/;
 #   5. roda `cargo test --workspace` + a verificação específica da
 #      tarefa dentro do worktree, grava o resultado em verification.json;
 #   6. remove o worktree (o resultado já foi copiado pra fora dele).
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-    echo "uso: $0 <tarefa 01-05> <lado normal|nas> <rodada N|ensaio>" >&2
+    echo "uso: $0 <tarefa 01-05> <cenario A|B|C> <rodada N|ensaio>" >&2
     exit 1
 fi
 
 TAREFA="$1"
-LADO="$2"
+CENARIO="$2"
 RODADA="$3"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,8 +58,8 @@ BENCH_MODEL="${BENCH_MODEL:-claude-sonnet-5}"
 BENCH_COMMIT="${BENCH_COMMIT:-3bfc9bb}"
 BENCH_WORKTREES_DIR="${BENCH_WORKTREES_DIR:-/tmp/nas-bench-worktrees}"
 
-if [[ "$LADO" != "normal" && "$LADO" != "nas" ]]; then
-    echo "lado inválido: $LADO (use 'normal' ou 'nas')" >&2
+if [[ "$CENARIO" != "A" && "$CENARIO" != "B" && "$CENARIO" != "C" ]]; then
+    echo "cenário inválido: $CENARIO (use 'A', 'B' ou 'C')" >&2
     exit 1
 fi
 
@@ -67,15 +69,15 @@ if [[ -z "$TAREFA_ARQUIVO" ]]; then
     exit 1
 fi
 
-if [[ "$LADO" == "nas" && -z "${BENCH_NAS_BIN:-}" ]]; then
+if [[ ("$CENARIO" == "B" || "$CENARIO" == "C") && -z "${BENCH_NAS_BIN:-}" ]]; then
     echo "BENCH_NAS_BIN precisa apontar pro binário nas já compilado (ver bench/build-nas.sh)" >&2
     exit 1
 fi
 
-RESULT_DIR="$REPO_ROOT/bench/resultados/$TAREFA/$LADO/$RODADA"
+RESULT_DIR="$REPO_ROOT/bench/resultados/$TAREFA/$CENARIO/$RODADA"
 mkdir -p "$RESULT_DIR"
 
-WORKTREE="$BENCH_WORKTREES_DIR/$TAREFA-$LADO-$RODADA-$$"
+WORKTREE="$BENCH_WORKTREES_DIR/$TAREFA-$CENARIO-$RODADA-$$"
 mkdir -p "$BENCH_WORKTREES_DIR"
 git -C "$REPO_ROOT" worktree add -q --detach "$WORKTREE" "$BENCH_COMMIT"
 cleanup() {
@@ -93,15 +95,15 @@ awk '
     capturando { print }
 ' "$TAREFA_ARQUIVO" | sed -E 's/^> ?//' | sed '/^\s*$/N;/\n\s*$/D' > "$PROMPT_FILE"
 
-echo "== tarefa $TAREFA, lado $LADO, rodada $RODADA ==" >&2
+echo "== tarefa $TAREFA, cenário $CENARIO, rodada $RODADA ==" >&2
 echo "worktree: $WORKTREE" >&2
 
-# Aviso igual nos dois lados (pedido explícito, registrado em
+# Aviso igual nos três cenários (pedido explícito, registrado em
 # docs/benchmark-fase3.md §4): numa rodada automatizada não há
-# ninguém pra aprovar nada no meio do caminho — sem isto, um lado
-# pode parar mais cedo "esperando revisão" (como o lado nas fez no
-# ensaio, por ter lido o CLAUDE.md do próprio worktree) e o outro não,
-# o que mediria estilo de parada, não a tarefa em si.
+# ninguém pra aprovar nada no meio do caminho — sem isto, um cenário
+# pode parar mais cedo "esperando revisão" (como B fez no ensaio, por
+# ter lido o CLAUDE.md do próprio worktree) e outro não, o que
+# mediria estilo de parada, não a tarefa em si.
 AVISO_BENCHMARK="Execução automatizada de benchmark: não há ninguém para aprovar. Conclua a tarefa por completo, sem pedir confirmação. Não faça commit nem push."
 
 COMMON_ARGS=(
@@ -113,15 +115,15 @@ COMMON_ARGS=(
     --append-system-prompt "$AVISO_BENCHMARK"
 )
 
-# Shell liberado igual nos dois lados: só cargo e git (ADR 0006 §7 —
-# "mesmas permissões nos dois lados, documentadas"). As variantes
-# "rtk cargo"/"rtk git" cobrem o hook local de RTK (proxy de
-# ferramenta deste usuário, ~/.claude/RTK.md), que pode reescrever um
-# comando por baixo antes da checagem de permissão chegar a vê-lo —
-# sem as duas formas, uma rodada poderia travar numa aprovação de
-# shell por causa de um hook que nada tem a ver com nas vs. normal.
-# Afeta os dois lados igualmente (mesma configuração de usuário), por
-# isso não é tratado como viés entre os lados — só registrado aqui.
+# Shell liberado igual nos três cenários: só cargo e git (ADR 0006
+# §7 — "mesmas permissões nos dois lados, documentadas", mantida nos
+# três). As variantes "rtk cargo"/"rtk git" cobrem o hook local de RTK
+# (proxy de ferramenta deste usuário, ~/.claude/RTK.md), que pode
+# reescrever um comando por baixo antes da checagem de permissão
+# chegar a vê-lo — sem as duas formas, uma rodada poderia travar numa
+# aprovação de shell por causa de um hook que nada tem a ver com o
+# cenário. Afeta os três igualmente (mesma configuração de usuário),
+# por isso não é tratado como viés entre eles — só registrado aqui.
 SHELL_ALLOW=(
     "Bash(cargo *)" "Bash(rtk cargo *)"
     "Bash(git *)" "Bash(rtk git *)"
@@ -131,15 +133,10 @@ SHELL_ALLOW=(
 TRANSCRIPT="$RESULT_DIR/transcript.jsonl"
 START_TS=$(date +%s)
 
-if [[ "$LADO" == "normal" ]]; then
-    (
-        cd "$WORKTREE"
-        claude -p "$(cat "$PROMPT_FILE")" \
-            "${COMMON_ARGS[@]}" \
-            --permission-mode acceptEdits \
-            --allowedTools "Read" "Edit" "Write" "MultiEdit" "${SHELL_ALLOW[@]}"
-    ) > "$TRANSCRIPT"
-else
+setup_nas_mcp() {
+    # Compartilhado por B e C: monta o --mcp-config apontando pro
+    # binário fixo e grava a política de permissões do benchmark no
+    # worktree desta rodada. Preenche $MCP_CONFIG como efeito lateral.
     MCP_CONFIG="$RESULT_DIR/mcp-config.json"
     python3 -c "
 import json, sys
@@ -152,16 +149,52 @@ json.dump({'mcpServers': {'nas': {'command': sys.argv[1], 'args': ['--mcp']}}}, 
     # modelo "tudo negado" pela política do benchmark.
     PERMISSIONS_PATH="$(cd "$WORKTREE" && "$BENCH_NAS_BIN" --permissions | sed -n 's/^Arquivo de política: //p')"
     cp "$REPO_ROOT/bench/permissoes-benchmark.toml" "$PERMISSIONS_PATH"
+}
 
+case "$CENARIO" in
+A)
     (
         cd "$WORKTREE"
         claude -p "$(cat "$PROMPT_FILE")" \
+            "${COMMON_ARGS[@]}" \
+            --permission-mode acceptEdits \
+            --allowedTools "Read" "Edit" "Write" "MultiEdit" "${SHELL_ALLOW[@]}"
+    ) > "$TRANSCRIPT"
+    ;;
+B)
+    setup_nas_mcp
+    (
+        cd "$WORKTREE"
+        # ENABLE_TOOL_SEARCH=false: carrega o esquema das ferramentas
+        # mcp__nas__* já no início da sessão, em vez de o modelo
+        # precisar descobri-las com ToolSearch antes da primeira
+        # chamada (achado do ensaio — item 1c da revisão pós-
+        # benchmark; https://code.claude.com/docs/en/mcp.md, "Disabling
+        # Tool Search"). Só muda quando o esquema chega, não qual
+        # ferramenta é permitida — a política de --allowedTools abaixo
+        # continua a mesma.
+        ENABLE_TOOL_SEARCH=false claude -p "$(cat "$PROMPT_FILE")" \
             "${COMMON_ARGS[@]}" \
             --mcp-config "$MCP_CONFIG" \
             --disallowedTools "Read" "Edit" "Write" "MultiEdit" "NotebookEdit" \
             --allowedTools "mcp__nas__*" "${SHELL_ALLOW[@]}"
     ) > "$TRANSCRIPT"
-fi
+    ;;
+C)
+    setup_nas_mcp
+    (
+        cd "$WORKTREE"
+        # Híbrido: nada desligado — Read/Edit/Write/MultiEdit do
+        # Claude Code E as ferramentas mcp__nas__* disponíveis ao
+        # mesmo tempo, à escolha do próprio modelo.
+        ENABLE_TOOL_SEARCH=false claude -p "$(cat "$PROMPT_FILE")" \
+            "${COMMON_ARGS[@]}" \
+            --mcp-config "$MCP_CONFIG" \
+            --permission-mode acceptEdits \
+            --allowedTools "Read" "Edit" "Write" "MultiEdit" "mcp__nas__*" "${SHELL_ALLOW[@]}"
+    ) > "$TRANSCRIPT"
+    ;;
+esac
 
 END_TS=$(date +%s)
 DURATION=$((END_TS - START_TS))
@@ -175,7 +208,7 @@ python3 "$REPO_ROOT/bench/verificar.py" "$TAREFA" "$WORKTREE" "$DURATION" > "$RE
 cat <<EOF > "$RESULT_DIR/meta.json"
 {
   "tarefa": "$TAREFA",
-  "lado": "$LADO",
+  "cenario": "$CENARIO",
   "rodada": "$RODADA",
   "modelo": "$BENCH_MODEL",
   "commit_de_partida": "$BENCH_COMMIT",

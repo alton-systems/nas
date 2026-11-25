@@ -2,11 +2,13 @@
 
 Registro do teste comparativo descrito em
 `docs/decisions/0006-ia-trabalha-pelo-nas.md` §7. Este documento é
-preparado na etapa **3f-prep, PASSO 1** — a bateria completa (trinta
-rodadas) ainda **não foi rodada**; o que existe até aqui é a
-metodologia fixada de antemão (este documento), as cinco tarefas
-(`bench/tarefas/`), os scripts (`bench/rodar.sh`, `bench/verificar.py`,
-`bench/resumir`) e um ensaio de validação (§5).
+preparado na etapa **3f-prep** — a bateria completa (tamanho a
+decidir depois da bateria reduzida, §6/§8) ainda **não foi rodada**; o
+que existe até aqui é a metodologia fixada de antemão (este
+documento), as cinco tarefas (`bench/tarefas/`), os scripts
+(`bench/rodar.sh`, `bench/verificar.py`, `bench/resumir`), um ensaio
+de validação com dois cenários (§5) e a bateria reduzida, exploratória,
+com os três cenários atuais (§7).
 
 ## 1. Ressalva da etapa 3c (ler antes dos números)
 
@@ -21,22 +23,33 @@ lida como um problema da integração MCP em si.
 
 ## 2. O que está sendo comparado
 
-**nas vs. o Claude Code no seu modo normal** — com as próprias
-ferramentas de ler, editar e buscar, além do shell — não "nas vs. só
-shell". A pergunta é se `nas-mcp` (leitura com números de linha,
-`edit` por texto exato, checkpoint automático de sessão) melhora sobre
-o que o Claude Code já faz por conta própria.
+**Revisão pós-ensaio: três cenários, não dois.** O ensaio (§5) só
+comparou "nas obrigatório" contra "normal" — essa comparação continua
+(cenário B × cenário A, abaixo), mas não responde se vale mais a pena
+**obrigar** o uso do nas ou só **oferecê-lo** ao lado das ferramentas
+que o Claude Code já tem. Cenário C existe pra essa segunda pergunta.
 
-- **Lado "normal"**: `Read`, `Edit`, `Write`, `MultiEdit` do Claude
-  Code ligadas; shell liberado só para `cargo` e `git`.
-- **Lado "nas"**: `Read`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`
-  do Claude Code **desligadas** (`--disallowedTools`); `nas --mcp`
-  registrado como único servidor MCP da sessão
+- **A (normal)**: `Read`, `Edit`, `Write`, `MultiEdit` do Claude Code
+  ligadas; shell liberado só para `cargo` e `git`. Nenhum servidor MCP
+  do nas.
+- **B (nas obrigatório)**: `Read`, `Edit`, `Write`, `MultiEdit`,
+  `NotebookEdit` do Claude Code **desligadas** (`--disallowedTools`);
+  `nas --mcp` registrado como único servidor MCP da sessão
   (`--mcp-config`/`--strict-mcp-config`); shell liberado só para
-  `cargo` e `git`, igual ao outro lado.
+  `cargo` e `git`, igual aos outros dois cenários. A única forma de
+  tocar um arquivo é pelas ferramentas do `nas-mcp`.
+- **C (híbrido)**: nada desligado — `Read`/`Edit`/`Write`/`MultiEdit`
+  do Claude Code ligadas **e** as ferramentas `mcp__nas__*` também
+  disponíveis ao mesmo tempo, via MCP; o modelo escolhe livremente
+  qual usar pra cada parte da tarefa. Mesmo shell (`cargo`/`git`) dos
+  outros dois.
 
-Mesmo modelo, mesma versão do modelo, nos dois lados — fixado abaixo
-(§4).
+A pergunta de B é "vale a pena **forçar** o nas-mcp?"; a de C é "vale
+a pena **oferecer** o nas-mcp, deixando a escolha pro modelo?" — duas
+perguntas diferentes, com critérios de decisão diferentes (§6).
+
+Mesmo modelo, mesma versão do modelo, nos três cenários — fixado
+abaixo (§4).
 
 ## 3. Tarefas
 
@@ -51,42 +64,55 @@ em `3bfc9bb` (`main`), descritas em `bench/tarefas/`:
 | 04 | extrair uma pequena duplicação | `bench/tarefas/04-extrair-tracked-files.md` |
 | 05 | explicar o que uma função faz (critério escrito antes de rodar) | `bench/tarefas/05-explicar-line-number-for-offset.md` |
 
-Cada arquivo de tarefa tem o texto exato do pedido (idêntico nos dois
-lados), o commit de partida, a verificação objetiva e por que a tarefa
-é representativa do trabalho real do projeto.
+Cada arquivo de tarefa tem o texto exato do pedido (idêntico nos três
+cenários), o commit de partida, a verificação objetiva e por que a
+tarefa é representativa do trabalho real do projeto.
 
-Cada tarefa roda três vezes em cada lado (seis rodadas por tarefa) —
-mesmo texto de prompt nas seis — em ordem alternada (lado A, lado B,
-lado A, ... tarefa a tarefa), pra não deixar aquecimento de contexto
-ou ordem de execução favorecer um lado só por ter rodado primeiro ou
-por último.
+**Bateria completa** (quando os cenários da bateria reduzida, §7,
+mostrarem que vale a pena): cada tarefa roda três vezes em cada
+cenário que seguir adiante — em ordem alternada entre cenários, tarefa
+a tarefa (A, B, C, A, B, C, ... ou só os que sobrarem da decisão),
+pra não deixar aquecimento de contexto ou ordem de execução favorecer
+um cenário só por ter rodado primeiro ou por último. O número de
+rodadas da bateria completa depende de quantos cenários restarem
+depois da reduzida — não é fixado aqui de antemão.
 
 ## 4. Condições fixadas antes de rodar
 
-- **Modelo**: `claude-sonnet-5`, mesma versão nos dois lados — fixado
-  em `BENCH_MODEL` (`bench/rodar.sh`); qualquer mudança de modelo
-  precisa ser uma decisão explícita, registrada aqui antes de rodar de
-  novo.
+- **Modelo**: `claude-sonnet-5`, mesma versão nos três cenários —
+  fixado em `BENCH_MODEL` (`bench/rodar.sh`); qualquer mudança de
+  modelo precisa ser uma decisão explícita, registrada aqui antes de
+  rodar de novo.
 - **Commit de partida**: `3bfc9bb` (topo da `main` quando as tarefas
   foram escolhidas) — fixado em `BENCH_COMMIT`.
 - **Binário `nas`**: compilado **uma única vez**, a partir do mesmo
   commit de partida (`bench/build-nas.sh`), e reaproveitado como
-  servidor MCP fixo em toda rodada do lado "nas" — nunca recompilado
-  por rodada. É a versão do nas sendo testada; o worktree de cada
-  rodada é só o alvo da edição (que, neste benchmark, é o próprio
-  código-fonte do nas — a IA usa o nas pra editar o nas).
-- **Shell**: `cargo` e `git` liberados nos dois lados, documentado em
-  `bench/rodar.sh` (`SHELL_ALLOW`); nenhuma tarefa precisa de rede.
+  servidor MCP fixo em toda rodada dos cenários B/C — nunca
+  recompilado por rodada. É a versão do nas sendo testada; o worktree
+  de cada rodada é só o alvo da edição (que, neste benchmark, é o
+  próprio código-fonte do nas — a IA usa o nas pra editar o nas).
+- **Shell**: `cargo` e `git` liberados nos três cenários, documentado
+  em `bench/rodar.sh` (`SHELL_ALLOW`); nenhuma tarefa precisa de rede.
   Variantes prefixadas por `rtk` também liberadas — um hook local
   deste usuário (`~/.claude/RTK.md`) pode reescrever um comando antes
-  da checagem de permissão vê-lo; afeta os dois lados igualmente, não
-  é um viés entre eles.
-- **Política de permissões do lado nas** (ADR 0006 §5):
+  da checagem de permissão vê-lo; afeta os três cenários igualmente,
+  não é um viés entre eles.
+- **Política de permissões dos cenários B/C** (ADR 0006 §5):
   `bench/permissoes-benchmark.toml` — libera exatamente
   `write-file = true` (as cinco tarefas são edição de código; nenhuma
   chama shell nem rede a partir de uma ferramenta do nas), copiada
   pro `permissions.toml` de cada worktree antes da rodada.
-- **Aviso de execução não assistida, igual nos dois lados**
+- **`ENABLE_TOOL_SEARCH=false` nos cenários B/C** (revisão pós-
+  benchmark, item 1c): sem isto, o modelo precisa descobrir o esquema
+  das ferramentas `mcp__nas__*` chamando `ToolSearch` antes de usá-las
+  — um custo de turnos extras só do lado que usa MCP, medido no
+  ensaio. Com a variável desativando a descoberta sob demanda, o
+  esquema é carregado de uma vez no início da sessão (documentado em
+  <https://code.claude.com/docs/en/mcp.md>, "Disabling Tool Search") —
+  só muda **quando** o esquema chega, nunca **quais** ferramentas
+  estão liberadas (`--allowedTools` continua decidindo isso). Não
+  aplicado no cenário A, que não tem nenhum servidor MCP configurado.
+- **Aviso de execução não assistida, igual nos três cenários**
   (`--append-system-prompt` em `bench/rodar.sh`): *"Execução
   automatizada de benchmark: não há ninguém para aprovar. Conclua a
   tarefa por completo, sem pedir confirmação. Não faça commit nem
@@ -107,11 +133,16 @@ por último.
   dólares (`total_cost_usd`, já devolvido por `claude -p`) é métrica
   complementar, ao lado, não parte do critério de tokens.
 
-## 5. Ensaio (validação do script — não entra no resultado)
+## 5. Ensaio (validação do script — não entra em nenhum resultado)
+
+**Nota de terminologia**: este ensaio rodou antes da revisão pós-
+benchmark que introduziu o cenário C (§2) — "lado normal"/"lado nas"
+abaixo correspondem aos cenários **A** e **B** de hoje, não a um
+terceiro rótulo.
 
 Rodado em 2026-11-25: tarefa 01, uma vez em cada lado, modelo
-`claude-sonnet-5`, commit de partida `3bfc9bb`. **Não entra no
-resultado** (§7) — serve só pra validar o script, a coleta e a
+`claude-sonnet-5`, commit de partida `3bfc9bb`. **Não entra em nenhum
+resultado** (§7/§8) — serve só pra validar o script, a coleta e a
 verificação antes de rodar a bateria completa (trinta rodadas).
 
 | tarefa | lado | tok. entrada | tok. criação cache | tok. leitura cache | tok. saída | **tok. total** | custo (US$) | chamadas | tempo (s) | sucesso |
@@ -165,24 +196,51 @@ previsão fina.
 
 ## 6. Critério de decisão (fixado antes de rodar)
 
-- **Taxa de sucesso** do lado nas igual ou maior que a do lado sem
-  nas (contando as três rodadas de cada tarefa).
-- **No máximo 25% a mais de tokens no total** (§4) do lado nas,
-  somadas as três rodadas de cada tarefa, comparado ao lado sem nas.
+Dois critérios, um por comparação (§2) — **fixados antes de qualquer
+rodada real, pra não racionalizar o resultado depois de ver os
+números**. Os dois usam "tokens no total" na mesma definição do §4
+(entrada + criação de cache + leitura de cache + saída, somados) e
+"taxa de sucesso" na mesma definição do §3/`bench/verificar.py`.
 
-Passou nos dois: o nas segue como editor, a fase 3 continua pelas
-etapas seguintes (ADR 0006 §8). Falhou em qualquer um dos dois: pivô —
-o nas deixa de perseguir ser um editor de propósito geral competitivo
-em eficiência de edição, e passa a focar em histórico e supervisão
-sobre o que a IA já faz direto, em vez de MCP de edição.
+- **B × A** (vale a pena **obrigar** o nas-mcp?): taxa de sucesso de B
+  igual ou maior que a de A, **e** no máximo **25%** a mais de tokens
+  no total em B, somadas as rodadas de cada tarefa, comparado a A.
+  Este é o critério original, já usado para avaliar o ensaio (§5).
+- **C × A** (vale a pena **oferecer** o nas-mcp, sem obrigar?): taxa
+  de sucesso de C igual ou maior que a de A, **e** no máximo **10%** a
+  mais de tokens no total em C, comparado a A — uma barra mais
+  apertada que a de B×A, porque C tem a opção de nunca usar o nas-mcp
+  quando ele não ajudar; um C que custe quase tanto quanto B sem
+  precisar usar o nas-mcp (e o quadro de uso em §7 mostrar isso) seria
+  sinal de que oferecer a ferramenta, por si só, não está valendo a
+  diferença de custo.
 
-## 7. Resultado
+**A bateria reduzida (§7) é exploratória — não decide nada por si
+só.** Ela roda só uma vez por cenário, por tarefa (quinze rodadas no
+total), pra ver a direção dos números e se faz sentido seguir com os
+três cenários, só dois, ou nenhum, antes de pagar o custo da bateria
+completa (três rodadas por cenário que seguir adiante). A decisão de
+verdade — se o nas segue como editor (ADR 0006 §8), se vira "nas
+opcional" (nem B nem C valem o custo de obrigar, mas C ainda ajuda
+quando escolhido), ou se pivota pra histórico/supervisão (nenhum dos
+dois criterios passa em nenhum cenário) — usa a bateria completa, não
+a reduzida.
 
-*(preenchido depois da bateria completa — trinta rodadas, cinco
-tarefas × dois lados × três rodadas — com `bench/resumir`. Vazio até
-lá.)*
+## 7. Bateria reduzida (exploratória)
 
-## 8. Integridade e rastreabilidade
+*(preenchida depois de rodar — cinco tarefas × três cenários × uma
+rodada = quinze rodadas, ordem alternada entre cenários tarefa a
+tarefa, com `bench/resumir --reduzida`. Vazia até lá. O ensaio da §5
+não entra aqui — é uma amostra solta, de antes da revisão de três
+cenários, só pra validar o script.)*
+
+## 8. Resultado (bateria completa)
+
+*(preenchido depois da bateria completa, cujo tamanho depende da
+decisão tomada com a bateria reduzida (§6/§7) — com `bench/resumir`.
+Vazio até lá.)*
+
+## 9. Integridade e rastreabilidade
 
 *(quadro separado — o lado sem nas não tem o recurso equivalente,
 então não é uma comparação simétrica como a de tokens/custo/tempo;

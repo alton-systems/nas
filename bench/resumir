@@ -4,7 +4,8 @@
 
 Uso:
     bench/resumir                  # imprime a tabela em Markdown (stdout)
-    bench/resumir --ensaio         # só a(s) rodada "ensaio", rotulado
+    bench/resumir --reduzida       # só a bateria reduzida (exploratória)
+    bench/resumir --ensaio         # só o ensaio antigo (não entra em nenhum resultado)
     bench/resumir --json           # a mesma agregação, em JSON crú
 
 "tokens no total" = entrada + criação de cache + leitura de cache +
@@ -15,6 +16,7 @@ qualquer rodada real — ADR 0006 §7).
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,13 +43,21 @@ def carregar_rodada(dir_rodada: Path):
     saida = usage.get("output_tokens", 0)
     total = entrada + cache_criacao + cache_leitura + saida
 
-    chamadas_ferramenta = contar_chamadas_ferramenta(dir_rodada / "transcript.jsonl")
-    retrabalho = contar_retrabalho(dir_rodada / "transcript.jsonl")
-    edicoes_shell = contar_edicoes_via_shell(dir_rodada / "transcript.jsonl")
+    transcript_path = dir_rodada / "transcript.jsonl"
+    chamadas_ferramenta = contar_chamadas_ferramenta(transcript_path)
+    retrabalho = contar_retrabalho(transcript_path)
+    edicoes_shell = contar_edicoes_via_shell(transcript_path)
+    uso_nas = contar_uso_nas(transcript_path)
+
+    # "cenario" é o rótulo atual (A/B/C); "lado" é o nome antigo
+    # (normal/nas) usado só pelo ensaio de validação do script, antes
+    # da revisão de três cenários — mantido como fallback de leitura,
+    # nunca escrito de novo.
+    cenario = meta.get("cenario") or meta.get("lado") or dir_rodada.parent.name
 
     return {
         "tarefa": meta.get("tarefa", dir_rodada.parent.parent.name),
-        "lado": meta.get("lado", dir_rodada.parent.name),
+        "cenario": cenario,
         "rodada": meta.get("rodada", dir_rodada.name),
         "tokens_entrada": entrada,
         "tokens_cache_criacao": cache_criacao,
@@ -60,6 +70,7 @@ def carregar_rodada(dir_rodada: Path):
         "sucesso": verification.get("sucesso"),
         "retrabalho": retrabalho,
         "edicoes_via_shell": edicoes_shell,
+        "uso_nas": uso_nas,
     }
 
 
@@ -80,6 +91,31 @@ def contar_chamadas_ferramenta(transcript_path: Path) -> int:
             if bloco.get("type") == "tool_use":
                 total += 1
     return total
+
+
+def contar_uso_nas(transcript_path: Path) -> dict:
+    """Quantas vezes cada ferramenta `mcp__nas__*` foi chamada — só
+    tem conteúdo nos cenários B/C (A não tem o servidor MCP nem
+    configurado)."""
+    if not transcript_path.exists():
+        return {}
+    uso = Counter()
+    for linha in transcript_path.read_text().splitlines():
+        if not linha.strip():
+            continue
+        try:
+            msg = json.loads(linha)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("type") != "assistant":
+            continue
+        for bloco in msg.get("message", {}).get("content", []):
+            if bloco.get("type") != "tool_use":
+                continue
+            nome = bloco.get("name", "")
+            if nome.startswith("mcp__nas__"):
+                uso[nome.removeprefix("mcp__nas__")] += 1
+    return dict(uso)
 
 
 def contar_retrabalho(transcript_path: Path) -> int:
@@ -142,21 +178,26 @@ def contar_edicoes_via_shell(transcript_path: Path) -> int:
     return total
 
 
-def coletar(ensaio: bool):
+def coletar(filtro):
+    """`filtro`: "reduzida" (rodada numérica, cenário A/B/C),
+    "ensaio" (rodada == "ensaio", qualquer nome de cenário — inclui o
+    ensaio antigo normal/nas) ou "tudo" (sem filtro)."""
     linhas = []
     if not RESULTADOS.exists():
         return linhas
     for tarefa_dir in sorted(RESULTADOS.iterdir()):
         if not tarefa_dir.is_dir():
             continue
-        for lado_dir in sorted(tarefa_dir.iterdir()):
-            if not lado_dir.is_dir():
+        for cenario_dir in sorted(tarefa_dir.iterdir()):
+            if not cenario_dir.is_dir():
                 continue
-            for rodada_dir in sorted(lado_dir.iterdir()):
+            for rodada_dir in sorted(cenario_dir.iterdir()):
                 if not rodada_dir.is_dir():
                     continue
                 is_ensaio = rodada_dir.name == "ensaio"
-                if is_ensaio != ensaio:
+                if filtro == "reduzida" and is_ensaio:
+                    continue
+                if filtro == "ensaio" and not is_ensaio:
                     continue
                 linha = carregar_rodada(rodada_dir)
                 if linha:
@@ -167,14 +208,14 @@ def coletar(ensaio: bool):
 def imprimir_tabela(linhas, titulo):
     print(f"### {titulo}\n")
     print(
-        "| tarefa | lado | rodada | tok. entrada | tok. criação cache | "
+        "| tarefa | cenário | rodada | tok. entrada | tok. criação cache | "
         "tok. leitura cache | tok. saída | tok. total | custo (US$) | "
         "chamadas | tempo (s) | sucesso | retrabalho | edições via shell |"
     )
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for l in linhas:
         print(
-            f"| {l['tarefa']} | {l['lado']} | {l['rodada']} | "
+            f"| {l['tarefa']} | {l['cenario']} | {l['rodada']} | "
             f"{l['tokens_entrada']} | {l['tokens_cache_criacao']} | "
             f"{l['tokens_cache_leitura']} | {l['tokens_saida']} | "
             f"{l['tokens_total']} | {l['custo_usd']:.4f} | "
@@ -183,21 +224,51 @@ def imprimir_tabela(linhas, titulo):
         )
     print()
 
+    linhas_c = [l for l in linhas if l["cenario"] == "C" and l["uso_nas"]]
+    if linhas_c:
+        print("### Uso das ferramentas do nas no cenário C\n")
+        print("| tarefa | rodada | ferramenta | chamadas |")
+        print("|---|---|---|---|")
+        for l in linhas_c:
+            for ferramenta, n in sorted(l["uso_nas"].items()):
+                print(f"| {l['tarefa']} | {l['rodada']} | {ferramenta} | {n} |")
+        print()
+
+    custo_total = sum(l["custo_usd"] for l in linhas)
+    print(f"**Custo total destas {len(linhas)} rodadas: US$ {custo_total:.4f}**\n")
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ensaio", action="store_true", help="só a rodada 'ensaio'")
+    grupo = parser.add_mutually_exclusive_group()
+    grupo.add_argument(
+        "--reduzida", action="store_true", help="só a bateria reduzida (exploratória, A/B/C)"
+    )
+    grupo.add_argument(
+        "--ensaio", action="store_true", help="só o ensaio antigo (normal/nas) — não entra em nenhum resultado"
+    )
     parser.add_argument("--json", action="store_true", help="JSON crú em vez de Markdown")
     args = parser.parse_args()
 
-    linhas = coletar(ensaio=args.ensaio)
+    if args.reduzida:
+        filtro = "reduzida"
+    elif args.ensaio:
+        filtro = "ensaio"
+    else:
+        filtro = "tudo"
+
+    linhas = coletar(filtro)
 
     if args.json:
         json.dump(linhas, sys.stdout, ensure_ascii=False, indent=2)
         print()
         return
 
-    titulo = "Ensaio (não entra no resultado)" if args.ensaio else "Resultado"
+    titulo = {
+        "reduzida": "Bateria reduzida (exploratória — não é a decisão final)",
+        "ensaio": "Ensaio (não entra em nenhum resultado)",
+        "tudo": "Resultado",
+    }[filtro]
     imprimir_tabela(linhas, titulo)
 
 
