@@ -1,0 +1,14 @@
+# Política de permissões usada pelo lado "nas" do benchmark (ADR 0006
+# §7/§5). Copiada por `rodar.sh` para o `permissions.toml` de cada
+# worktree de rodada antes de chamar `claude -p` — nunca editada à
+# mão durante uma rodada.
+#
+# Libera só o que as cinco tarefas de bench/tarefas/ precisam: todas
+# são edição de código dentro do próprio projeto, nenhuma chama shell
+# nem rede a partir de uma ferramenta do nas. `write-file = true`
+# cobre `create_file`, `save_file`, `checkpoint_restore` e `edit` com
+# `save: true` — sem ele, toda tarefa pediria aprovação pra gravar no
+# disco e travaria uma rodada não assistida.
+write-file = true
+shell = false
+network = false
