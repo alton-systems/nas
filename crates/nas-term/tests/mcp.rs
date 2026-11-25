@@ -674,6 +674,79 @@ fn leituras_devolvem_texto_puro_e_aviso_num_segundo_bloco() {
     mcp.kill();
 }
 
+/// ADR 0006 §8 (etapa 3f-prep): `read` com intervalo, `edit` com
+/// `save` (gravando no disco na mesma chamada, com aprovação) e o
+/// texto compacto/puro de `list_symbols`/`read_symbol`, ponta a
+/// ponta pelo protocolo MCP de verdade.
+#[test]
+fn intervalo_save_e_simbolos_funcionam_ponta_a_ponta_via_mcp() {
+    let project_dir = tempfile::tempdir().expect("diretório do projeto");
+    let state_home = tempfile::tempdir().expect("diretório de estado");
+    std::fs::write(
+        project_dir.path().join("foo.txt"),
+        "um\ndois\ntres\nquatro\ncinco\n",
+    )
+    .expect("escrever foo.txt");
+    std::fs::write(
+        project_dir.path().join("lib.rs"),
+        "/// Soma dois números.\npub fn soma(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    )
+    .expect("escrever lib.rs");
+
+    let mut mcp = McpProcess::spawn(project_dir.path(), state_home.path(), true);
+    mcp.initialize("teste-3f-prep");
+
+    // `read` com start_line/end_line, sem `open_file` antes — abre
+    // sozinho.
+    let read_texts = mcp.call_tool_content_texts(
+        "read",
+        json!({"path": "foo.txt", "start_line": 2, "end_line": 3}),
+    );
+    assert_eq!(
+        read_texts,
+        vec!["linhas 2–3 de 5\n2 dois\n3 tres".to_string()]
+    );
+
+    // `edit` com `save: true`, sem `open_file` antes — abre sozinho,
+    // edita e grava na mesma chamada (aprovado por
+    // `--approve-writes`, como os outros testes de `WriteFile`).
+    let edit_texts = mcp.call_tool_content_texts(
+        "edit",
+        json!({"path": "foo.txt", "old_text": "um", "new_text": "um editado", "save": true}),
+    );
+    assert_eq!(edit_texts.len(), 1);
+    assert!(
+        edit_texts[0].contains("1 um editado"),
+        "snippet devia mostrar a linha editada: {edit_texts:?}"
+    );
+    assert!(
+        edit_texts[0].contains("gravado no disco"),
+        "devia avisar que gravou no disco: {edit_texts:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project_dir.path().join("foo.txt")).unwrap(),
+        "um editado\ndois\ntres\nquatro\ncinco\n"
+    );
+
+    // `list_symbols`/`read_symbol`, sem `open_file` antes.
+    let symbols_texts = mcp.call_tool_content_texts("list_symbols", json!({"path": "lib.rs"}));
+    assert_eq!(symbols_texts.len(), 1);
+    assert!(
+        symbols_texts[0].contains("fn soma 2-4"),
+        "lista compacta devia ter o símbolo 'soma': {symbols_texts:?}"
+    );
+
+    let symbol_texts =
+        mcp.call_tool_content_texts("read_symbol", json!({"path": "lib.rs", "name": "soma"}));
+    assert_eq!(symbol_texts.len(), 1);
+    assert!(
+        symbol_texts[0].contains("Soma dois números"),
+        "devia incluir o doc comment logo acima: {symbol_texts:?}"
+    );
+
+    mcp.kill();
+}
+
 #[test]
 fn caminho_fora_da_raiz_e_recusado_via_mcp() {
     let project_dir = tempfile::tempdir().expect("diretório do projeto");

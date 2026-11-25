@@ -181,20 +181,24 @@ fn session_id() -> String {
 
 /// O resultado de sucesso de uma ferramenta, como blocos de conteúdo
 /// MCP — texto puro pra quem devolve texto de arquivo de verdade
-/// (`read`/`search`/`list_files`/`show_diff`: linhas numeradas, como
-/// a IA já vê em qualquer um desses), nunca esse texto dentro de um
-/// JSON com quebras de linha escapadas (`\n` literal na string, mais
-/// difícil de ler que o texto de verdade). Os outros comandos
-/// continuam como JSON — são metadados pequenos (`path`, `from`/`to`),
-/// sem motivo pra um formato especial. Um aviso (`sync_with_disk`/
-/// `open_or_resync`), quando presente, vai num segundo bloco de
-/// conteúdo, nunca misturado ao primeiro.
+/// (`read`/`search`/`list_files`/`show_diff`/`edit`/`list_symbols`/
+/// `read_symbol`: linhas numeradas, como a IA já vê em qualquer um
+/// desses), nunca esse texto dentro de um JSON com quebras de linha
+/// escapadas (`\n` literal na string, mais difícil de ler que o
+/// texto de verdade). Os outros comandos continuam como JSON — são
+/// metadados pequenos (`path`, `from`/`to`), sem motivo pra um
+/// formato especial. Um aviso (`sync_with_disk`/`open_or_resync`),
+/// quando presente, vai num segundo bloco de conteúdo, nunca
+/// misturado ao primeiro.
 fn render_success(name: &str, value: &serde_json::Value) -> Vec<Content> {
     let mut blocks = match name {
         "read" => vec![Content::text(text_field(value, "text"))],
         "search" => vec![Content::text(render_matches(value))],
         "list_files" => vec![Content::text(render_file_list(value))],
         "show_diff" => vec![Content::text(render_diffs(value))],
+        "edit" => vec![Content::text(render_edit(value))],
+        "list_symbols" => vec![Content::text(render_symbols(value))],
+        "read_symbol" => vec![Content::text(text_field(value, "text"))],
         _ => return vec![Content::text(value.to_string())],
     };
     if let Some(warning) = value["warning"].as_str() {
@@ -239,6 +243,42 @@ fn render_file_list(value: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
+/// O trecho alterado (já numerado por `nas-commands`), mais uma nota
+/// quando a chamada também gravou no disco (`save: true`, ADR 0006
+/// §8, etapa 3f-prep) — o aviso de disco mudado, se houver, continua
+/// num bloco separado (`render_success`, acima).
+fn render_edit(value: &serde_json::Value) -> String {
+    let snippet = text_field(value, "snippet");
+    if value["saved"].as_bool() == Some(true) {
+        format!("{snippet}\n\n(gravado no disco)")
+    } else {
+        snippet
+    }
+}
+
+/// Uma linha por símbolo, texto compacto (ADR 0006 §8, etapa
+/// 3f-prep): `tipo nome linha_inicio-linha_fim`.
+fn render_symbols(value: &serde_json::Value) -> String {
+    value["symbols"]
+        .as_array()
+        .map(|symbols| {
+            symbols
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} {} {}-{}",
+                        s["kind"].as_str().unwrap_or_default(),
+                        s["name"].as_str().unwrap_or_default(),
+                        s["start_line"].as_u64().unwrap_or_default(),
+                        s["end_line"].as_u64().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 fn render_diffs(value: &serde_json::Value) -> String {
     value["diffs"]
         .as_array()
@@ -269,20 +309,25 @@ fn spec_to_tool(spec: &CommandSpec) -> Tool {
         name: spec.name.into(),
         description: Some(spec.description.into()),
         input_schema: std::sync::Arc::new(input_schema),
-        annotations: annotations_for(spec.effect),
+        annotations: annotations_for(spec.max_effect),
     }
 }
 
 /// Dica (nunca garantia — `ToolAnnotations` é só isso, uma dica pro
-/// cliente) derivada do mesmo `Effect` que já decide aprovação (ADR
-/// 0006 §5): `Pure`/`ReadFile` nunca mudam nada
-/// (`read_only_hint`); `WriteFile` toca o disco de verdade, o que
-/// `ToolAnnotations` chama de destrutivo (`destructive_hint`) — não
-/// porque apague algo sem avisar (`save_file` recusa antes disso,
-/// §5), mas porque sobrescreve o arquivo por completo. Os demais
-/// efeitos (`WriteBuffer`, `WriteHistory`, `Shell`, `Network`) não
-/// têm uma dica óbvia nenhuma das duas categorias, então ficam sem
-/// anotação — nenhuma lista paralela, direto do mesmo enum.
+/// cliente) derivada de `CommandSpec::max_effect` — o "pior caso"
+/// entre todos os argumentos possíveis desta ferramenta (ADR 0006
+/// §5, etapa 3f-prep: `tools/list` não vê os argumentos de uma
+/// chamada específica ainda, então a anotação estática precisa ser
+/// conservadora; a aprovação de verdade usa sempre
+/// `effective_effect`, nunca isto). `Pure`/`ReadFile` nunca mudam
+/// nada (`read_only_hint`); `WriteFile` toca o disco de verdade, o
+/// que `ToolAnnotations` chama de destrutivo (`destructive_hint`) —
+/// não porque apague algo sem avisar (`save_file` recusa antes
+/// disso, §5), mas porque sobrescreve o arquivo por completo. Os
+/// demais efeitos (`WriteBuffer`, `WriteHistory`, `Shell`,
+/// `Network`) não têm uma dica óbvia nenhuma das duas categorias,
+/// então ficam sem anotação — nenhuma lista paralela, direto do
+/// mesmo enum.
 fn annotations_for(effect: Effect) -> Option<ToolAnnotations> {
     match effect {
         Effect::Pure | Effect::ReadFile => Some(ToolAnnotations::new().read_only(true)),
@@ -348,14 +393,20 @@ impl ServerHandler for NasMcpHandler {
         };
         let history_dir = workspace.history_dir().map(|dir| dir.to_path_buf());
 
-        // Decidido aqui, antes de chamar o `Registry` — pra um efeito
-        // negado nunca rodar nenhum pedaço do comando, e pra poder
-        // devolver uma mensagem mais específica que o cinto de
-        // segurança genérico de `Registry::run` (ADR 0006 §5, etapa
-        // 3d).
+        // O efeito **desta chamada** — não `spec.effect`/`max_effect`
+        // direto, pra um comando como `edit` (ADR 0006 §5, etapa
+        // 3f-prep: `save: true` muda o efeito de `WriteBuffer` pra
+        // `WriteFile`). Decidido aqui, antes de chamar o `Registry` —
+        // pra um efeito negado nunca rodar nenhum pedaço do comando,
+        // e pra poder devolver uma mensagem mais específica que o
+        // cinto de segurança genérico de `Registry::run` (ADR 0006
+        // §5, etapa 3d) — que recalcula o mesmo `effective_effect`
+        // por conta própria, então um efeito negado aqui nunca
+        // consegue gravar no disco por nenhum outro caminho.
+        let effect = spec.effective_effect(&args);
         let mut approved_effects = HashSet::new();
-        if let Some(policy_key) = spec.effect.policy_key() {
-            let decision = self.decide_effect(spec.effect, history_dir.as_deref());
+        if let Some(policy_key) = effect.policy_key() {
+            let decision = self.decide_effect(effect, history_dir.as_deref());
             self.log_decision(
                 history_dir.as_deref(),
                 &author,
@@ -365,12 +416,12 @@ impl ServerHandler for NasMcpHandler {
             );
             match decision {
                 EffectDecision::Allowed => {
-                    approved_effects.insert(spec.effect);
+                    approved_effects.insert(effect);
                 }
                 EffectDecision::Denied { reason } => {
                     return Ok(CallToolResult::error(vec![Content::text(deny_message(
                         request.name.as_ref(),
-                        spec.effect,
+                        effect,
                         reason.as_deref(),
                     ))]));
                 }

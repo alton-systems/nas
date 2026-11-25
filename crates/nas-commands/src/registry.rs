@@ -15,6 +15,8 @@ type RunFn = Box<
         + Sync,
 >;
 
+type EffectForArgsFn = Box<dyn Fn(&serde_json::Value) -> Effect + Send + Sync>;
+
 /// Nome, descrição, efeito e esquema de argumentos de um comando —
 /// os quatro metadados do pilar 1 do README — mais a função que o
 /// executa, por trás de um `serde_json::Value` dos dois lados, pra
@@ -23,7 +25,20 @@ type RunFn = Box<
 pub struct CommandSpec {
     pub name: &'static str,
     pub description: &'static str,
+    /// O efeito "de repouso" — o que `effective_effect` devolve
+    /// quando o comando não tem efeito dependente de argumento
+    /// (`effect_for_args`, abaixo). Pra a maioria dos comandos, é o
+    /// único efeito que existe.
     pub effect: Effect,
+    /// O efeito mais arriscado que esta ferramenta pode ter, entre
+    /// todos os argumentos possíveis — igual a `effect`, a menos que
+    /// `with_dynamic_effect` diga o contrário. Só usado pra decidir a
+    /// anotação MCP estática de `tools/list` (`nas-mcp`), que
+    /// precisa de uma resposta antes de qualquer argumento de uma
+    /// chamada existir — escolhida de forma conservadora (o "pior
+    /// caso"), nunca pra decidir aprovação de verdade (ADR 0006 §5,
+    /// etapa 3f-prep: isso é sempre `effective_effect`).
+    pub max_effect: Effect,
     /// Se este comando aparece como ferramenta pra um agente de IA
     /// (ADR 0006 §5/ADR 0007-configuracao-em-camadas.md §5): estar
     /// no registro **não basta** — cada comando precisa marcar isto
@@ -33,6 +48,16 @@ pub struct CommandSpec {
     pub exposed_to_ai: bool,
     pub args_schema: schemars::Schema,
     run: RunFn,
+    /// Calcula o efeito **desta chamada específica**, a partir dos
+    /// argumentos crus (ainda não validados contra o esquema — só
+    /// uma leitura otimista de um campo booleano, nunca algo que
+    /// decida segurança por si só: a validação de verdade continua
+    /// sendo o `Deserialize` de `A` dentro de `run`, que recusa a
+    /// chamada inteira, gravação incluída, se o argumento não bater
+    /// com o tipo esperado). `None` pra todo comando cujo efeito não
+    /// depende de argumento nenhum (a maioria) — `effective_effect`
+    /// cai pra `effect` nesse caso.
+    effect_for_args: Option<EffectForArgsFn>,
 }
 
 impl CommandSpec {
@@ -42,6 +67,34 @@ impl CommandSpec {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, CommandError> {
         (self.run)(ctx, args)
+    }
+
+    /// O efeito desta chamada específica, a partir dos argumentos
+    /// crus que ela recebeu — o que `Registry::run` usa pra decidir
+    /// aprovação (ADR 0006 §5) e `nas-mcp` usa pra decidir aprovação
+    /// e registrar a decisão. Nunca `effect`/`max_effect` direto,
+    /// pra um comando como `edit` (etapa 3f-prep: `save: true` muda o
+    /// efeito de `WriteBuffer` pra `WriteFile`).
+    pub fn effective_effect(&self, args: &serde_json::Value) -> Effect {
+        match &self.effect_for_args {
+            Some(f) => f(args),
+            None => self.effect,
+        }
+    }
+
+    /// Marca este comando como tendo um efeito dependente dos
+    /// argumentos (ADR 0006 §5, etapa 3f-prep) — `max_effect` passa a
+    /// ser o que `nas-mcp` anuncia em `tools/list` (o "pior caso",
+    /// escolhido conservadoramente); `f` passa a decidir o efeito de
+    /// cada chamada, substituindo o `effect` fixo original.
+    pub fn with_dynamic_effect(
+        mut self,
+        max_effect: Effect,
+        f: impl Fn(&serde_json::Value) -> Effect + Send + Sync + 'static,
+    ) -> Self {
+        self.max_effect = max_effect;
+        self.effect_for_args = Some(Box::new(f));
+        self
     }
 }
 
@@ -66,6 +119,7 @@ where
         name,
         description,
         effect,
+        max_effect: effect,
         exposed_to_ai,
         args_schema: schemars::schema_for!(A),
         run: Box::new(move |ctx, value| {
@@ -73,6 +127,7 @@ where
             let result = f(ctx, args)?;
             serde_json::to_value(result).map_err(CommandError::Serialize)
         }),
+        effect_for_args: None,
     }
 }
 
@@ -108,13 +163,22 @@ impl Registry {
         let spec = self
             .get(name)
             .ok_or_else(|| CommandError::UnknownCommand(name.to_string()))?;
-        if needs_approval(spec.effect)
+        // O efeito **desta chamada** — não `spec.effect` direto, pra
+        // um comando como `edit` (ADR 0006 §5, etapa 3f-prep: `save:
+        // true` muda o efeito de `WriteBuffer` pra `WriteFile`).
+        // Decidido aqui, antes de rodar qualquer pedaço do comando —
+        // é por isto que não existe jeito de `edit(save: true)`
+        // gravar no disco sem passar pela aprovação de `write-file`:
+        // este é o único caminho de execução, usado por `nas-mcp` e
+        // por qualquer chamador direto (como os testes).
+        let effect = spec.effective_effect(&args);
+        if needs_approval(effect)
             && !matches!(ctx.author, Author::User)
-            && !ctx.approved_effects.contains(&spec.effect)
+            && !ctx.approved_effects.contains(&effect)
         {
             return Err(CommandError::NeedsApproval {
                 command: name.to_string(),
-                effect: spec.effect,
+                effect,
             });
         }
 
@@ -125,7 +189,7 @@ impl Registry {
         // computado de novo depois). Só é de fato criado (gravado em
         // disco) se o comando terminar com sucesso — nunca numa
         // tentativa que falhou (não foi uma mudança efetiva).
-        let session_checkpoint = prepare_session_checkpoint(ctx, spec.effect);
+        let session_checkpoint = prepare_session_checkpoint(ctx, effect);
 
         let mut result = spec.run(ctx, args);
 
