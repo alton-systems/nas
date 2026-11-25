@@ -228,11 +228,106 @@ a reduzida.
 
 ## 7. Bateria reduzida (exploratória)
 
-*(preenchida depois de rodar — cinco tarefas × três cenários × uma
-rodada = quinze rodadas, ordem alternada entre cenários tarefa a
-tarefa, com `bench/resumir --reduzida`. Vazia até lá. O ensaio da §5
-não entra aqui — é uma amostra solta, de antes da revisão de três
-cenários, só pra validar o script.)*
+Rodada em 2026-11-25, depois das correções 1a/1b/1c (commits
+`4ede370`/`3dc54c6`) — binário `nas` compilado do HEAD da branch com
+as correções já aplicadas, não do commit de partida das tarefas. Cinco
+tarefas × três cenários × uma rodada = quinze rodadas. A ordem alternada
+planejada em §3 não foi seguida à risca na execução (rodadas disparadas
+em paralelo, não em sequência — processos independentes, sem contexto
+compartilhado entre si, então a alternância não se aplicava do mesmo
+jeito que numa bateria manual sequencial); duas rodadas da primeira
+tentativa (o orquestrador `bateria-reduzida.sh` original) caíram num
+limite de sessão da conta no meio do caminho (`429`, "You've hit your
+session limit") e tiveram que ser refeitas uma a uma depois que o
+limite resetou — sem isso, `wait -n` sob `set -e` matava o script
+inteiro sem limpar os processos filhos, que ficaram órfãos; corrigido
+não no script (que já não roda mais sem supervisão), mas relançando
+cada rodada que faltou individualmente. Três rodadas da tarefa 05
+(todas de A/B/C) perderam o `verification.json`/`meta.json` nesse
+mesmo incidente — como a tarefa 05 é só explicação (confirmado,
+lendo as três transcrições: zero chamadas de edição em qualquer uma),
+o `cargo_test_ok`/tempo de parede foram reconstruídos à mão a partir
+do `result.json` (que não se perdeu) em vez de gastar uma rodada nova.
+
+| tarefa | cenário | tok. entrada | tok. criação cache | tok. leitura cache | tok. saída | **tok. total** | custo (US$) | chamadas | tempo (s) | sucesso | retrabalho | edições via shell |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 01 | A | 76 | 87 786 | 2 270 866 | 12 062 | **2 370 790** | 0,9275 | 37 | 236 | ✅ | 4 | 0 |
+| 01 | B | 54 | 93 222 | 1 886 234 | 12 221 | **1 991 731** | 0,8739 | 26 | 215 | ✅ | 1 | 0 |
+| 01 | C | 70 | 106 520 | 2 728 971 | 15 761 | **2 851 322** | 1,1311 | 35 | 262 | ✅ | 7 | 0 |
+| 02 | A | 8 | 19 290 | 118 454 | 1 772 | **139 524** | 0,1201 | 3 | 26 | ✅ | 0 | 0 |
+| 02 | B | 10 | 52 226 | 197 672 | 1 744 | **251 652** | 0,2674 | 4 | 28 | ✅ | 0 | 0 |
+| 02 | C | 10 | 54 174 | 206 799 | 1 941 | **262 924** | 0,2790 | 4 | 29 | ✅ | 0 | 0 |
+| 03 | A | 22 | 22 149 | 377 096 | 3 167 | **402 434** | 0,1971 | 10 | 70 | ✅ | 1 | 0 |
+| 03 | B | 20 | 22 397 | 484 481 | 3 122 | **510 020** | 0,2191 | 14 | 80 | ✅ | 2 | 0 |
+| 03 | C | 24 | 21 287 | 616 325 | 3 258 | **640 894** | 0,2425 | 11 | 81 | ✅ | 2 | 0 |
+| 04 | A | 42 | 33 780 | 832 801 | 5 162 | **871 785** | 0,3547 | 21 | 156 | ✅ | 1 | 0 |
+| 04 | B | 24 | 26 703 | 614 673 | 3 053 | **644 453** | 0,2617 | 13 | 123 | ✅ | 0 | 0 |
+| 04 | C | 50 | 38 324 | 1 514 422 | 5 443 | **1 558 239** | 0,5121 | 24 | 157 | ✅ | 6 | 2\* |
+| 05 | A | 8 | 16 076 | 116 758 | 1 565 | **134 407** | 0,1046 | 3 | 21 | — | 0 | 0 |
+| 05 | B | 6 | 14 101 | 127 740 | 2 059 | **143 906** | 0,1039 | 2 | 29 | — | 0 | 0 |
+| 05 | C | 8 | 15 241 | 187 448 | 2 240 | **204 937** | 0,1222 | 3 | 27 | — | 0 | 0 |
+
+\* falso-positivo da heurística de "edição pelo shell" (§4): os dois
+comandos eram `cargo test --workspace > /tmp/test_out.log` — um
+redirecionamento pra inspecionar a saída, não uma edição de arquivo do
+projeto. A heurística (`bench/resumir`) marca qualquer `>`/`>>` num
+comando `Bash`, sem saber se o destino é um arquivo do projeto ou um
+log temporário — ponto a refinar antes da bateria completa, não um
+resultado real de "edição via shell contornando o nas".
+
+**Custo total das quinze rodadas: US$ 5,7168.** Tempo de parede total
+somado (sem contar o paralelismo e os reinícios pelo limite de sessão)
+não é uma métrica útil aqui — o que importa pro §6 é tokens e sucesso.
+
+### Uso das ferramentas do nas no cenário C
+
+**Nenhuma.** Nas cinco tarefas, zero chamadas a qualquer ferramenta
+`mcp__nas__*` — confirmado tanto por `bench/resumir --reduzida --json`
+quanto por inspeção direta das transcrições. Com as duas ferramentas
+disponíveis (Claude Code nativo e nas-mcp), o modelo não escolheu o
+nas-mcp nenhuma vez nesta amostra.
+
+### Contra os critérios do §6 (agregado das cinco tarefas, n=1 por célula — exploratório)
+
+| comparação | tokens totais (soma das 5 tarefas) | diferença | critério | resultado nesta amostra |
+|---|---|---|---|---|
+| B × A | B = 3 541 762 / A = 3 918 940 | **−9,6%** (B mais barato) | ≤ 25% a mais | dentro do critério, com folga |
+| C × A | C = 5 518 316 / A = 3 918 940 | **+40,8%** | ≤ 10% a mais | **fora do critério**, por uma margem grande |
+
+Taxa de sucesso: ✅ nas quatro tarefas verificáveis (01–04), nos três
+cenários — sem diferença de sucesso entre eles nesta amostra. Tarefa
+05 (explicar) não entra nesta soma — precisa da nota manual de 5
+pontos (critério do próprio `bench/tarefas/05-...md`), ainda não feita
+pra estas três respostas.
+
+**Leitura, com a ressalva de que isto é exploratório (n=1 por
+tarefa/cenário, não a bateria completa):**
+
+- **As correções 1a/1b/1c (item 1, revisão pós-ensaio) funcionaram**:
+  o ensaio original (§5) media o cenário B ~70% mais caro que A; nesta
+  bateria, com as ferramentas corrigidas, B ficou **mais barato** que
+  A. O `save` por padrão (menos chamadas de `save_file`) e
+  `ENABLE_TOOL_SEARCH=false` (menos `ToolSearch`) parecem ter resolvido
+  justamente o que o ensaio tinha apontado.
+- **O cenário C saiu caro sem nunca ser usado.** C custou ~41% mais
+  que A somando as cinco tarefas, numa amostra em que o nas-mcp nunca
+  foi chamado nenhuma vez — ou seja, o custo extra de C, nesta amostra,
+  não é o custo de *usar* o nas-mcp (que seria zero, já que não foi
+  usado): é o custo de só **tê-lo disponível** (esquema de doze
+  ferramentas a mais carregado na sessão, mesmo com
+  `ENABLE_TOOL_SEARCH=false` evitando o `ToolSearch`, ainda ocupa
+  espaço — e possivelmente mais raciocínio sobre qual ferramenta
+  escolher). Isso é uma evidência, ainda que de amostra pequena, contra
+  a hipótese de que "oferecer sem obrigar" seria uma forma barata de
+  deixar a IA escolher: aqui ela nunca escolheu, e ainda assim pagou
+  mais.
+- **Isto não decide nada ainda** (§6) — é a bateria completa, com três
+  rodadas por tarefa e tarefas maiores que a 01, que decide de
+  verdade. Mas a direção desta amostra sugere que vale a pena levar
+  **B** pra bateria completa (o critério já passa, com folga, mesmo
+  nesta amostra pequena) e repensar — ou simplesmente não repetir — o
+  **C** como está, já que não houve nenhum uso de nas-mcp pra justificar
+  o custo extra observado.
 
 ## 8. Resultado (bateria completa)
 
