@@ -8,6 +8,7 @@ members = [
     "crates/nas-commands",
     "crates/nas-config",
     "crates/nas-mcp",
+    "crates/nas-syntax",
 ]
 
 [workspace.package]
