@@ -61,6 +61,7 @@ crates/
   nas-commands/  # registro de comandos tipados — nome, args, efeito (ADR 0006 §1)
   nas-config/    # configuração em camadas: config.toml, keymap.toml (ADR 0007)
   nas-mcp/       # adaptador MCP (rmcp isolado) sobre nas-commands; nas --mcp (ADR 0006 §3)
+  nas-syntax/    # símbolos via Tree-sitter (tree-house-bindings isolado); list_symbols/read_symbol (ADR 0006 §8)
 docs/decisions/  # ADRs — uma nota curta por decisão importante
 spikes/          # protótipos descartáveis, fora do workspace principal
 ```
