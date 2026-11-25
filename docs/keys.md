@@ -56,7 +56,7 @@ significam, e o que `d` significa, já sabe o que `d :` faz.
   para) e `Espaço` (líder).
 - **Frase**: uma sequência de compostos digitada no estado Sequential,
   mostrada antes de executar — é o que a IA vai propor, no marco 4.
-- **Estado**: Insert, Visual ou Sequential — ver §4.4.
+- **Estado**: Insert, Visual, Sequential ou Review — ver §5.4 e §5.10.
 
 ## 3. As regras (o contrato do sistema)
 
@@ -219,6 +219,7 @@ dois lugares.
 |---|---|
 | `g g` | início do arquivo |
 | `g l` | uma linha (pede o número) |
+| `g h` | o trecho atual, na revisão — "ir para" (`g`) o lugar d`o` trecho (`h`, docs/decisions/0008-modo-de-revisao.md §4); global, mas sem efeito fora da revisão (não há trecho atual) |
 | `g c` | uma posição em caracteres (reservado, não implementado) |
 | `g f` | a definição de uma função (reservado, depende de LSP) |
 
@@ -278,6 +279,8 @@ seguinte, **sem** Ctrl, escolhe o comando — mesma ideia do líder
 | `Ctrl+t r` | restaurar um checkpoint | `r`estaurar, livre |
 | `Ctrl+t a` | autoria — histórico de edições do arquivo atual | `b` já é `Ctrl+b` (buffer); `a`utoria |
 | `Ctrl+t m` | histórico de mensagens (echo area) num overlay | `m`ensagens, livre |
+| `Ctrl+t v` | revisar — abre direto, no checkpoint padrão (§5.10) | `v`er/revisar, livre |
+| `Ctrl+t V` | revisar — abre a lista de checkpoints pra escolher | Shift leva a ação ao extremo (regra 3): em vez do caminho direto, mostra **todas** as opções antes de decidir |
 | `Ctrl+t z` | apagar o histórico do projeto (exige digitar "apagar") | sem uso melhor por perto; ação rara e destrutiva, letra "longe" das outras |
 
 `Ctrl+t` por si só não faz nada além de abrir o prefixo — uma tecla
@@ -336,12 +339,72 @@ Em `Espaço`, no líder, `p` é livre pra isto: diferente do `p`
 sozinho em `[visual]` (reservado pra "dentro de"/"em volta de", §6),
 o namespace do líder é independente, e nada mais usa essa letra ali.
 
+### 5.10 Estado `Review` — o modo de revisão
+
+Primeiro estado além de Insert/Visual/Sequential (§2/§5.4) — um
+buffer somente leitura com os trechos alterados de uma sessão de IA
+(ou de outro checkpoint escolhido), um por arquivo tocado
+(docs/decisions/0008-modo-de-revisao.md). Aberto por `Ctrl+t v`/
+`Ctrl+t V` (§5.7), nunca por uma tecla do próprio Visual.
+
+**Mecanismo: uma camada sobre o `[visual]` resolvido, não uma cópia
+dele.** `[review]`, em `default.toml`, só declara o que é novo pra
+este estado; o que ela **não** menciona cai no `[visual]` já
+resolvido — com o `keymap.toml` do usuário por cima, não o
+`default.toml` cru. Isso é o que faz um movimento remapeado pelo
+usuário (`j`/`k`/`l`/`;`/`J`/`:`/`K`/`L`, docs/config.md) continuar
+valendo dentro da revisão sem que `[review]` precise saber que foi
+remapeado.
+
+Dessa queda ficam de fora, **bloqueadas por nome de ação** (nunca por
+tecla física — um movimento ou verbo remapeado continua bloqueado
+pelo nome, não pela tecla original): qualquer verbo
+(`delete`/`copy`/`cut`), `start-selection`, `select-all`, `paste` e
+`repeat` — nenhum faz sentido num buffer que não se edita. Uma tecla
+bloqueada avisa na echo area, nunca falha em silêncio.
+
+| Teclas | Ação | Por quê, contra as regras do §3 |
+|---|---|---|
+| `h k` / `h l` | próximo / trecho anterior | `h` é uma unidade nova — "trecho alterado" — no mesmo mecanismo de `w`/`W` (§5.1): a direção usa as mesmas teclas que já significam "abaixo"/"acima", igual a `W k`/`W l` pra parágrafo; nenhum radical de movimento é redefinido (regra 1) |
+| `H k` / `H l` | próximo / arquivo anterior | `H` (Shift de `h`) escala trecho → arquivo — regra 3, o mesmo salto de escala que leva palavra a parágrafo; só existe em `[review]`, porque "mais de um arquivo" só faz sentido aqui |
+| `Enter` | aceita o trecho sob o cursor (marca como revisado, persiste) | reaproveita o que `Enter` já significa em todo outro estado — avançar/confirmar o que está pendente (Visual: entra no Insert; Sequential: executa a frase) |
+| `u` | rejeita o trecho sob o cursor (desfaz, só no arquivo real, se o texto ainda for o que a IA deixou) | não é uma tecla nova: é o `u` de sempre (desfazer), com o alvo "o trecho atual" em vez de "a última transação" — mesmo significado, alvo diferente |
+| `g h` | abre o arquivo real na linha do trecho, sai da revisão | vive em `[prefixes.go]` (§5.5), não em `[review]` — compõe "ir para" (`g`) com "trecho" (`h`), por isso continua global |
+| `Esc` | sai da revisão, volta pro Visual | um degrau a mais na mesma cascata de `Esc` de sempre (cancela pendente; sem pendente, desfaz seleção; sem seleção, isto) |
+
+`h` fica fixado como um radical do nas **inteiro**, não só da
+revisão — "trecho alterado" — mesmo que hoje só `[review]` de fato
+ligue algo a ele (ver §6). `H` não generaliza: "o próximo arquivo" só
+faz sentido com mais de um arquivo em jogo, o que só a revisão tem.
+
+A dica which-key de `[review]` é **persistente** na echo area
+enquanto o estado for `Review` — ao contrário da dica de um
+verbo/prefixo/unidade pendente (regra 8), que só aparece até a tecla
+seguinte. A barra de status mostra `[Revisão]` no lugar de `[Visual]`/
+`[Insert]`.
+
+A paleta de comandos (§5.9) passa a filtrar pelo estado atual: os
+comandos que só existem em `[review]` (aceitar, navegar por trecho/
+arquivo) só aparecem na paleta dentro da revisão — fora dela não há
+trecho nenhum pra agir sobre. `goto-hunk` (`g h`), por viver em
+`[prefixes.go]`, continua global, em qualquer estado.
+
+**Relação com a issue #9** (modos: contexto + capacidades): o
+mecanismo de camada acima — `[review]` consultada primeiro, bloqueio
+por nome de ação, o resto cai no keymap resolvido — é o primeiro
+código real de "uma camada de teclas sobre outra" no nas, não só uma
+analogia. Não generaliza (só existe esta camada, o bloqueio é uma
+lista fixa em Rust, não há resolução de conflito) — isso fica pra
+quando a issue #9 chegar, trocando esta camada única por N camadas
+declaradas como dados.
+
 ## 6. Teclas reservadas (não implementadas)
 
 | Teclas | Reservadas para |
 |---|---|
 | `i` / `o` | objetos "dentro de" e "em volta de" (como o `i"` e o `a(` do Vim) |
 | `p` | sem uso — a unidade parágrafo é `W` (Shift+`w`), não `p` |
+| `h k` / `h l` | em buffers comuns (fora da revisão): um futuro "próxima/anterior mudança" — `h` já significa "trecho alterado" (§5.10), contra o checkpoint mais recente, presumivelmente; não decidido, só reservado |
 | números `0`–`9` | contagem antes de um comando (ex.: `3 w ;`) |
 | `m` | prefixo livre para atalhos do próprio usuário, vazio por padrão |
 | `g c` | ir para uma posição em caracteres |
