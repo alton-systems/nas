@@ -22,21 +22,21 @@ use crate::registry::{Registry, typed_command};
 pub fn register_all(registry: &mut Registry) {
     registry.register(typed_command(
         "open_file",
-        "Abre um arquivo do projeto (cria o buffer se ainda não estiver aberto).",
+        "Abre um arquivo do projeto para leitura e edição.",
         Effect::ReadFile,
         true,
         open_file,
     ));
     registry.register(typed_command(
         "read",
-        "Lê o conteúdo de um arquivo (abre sozinho, se preciso), com números de linha; aceita start_line/end_line (1-indexadas, inclusive) pra ler só um intervalo.",
+        "Lê um arquivo com números de linha; opcionalmente só um intervalo.",
         Effect::Pure,
         true,
         read,
     ));
     registry.register(typed_command(
         "search",
-        "Busca um texto literal num arquivo já aberto, devolvendo a linha de cada ocorrência.",
+        "Busca um texto literal num arquivo, devolvendo a linha de cada ocorrência.",
         Effect::Pure,
         true,
         search,
@@ -51,7 +51,7 @@ pub fn register_all(registry: &mut Registry) {
     registry.register(
         typed_command(
             "edit",
-            "Substitui um texto antigo exato por um novo texto num arquivo (abre sozinho, se preciso); recusa se o texto antigo não for encontrado ou aparecer mais de uma vez (use line_range pra desambiguar). Devolve o trecho alterado com contexto. Com save: true, já grava no disco nesta mesma chamada (efeito passa a write-file, pedindo aprovação).",
+            "Substitui um texto exato por outro num arquivo; recusa se o texto não existir ou repetir. Com save, grava no disco na mesma chamada.",
             Effect::WriteBuffer,
             true,
             edit,
@@ -70,14 +70,14 @@ pub fn register_all(registry: &mut Registry) {
     );
     registry.register(typed_command(
         "list_symbols",
-        "Lista os símbolos de um arquivo (funções, métodos Tipo::metodo, structs, enums, traits, impls, consts e mods em Rust; títulos em Markdown), com tipo e intervalo de linhas — abre o arquivo sozinho, se preciso.",
+        "Lista os símbolos de um arquivo (funções, structs, etc. em Rust; títulos em Markdown), com tipo e linhas.",
         Effect::ReadFile,
         true,
         list_symbols,
     ));
     registry.register(typed_command(
         "read_symbol",
-        "Devolve o texto completo de um símbolo (aceita nome qualificado, ex. Tipo::metodo), incluindo doc comments/atributos logo acima; recusa listando os candidatos se o nome for ambíguo.",
+        "Devolve o texto completo de um símbolo pelo nome; recusa listando candidatos se o nome for ambíguo.",
         Effect::ReadFile,
         true,
         read_symbol,
@@ -98,7 +98,7 @@ pub fn register_all(registry: &mut Registry) {
     ));
     registry.register(typed_command(
         "checkpoint_create",
-        "Cria um checkpoint nomeado com o conteúdo atual de todo arquivo rastreado do projeto.",
+        "Cria um checkpoint nomeado com o estado atual dos arquivos rastreados.",
         Effect::WriteHistory,
         true,
         checkpoint_create,
@@ -112,7 +112,7 @@ pub fn register_all(registry: &mut Registry) {
     ));
     registry.register(typed_command(
         "save_file",
-        "Grava no disco as alterações já feitas num arquivo aberto; recusa se o arquivo mudou no disco desde a última leitura.",
+        "Grava no disco as alterações feitas num arquivo; recusa se o arquivo mudou no disco.",
         Effect::WriteFile,
         true,
         save_file,
@@ -184,7 +184,11 @@ fn char_range_for_lines(text: &str, from_line: usize, to_line: usize) -> std::op
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OpenFileArgs {
-    /// Caminho do arquivo, absoluto ou relativo à raiz do projeto.
+    // Absoluto ou relativo à raiz do projeto — todo campo `path`
+    // deste registro aceita os dois (`Workspace::resolve`); descrito
+    // só aqui pra não repetir a mesma frase em cada ferramenta e
+    // inflar `tools/list` (ADR 0006 §8, revisão).
+    #[schemars(description = "caminho do arquivo (absoluto ou relativo à raiz do projeto)")]
     pub path: String,
 }
 
@@ -209,17 +213,17 @@ fn open_file(ctx: &mut CommandContext, args: OpenFileArgs) -> Result<OpenFileRes
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ReadArgs {
+    #[schemars(description = "caminho do arquivo")]
     pub path: String,
-    /// Linha inicial (1-indexada, inclusive) do intervalo a ler — o
-    /// arquivo inteiro, a partir da linha 1, se omitida junto com
-    /// `end_line` (ADR 0006 §8, etapa 3f-prep). Fora dos limites do
-    /// arquivo é tolerado, nunca um erro — só resulta num intervalo
-    /// vazio.
+    // Fora dos limites do arquivo é tolerado, nunca um erro — só
+    // resulta num intervalo vazio (ADR 0006 §8, etapa 3f-prep).
     #[serde(default)]
+    #[schemars(
+        description = "primeira linha (1-based), opcional — lê o arquivo inteiro se omitida junto de end_line"
+    )]
     pub start_line: Option<usize>,
-    /// Linha final (1-indexada, inclusive) — até o fim do arquivo,
-    /// se omitida.
     #[serde(default)]
+    #[schemars(description = "última linha (1-based, inclusive), opcional")]
     pub end_line: Option<usize>,
 }
 
@@ -269,7 +273,8 @@ fn read(ctx: &mut CommandContext, args: ReadArgs) -> Result<ReadResult, CommandE
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchArgs {
     pub path: String,
-    /// Texto literal buscado — sem regex, por simplicidade.
+    // Sem regex, por simplicidade.
+    #[schemars(description = "texto literal a buscar (sem regex)")]
     pub query: String,
 }
 
@@ -309,9 +314,8 @@ fn search(ctx: &mut CommandContext, args: SearchArgs) -> Result<SearchResult, Co
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
-    /// Subdiretório a listar, relativo à raiz do projeto — a raiz
-    /// inteira se omitido.
     #[serde(default)]
+    #[schemars(description = "subpasta a listar, opcional (padrão: a raiz do projeto)")]
     pub dir: Option<String>,
 }
 
@@ -350,24 +354,22 @@ fn list_files(
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct EditArgs {
     pub path: String,
-    /// O texto exato a substituir — precisa aparecer exatamente uma
-    /// vez (dentro de `line_range`, se dado).
+    // Precisa aparecer exatamente uma vez (dentro de `line_range`,
+    // se dado) — `CommandError::NoMatch`/`Ambiguous` senão.
+    #[schemars(description = "texto exato a substituir (deve ocorrer uma única vez)")]
     pub old_text: String,
     pub new_text: String,
-    /// Linhas `[de, até]` (1-indexadas, inclusive) pra restringir a
-    /// busca, quando `old_text` aparecer mais de uma vez no arquivo
-    /// inteiro.
     #[serde(default)]
+    #[schemars(
+        description = "[linha inicial, linha final] (1-based) para desambiguar quando old_text se repete"
+    )]
     pub line_range: Option<[usize; 2]>,
-    /// Se `true`, grava a mudança no disco nesta mesma chamada —
-    /// equivalente a chamar `save_file` logo depois, numa única
-    /// ferramenta (ADR 0006 §8, etapa 3f-prep). Muda o efeito desta
-    /// chamada de `WriteBuffer` pra `WriteFile`: pede aprovação se
-    /// quem chama não for o usuário, e vale a mesma regra de
-    /// conflito de `save_file` (recusa com `DiskChanged` se o disco
-    /// mudou desde a última leitura) — nesse caso a edição em
-    /// memória já aconteceu, mas nada foi pro disco.
+    // Muda o efeito desta chamada de `WriteBuffer` pra `WriteFile`
+    // (`CommandSpec::effective_effect`) e vale a mesma regra de
+    // conflito de `save_file` (`DiskChanged` se o disco mudou) — ver
+    // ADR 0006 §5/§8.
     #[serde(default)]
+    #[schemars(description = "grava no disco após editar; pede permissão de escrita")]
     pub save: bool,
 }
 
@@ -509,9 +511,9 @@ fn list_symbols(
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadSymbolArgs {
     pub path: String,
-    /// Nome do símbolo — aceita qualificado (`Tipo::metodo`) pra
-    /// desambiguar entre tipos diferentes com um método do mesmo
-    /// nome.
+    // Aceita qualificado (`Tipo::metodo`) pra desambiguar entre
+    // tipos diferentes com um método do mesmo nome.
+    #[schemars(description = "nome do símbolo; use Tipo::metodo para desambiguar")]
     pub name: String,
 }
 
@@ -562,7 +564,9 @@ fn read_symbol(
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShowDiffArgs {
+    #[schemars(description = "id do checkpoint inicial")]
     pub from_checkpoint: String,
+    #[schemars(description = "id do checkpoint final")]
     pub to_checkpoint: String,
 }
 
@@ -599,8 +603,8 @@ fn show_diff(ctx: &mut CommandContext, args: ShowDiffArgs) -> Result<ShowDiffRes
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateFileArgs {
     pub path: String,
-    /// Conteúdo inicial — vazio se omitido.
     #[serde(default)]
+    #[schemars(description = "conteúdo inicial, opcional (padrão: vazio)")]
     pub content: Option<String>,
 }
 
@@ -688,6 +692,7 @@ fn save_to_disk(ctx: &mut CommandContext, path: &Path) -> Result<(), CommandErro
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CheckpointCreateArgs {
+    #[schemars(description = "nome do checkpoint")]
     pub name: String,
 }
 
@@ -732,6 +737,7 @@ fn checkpoint_create(
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CheckpointRestoreArgs {
+    #[schemars(description = "id do checkpoint a restaurar")]
     pub id: String,
 }
 
