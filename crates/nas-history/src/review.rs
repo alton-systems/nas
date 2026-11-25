@@ -256,7 +256,7 @@ pub fn attribute_hunk(
     let (range_start, range_end) = range;
     let mut authors = Vec::new();
     for (start, end, author) in spans {
-        if start < range_end && end > range_start && !authors.contains(&author) {
+        if ranges_intersect(start, end, range_start, range_end) && !authors.contains(&author) {
             authors.push(author);
         }
     }
@@ -265,6 +265,35 @@ pub fn attribute_hunk(
 
 fn shift(pos: usize, delta: isize) -> usize {
     (pos as isize + delta).max(0) as usize
+}
+
+/// Se dois intervalos `[a_start, a_end)`/`[b_start, b_end)` se tocam —
+/// tratando um intervalo de **tamanho zero** como um ponto, não como
+/// "vazio, nunca toca nada" (ADR 0008, revisão do PR): um trecho que só
+/// remove texto tem faixa de tamanho zero no texto atual, e a entrada
+/// do journal que fez essa remoção também remapeia pra um span de
+/// tamanho zero — o teste de sobreposição de intervalo semi-aberto
+/// comum (`a_start < b_end && b_start < a_end`) nunca é verdadeiro
+/// quando um dos dois lados (ou os dois) tem tamanho zero, mesmo que os
+/// dois "pontos" coincidam exatamente.
+///
+/// - Dois pontos: só contam se forem exatamente o mesmo (`a_start ==
+///   b_start`) — "a borda" dos dois precisa coincidir.
+/// - Um ponto contra um intervalo não-vazio: conta se o ponto estiver
+///   **dentro, incluindo as duas bordas** do intervalo — precisa ser
+///   inclusivo nas bordas pra uma remoção bem no início ou no fim do
+///   arquivo ainda contar.
+/// - Dois intervalos não-vazios: o teste de sobreposição comum, sem
+///   mudança.
+fn ranges_intersect(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    let a_zero = a_start == a_end;
+    let b_zero = b_start == b_end;
+    match (a_zero, b_zero) {
+        (true, true) => a_start == b_start,
+        (true, false) => b_start <= a_start && a_start <= b_end,
+        (false, true) => a_start <= b_start && b_start <= a_end,
+        (false, false) => a_start < b_end && b_start < a_end,
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +402,112 @@ mod tests {
         // o trecho inteiro, nas coordenadas atuais ("ola terra" tem 9
         // chars também, mas isso não importa pro teste: só a faixa).
         let authors = attribute_hunk(dir.path(), "f.txt", 50, (0, 9)).unwrap();
+        assert_eq!(authors.len(), 2);
+        assert!(authors.contains(&ai("s1")));
+        assert!(authors.contains(&Author::User));
+    }
+
+    #[test]
+    fn remocao_pura_da_ia_atribui_a_ela_nao_desconhecida() {
+        // Trecho que só remove texto: a entrada do journal tem
+        // `inserted` vazio, logo o span remapeado é de tamanho zero —
+        // é exatamente o bug corrigido (a faixa consultada, (5, 5),
+        // também é de tamanho zero).
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path()).unwrap();
+        journal
+            .record(100, ai("s1"), "delete", "f.txt", 5, 10, "linha", "")
+            .unwrap();
+        journal.flush(100).unwrap();
+
+        let authors = attribute_hunk(dir.path(), "f.txt", 50, (5, 5)).unwrap();
+        assert_eq!(authors, vec![ai("s1")]);
+    }
+
+    #[test]
+    fn duas_remocoes_em_pontos_diferentes_nao_sao_misto() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path()).unwrap();
+        // IA remove em [5, 8); fica um ponto em 5.
+        journal
+            .record(100, ai("s1"), "delete", "f.txt", 5, 8, "xyz", "")
+            .unwrap();
+        journal.flush(100).unwrap();
+        // Usuário remove em [20, 23), bem longe — fica um ponto em 20,
+        // sem deslocar o ponto da IA (20 >= 8, "inteiramente depois",
+        // mas o delta de um ponto não desloca outro ponto que já veio
+        // antes dele).
+        journal
+            .record(200, Author::User, "delete", "f.txt", 20, 23, "abc", "")
+            .unwrap();
+        journal.flush(200).unwrap();
+
+        assert_eq!(
+            attribute_hunk(dir.path(), "f.txt", 50, (5, 5)).unwrap(),
+            vec![ai("s1")],
+            "o ponto da IA não deveria incluir o autor do ponto do usuário"
+        );
+        assert_eq!(
+            attribute_hunk(dir.path(), "f.txt", 50, (20, 20)).unwrap(),
+            vec![Author::User],
+            "o ponto do usuário não deveria incluir a IA"
+        );
+    }
+
+    #[test]
+    fn duas_remocoes_no_mesmo_ponto_sao_misto() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path()).unwrap();
+        // IA remove em [5, 8) -> ponto em 5.
+        journal
+            .record(100, ai("s1"), "delete", "f.txt", 5, 8, "xyz", "")
+            .unwrap();
+        journal.flush(100).unwrap();
+        // Usuário remove depois, bem no mesmo ponto 5 (end <= from do
+        // span da IA: 5 <= 5 — o span da IA fica intacto, e o novo
+        // span do usuário nasce exatamente ali também).
+        journal
+            .record(200, Author::User, "delete", "f.txt", 5, 7, "no", "")
+            .unwrap();
+        journal.flush(200).unwrap();
+
+        let authors = attribute_hunk(dir.path(), "f.txt", 50, (5, 5)).unwrap();
+        assert_eq!(authors.len(), 2);
+        assert!(authors.contains(&ai("s1")));
+        assert!(authors.contains(&Author::User));
+    }
+
+    #[test]
+    fn remocao_no_inicio_e_no_fim_do_arquivo_atribuem_corretamente() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path()).unwrap();
+        // IA remove os 2 primeiros caracteres (texto original de 10
+        // chars) -> ponto em 0.
+        journal
+            .record(100, ai("s1"), "delete", "f.txt", 0, 2, "xy", "")
+            .unwrap();
+        journal.flush(100).unwrap();
+        // Usuário remove os 2 últimos caracteres (já nas coordenadas
+        // depois da primeira remoção: texto de 8 chars, posições 6-8)
+        // -> ponto em 6, que é o fim do arquivo atual (10 - 2 - 2 = 6).
+        journal
+            .record(200, Author::User, "delete", "f.txt", 6, 8, "zw", "")
+            .unwrap();
+        journal.flush(200).unwrap();
+
+        // Ponto exato em 0 (início) só a IA.
+        assert_eq!(
+            attribute_hunk(dir.path(), "f.txt", 50, (0, 0)).unwrap(),
+            vec![ai("s1")]
+        );
+        // Ponto exato em 6 (fim do arquivo atual) só o usuário.
+        assert_eq!(
+            attribute_hunk(dir.path(), "f.txt", 50, (6, 6)).unwrap(),
+            vec![Author::User]
+        );
+        // A faixa do arquivo inteiro (0, 6) inclui os dois — a borda
+        // em 0 e a borda em 6 contam (inclusivas nas duas pontas).
+        let authors = attribute_hunk(dir.path(), "f.txt", 50, (0, 6)).unwrap();
         assert_eq!(authors.len(), 2);
         assert!(authors.contains(&ai("s1")));
         assert!(authors.contains(&Author::User));

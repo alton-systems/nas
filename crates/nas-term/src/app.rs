@@ -126,6 +126,11 @@ struct ReviewHunk {
     decision: Option<nas_history::ReviewDecision>,
     header_line: usize,
     body_end_line: usize,
+    /// O arquivo existia no checkpoint ("antes") e não existe mais
+    /// agora — nem buffer, nem disco (ADR 0008, revisão do PR: "arquivo
+    /// removido"). `after` é sempre vazio nesse caso; rejeitar recria o
+    /// arquivo em vez de editar uma região dele.
+    removed_file: bool,
 }
 
 /// Uma revisão aberta (`Ctrl+t v`/`Ctrl+t V`) — docs/decisions/0008-modo-de-revisao.md
@@ -1881,10 +1886,6 @@ impl App {
 
         let mut hunks = Vec::new();
         for path in &paths {
-            let Some(new_bytes) = self.current_content_for(path) else {
-                continue; // arquivo não existe mais nem em buffer nem em disco.
-            };
-            let new_text = String::from_utf8_lossy(&new_bytes).into_owned();
             let old_text =
                 match nas_history::file_text_at_checkpoint(history_dir, &checkpoint.id, path)
                     .unwrap_or(None)
@@ -1899,6 +1900,46 @@ impl App {
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                         .unwrap_or_default(),
                 };
+
+            let Some(new_bytes) = self.current_content_for(path) else {
+                // Arquivo rastreado pelo checkpoint, agora ausente —
+                // nem buffer, nem disco. Se nunca teve conteúdo (não
+                // existia nem no "antes"), não há nada pra revisar;
+                // senão é um "arquivo removido" — um trecho só, com o
+                // conteúdo antigo inteiro do lado "-" (ADR 0008,
+                // revisão do PR).
+                if old_text.is_empty() {
+                    continue;
+                }
+                let hash = nas_history::hunk_hash(path, &checkpoint.id, &old_text, "", 1);
+                // Sem texto atual (o arquivo não existe), a autoria é
+                // a de quem fez a remoção em si — o mesmo mecanismo de
+                // `attribute_hunk`, consultado no ponto (0, 0): a
+                // entrada que removeu o arquivo (tipicamente de
+                // `from=0` até o fim) remapeia pra um span de tamanho
+                // zero bem ali.
+                let authors =
+                    nas_history::attribute_hunk(history_dir, path, checkpoint.created_at, (0, 0))
+                        .unwrap_or_default();
+                let decision = marks
+                    .iter()
+                    .find(|m| &m.file == path && m.hunk_hash == hash)
+                    .map(|m| m.decision);
+                hunks.push(ReviewHunk {
+                    file: path.to_string(),
+                    before: old_text,
+                    after: String::new(),
+                    after_start_line: 1,
+                    hash,
+                    authors,
+                    decision,
+                    header_line: 0,
+                    body_end_line: 0,
+                    removed_file: true,
+                });
+                continue;
+            };
+            let new_text = String::from_utf8_lossy(&new_bytes).into_owned();
             if old_text == new_text {
                 continue;
             }
@@ -1935,6 +1976,7 @@ impl App {
                     decision,
                     header_line: 0,
                     body_end_line: 0,
+                    removed_file: false,
                 });
             }
         }
@@ -2022,7 +2064,9 @@ impl App {
     /// só se o texto atual ainda for exatamente o que a IA deixou
     /// (mesma semântica de `edit`, ADR 0006 §3/0008 §3): busca o texto
     /// "depois" exato no conteúdo atual do arquivo, recusa se não
-    /// achar ou achar mais de uma vez.
+    /// achar ou achar mais de uma vez. Um trecho "arquivo removido"
+    /// (ADR 0008, revisão do PR) vai por [`Self::review_reject_removed_file`]
+    /// — recriar um arquivo não é "achar o texto depois e substituir".
     fn review_reject(&mut self) {
         let Some(idx) = self.current_review_hunk() else {
             self.set_status_message("Nenhum trecho sob o cursor.".to_string());
@@ -2033,6 +2077,11 @@ impl App {
         };
         let hunk = session.hunks[idx].clone();
         let from_checkpoint = session.from_checkpoint.clone();
+
+        if hunk.removed_file {
+            self.review_reject_removed_file(hunk, from_checkpoint);
+            return;
+        }
 
         let Some(current_bytes) = self.current_content_for(&hunk.file) else {
             self.set_status_message(format!("'{}' não existe mais.", hunk.file));
@@ -2105,12 +2154,78 @@ impl App {
         }
 
         self.rebuild_review();
-        self.set_status_message("Trecho rejeitado.".to_string());
+        self.set_status_message(review_reject_message(already_open).to_string());
+    }
+
+    /// Rejeitar um trecho "arquivo removido" (ADR 0008, revisão do
+    /// PR): recria o arquivo com o conteúdo do checkpoint — mesmo
+    /// caminho de `restore_file` (substitui o conteúdo inteiro do
+    /// buffer, salva se for um buffer novo, journala como edição do
+    /// usuário). Recusa se o arquivo já não estiver mais ausente (algo
+    /// o recriou com outro conteúdo desde que a revisão foi montada) —
+    /// mesma cautela de `review_reject`, só que a condição é "ainda
+    /// está removido", não "o texto ainda bate".
+    fn review_reject_removed_file(&mut self, hunk: ReviewHunk, from_checkpoint: String) {
+        if self.current_content_for(&hunk.file).is_some() {
+            self.set_status_message(format!(
+                "'{}' já mudou desde a revisão — rejeitar recusado.",
+                hunk.file
+            ));
+            return;
+        }
+
+        let already_open = self.find_buffer_by_path(Path::new(&hunk.file)).is_some();
+        let buffer_index = match self.find_buffer_by_path(Path::new(&hunk.file)) {
+            Some(index) => index,
+            None => match Document::open(&hunk.file) {
+                Ok(document) => {
+                    self.buffers.push(Buffer::new(document));
+                    self.buffers.len() - 1
+                }
+                Err(err) => {
+                    self.set_status_message(format!("Erro ao abrir '{}': {err}", hunk.file));
+                    return;
+                }
+            },
+        };
+        let change = self.buffers[buffer_index]
+            .document
+            .replace_all(&hunk.before);
+        if !already_open && let Err(err) = self.buffers[buffer_index].document.save() {
+            self.set_status_message(format!("Erro ao gravar '{}': {err}", hunk.file));
+            return;
+        }
+        self.journal_record_for(
+            hunk.file.clone(),
+            "review-reject",
+            change.from,
+            change.to,
+            change.removed,
+            change.inserted,
+        );
+
+        if let Some(history_dir) = self.history_dir() {
+            let mark = nas_history::ReviewMark {
+                ts: nas_history::now_unix(),
+                reviewer: Author::User,
+                from_checkpoint,
+                file: hunk.file.clone(),
+                hunk_hash: hunk.hash.clone(),
+                decision: nas_history::ReviewDecision::Rejected,
+            };
+            let _ = nas_history::record_mark(&history_dir, &mark);
+        }
+
+        self.rebuild_review();
+        self.set_status_message(review_reject_message(already_open).to_string());
     }
 
     /// `g h`, dentro da revisão: abre o arquivo real na linha do
     /// trecho sob o cursor e sai da revisão. Sem trecho atual (ou
-    /// fora da revisão, `self.review` é `None`), não tem efeito.
+    /// fora da revisão, `self.review` é `None`), não tem efeito. Um
+    /// trecho "arquivo removido" não tem arquivo nenhum pra abrir —
+    /// avisa em vez de abrir um buffer vazio numa "linha" que não
+    /// existe (ADR 0008, revisão do PR).
     fn review_goto(&mut self) {
         let Some(idx) = self.current_review_hunk() else {
             self.set_status_message("Nenhum trecho sob o cursor.".to_string());
@@ -2119,6 +2234,12 @@ impl App {
         let Some(session) = &self.review else {
             return;
         };
+        if session.hunks[idx].removed_file {
+            self.set_status_message(
+                "Arquivo removido — não há onde ir; rejeitar recria o arquivo.".to_string(),
+            );
+            return;
+        }
         let file = session.hunks[idx].file.clone();
         let line = session.hunks[idx].after_start_line;
         self.close_review();
@@ -2567,6 +2688,23 @@ fn format_hunk_authors(authors: &[Author]) -> String {
     }
 }
 
+/// A mensagem da echo area depois de um `review_reject` com sucesso —
+/// ADR 0008, revisão do PR: distingue se a rejeição já está em disco
+/// ou só pendente no buffer. `already_open` é exatamente a condição
+/// que decide isso em `review_reject`/`review_reject_removed_file`: um
+/// buffer que já estava aberto não é salvo automaticamente (o usuário
+/// decide quando salvar, como qualquer outra edição sua), então a
+/// rejeição fica como alteração não salva; um buffer novo, aberto só
+/// pra esta rejeição, é salvo na hora — senão o arquivo real nunca
+/// mudaria.
+fn review_reject_message(already_open: bool) -> &'static str {
+    if already_open {
+        "Trecho rejeitado; arquivo com alterações não salvas."
+    } else {
+        "Trecho rejeitado e salvo."
+    }
+}
+
 /// O deslocamento em caracteres do início da linha `line` (1-indexada,
 /// como `nas_history::TextHunk::new_start_line`) dentro de `text` —
 /// pra converter a posição de um trecho (em linhas) pra um intervalo
@@ -2594,9 +2732,22 @@ fn render_review_buffer(hunks: &mut [ReviewHunk]) -> String {
         .map(|h| h.file.as_str())
         .collect::<HashSet<_>>()
         .len();
+    // Arquivos removidos entram na contagem de arquivos/trechos acima
+    // (são `ReviewHunk`s como qualquer outro) — esta conta é só pra
+    // destacar quantos deles são remoção de arquivo inteiro, não uma
+    // contagem paralela (ADR 0008, revisão do PR: "o resumo do topo
+    // conta arquivos removidos").
+    let removed_files = hunks.iter().filter(|h| h.removed_file).count();
+    let removed_note = if removed_files > 0 {
+        format!(", {removed_files} removido(s)")
+    } else {
+        String::new()
+    };
 
     let mut lines: Vec<String> = vec![
-        format!("Revisão — {files} arquivo(s), {total} trecho(s), {reviewed} já revisado(s)"),
+        format!(
+            "Revisão — {files} arquivo(s){removed_note}, {total} trecho(s), {reviewed} já revisado(s)"
+        ),
         String::new(),
     ];
 
@@ -2610,12 +2761,20 @@ fn render_review_buffer(hunks: &mut [ReviewHunk]) -> String {
             current_file = Some(hunk.file.as_str());
         }
 
-        let mut header = format!(
-            "{}:{}  {}",
-            hunk.file,
-            hunk.after_start_line,
-            format_hunk_authors(&hunk.authors)
-        );
+        let mut header = if hunk.removed_file {
+            format!(
+                "{}  arquivo removido  {}",
+                hunk.file,
+                format_hunk_authors(&hunk.authors)
+            )
+        } else {
+            format!(
+                "{}:{}  {}",
+                hunk.file,
+                hunk.after_start_line,
+                format_hunk_authors(&hunk.authors)
+            )
+        };
         match hunk.decision {
             Some(nas_history::ReviewDecision::Accepted) => header.push_str("  [revisado]"),
             Some(nas_history::ReviewDecision::Rejected) => header.push_str("  [rejeitado]"),
@@ -4294,6 +4453,69 @@ mod tests {
         assert!(
             message.contains("recusado"),
             "mensagem deveria explicar a recusa: {message}"
+        );
+    }
+
+    #[test]
+    fn arquivo_removido_aparece_na_revisao_e_rejeitar_recria() {
+        let project_dir = tempfile::tempdir().expect("diretório temporário");
+        let state_home = tempfile::tempdir().expect("diretório temporário");
+
+        let mut app = App::with_layout(Document::empty(), Layout::Qwerty);
+        let history_dir = attached_full_history(&mut app, project_dir.path(), state_home.path());
+
+        let before = "conteudo original\nsegunda linha\n";
+        let (path, _) = ai_checkpoint_and_disk(
+            &history_dir,
+            project_dir.path(),
+            "sumiu.txt",
+            before,
+            before,
+            "sessao-1",
+            100,
+        );
+        // A sessão apagou o arquivo depois do checkpoint — nem buffer
+        // aberto, nem disco (poderia ter sido `checkpoint_restore`
+        // sobre um checkpoint sem este arquivo; apagar direto é o
+        // jeito mais direto de simular o mesmo estado final).
+        fs::remove_file(&path).expect("remover arquivo");
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('v')));
+
+        let session = app.review.as_ref().expect("revisão deveria estar aberta");
+        assert_eq!(session.hunks.len(), 1, "um trecho só: o arquivo removido");
+        assert!(session.hunks[0].removed_file);
+        assert_eq!(session.hunks[0].before, before);
+        assert!(session.hunks[0].after.is_empty());
+
+        let text = app.document().full_text();
+        assert!(
+            text.contains("arquivo removido"),
+            "a tela deveria rotular o trecho como arquivo removido: {text}"
+        );
+        assert!(
+            text.contains("1 removido"),
+            "o resumo deveria contar o arquivo removido: {text}"
+        );
+
+        move_cursor_to_hunk(&mut app, 0);
+        app.handle_key(key(KeyCode::Char('u'))); // rejeitar
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "rejeitar deveria recriar o arquivo com o conteúdo do checkpoint"
+        );
+        let session = app.review.as_ref().expect("revisão ainda aberta");
+        assert!(
+            session.hunks.is_empty() || session.hunks[0].decision.is_some(),
+            "o trecho deveria desaparecer (antes==depois agora) ou aparecer marcado"
+        );
+        let message = app.status_message().expect("deveria avisar o resultado");
+        assert!(
+            message.contains("rejeitado"),
+            "mensagem deveria confirmar a rejeição: {message}"
         );
     }
 
