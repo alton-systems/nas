@@ -46,6 +46,16 @@ pub enum CommandError {
     /// (`nas-mcp`) já devia ter recusado antes de chegar aqui; este é
     /// só o cinto de segurança do `Registry` em si (etapa 3d).
     NeedsApproval { command: String, effect: Effect },
+    /// `list_symbols`/`read_symbol`: a extensão do arquivo não tem
+    /// suporte ainda (ADR 0006 §8, etapa 3f-prep) — hoje, só `.rs` e
+    /// `.md`/`.markdown`.
+    UnsupportedLanguage(String),
+    /// `read_symbol`: nenhum símbolo bateu com o nome pedido.
+    SymbolNotFound(String),
+    /// `read_symbol`: o nome pedido bateu com mais de um símbolo —
+    /// cada item já formatado como `"nome (linha N)"`, pra
+    /// desambiguar (ex.: com o nome qualificado `Tipo::metodo`).
+    AmbiguousSymbol(Vec<String>),
 }
 
 impl fmt::Display for CommandError {
@@ -79,6 +89,15 @@ impl fmt::Display for CommandError {
                 f,
                 "{command:?} tem efeito {effect:?}, que pede aprovação e não foi liberado — rode nas --permissions neste projeto pra ver ou liberar o que falta"
             ),
+            CommandError::UnsupportedLanguage(ext) => {
+                write!(f, "linguagem ainda não suportada: {ext:?}")
+            }
+            CommandError::SymbolNotFound(name) => {
+                write!(f, "nenhum símbolo chamado {name:?} encontrado")
+            }
+            CommandError::AmbiguousSymbol(candidates) => {
+                write!(f, "nome ambíguo — candidatos: {}", candidates.join(", "))
+            }
         }
     }
 }
@@ -102,5 +121,15 @@ impl From<io::Error> for CommandError {
 impl From<nas_editor::OpenError> for CommandError {
     fn from(err: nas_editor::OpenError) -> Self {
         CommandError::Io(err.into())
+    }
+}
+
+impl From<nas_syntax::SyntaxError> for CommandError {
+    fn from(err: nas_syntax::SyntaxError) -> Self {
+        match err {
+            nas_syntax::SyntaxError::UnsupportedLanguage(ext) => {
+                CommandError::UnsupportedLanguage(ext)
+            }
+        }
     }
 }

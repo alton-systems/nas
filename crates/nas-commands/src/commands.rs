@@ -1,8 +1,8 @@
-//! Os nove comandos iniciais (docs/decisions/0006-ia-trabalha-pelo-nas.md
-//! §1/§3), cada um uma função Rust tipada registrada em
+//! Os comandos nativos (docs/decisions/0006-ia-trabalha-pelo-nas.md
+//! §1/§3/§8), cada um uma função Rust tipada registrada em
 //! `register_all` — sem macro, sem núcleo em segundo plano ainda
-//! (etapa 3a): chamam `Document`/`nas-history` direto, através do
-//! `Workspace`.
+//! (etapa 3a): chamam `Document`/`nas-history`/`nas-syntax` direto,
+//! através do `Workspace`.
 
 use std::path::Path;
 
@@ -14,8 +14,8 @@ use crate::effect::Effect;
 use crate::error::CommandError;
 use crate::registry::{Registry, typed_command};
 
-/// Os dez comandos: todos marcados `exposed_to_ai: true` nesta etapa
-/// — a marcação já existe (ADR 0006 §5/ADR 0007 §5: "estar no
+/// Todos os comandos nativos: marcados `exposed_to_ai: true` nesta
+/// etapa — a marcação já existe (ADR 0006 §5/ADR 0007 §5: "estar no
 /// registro não basta"), mas nenhum comando nativo tem razão pra
 /// ficar de fora ainda. Um comando de usuário (quando o Steel
 /// chegar) é que nasce privado por padrão.
@@ -29,7 +29,7 @@ pub fn register_all(registry: &mut Registry) {
     ));
     registry.register(typed_command(
         "read",
-        "Lê o conteúdo de um arquivo já aberto, com números de linha.",
+        "Lê o conteúdo de um arquivo (abre sozinho, se preciso), com números de linha; aceita start_line/end_line (1-indexadas, inclusive) pra ler só um intervalo.",
         Effect::Pure,
         true,
         read,
@@ -48,12 +48,39 @@ pub fn register_all(registry: &mut Registry) {
         true,
         list_files,
     ));
+    registry.register(
+        typed_command(
+            "edit",
+            "Substitui um texto antigo exato por um novo texto num arquivo (abre sozinho, se preciso); recusa se o texto antigo não for encontrado ou aparecer mais de uma vez (use line_range pra desambiguar). Devolve o trecho alterado com contexto. Com save: true, já grava no disco nesta mesma chamada (efeito passa a write-file, pedindo aprovação).",
+            Effect::WriteBuffer,
+            true,
+            edit,
+        )
+        .with_dynamic_effect(Effect::WriteFile, |args| {
+            if args
+                .get("save")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                Effect::WriteFile
+            } else {
+                Effect::WriteBuffer
+            }
+        }),
+    );
     registry.register(typed_command(
-        "edit",
-        "Substitui um texto antigo exato por um novo texto num arquivo já aberto; recusa se o texto antigo não for encontrado ou aparecer mais de uma vez (use line_range pra desambiguar).",
-        Effect::WriteBuffer,
+        "list_symbols",
+        "Lista os símbolos de um arquivo (funções, métodos Tipo::metodo, structs, enums, traits, impls, consts e mods em Rust; títulos em Markdown), com tipo e intervalo de linhas — abre o arquivo sozinho, se preciso.",
+        Effect::ReadFile,
         true,
-        edit,
+        list_symbols,
+    ));
+    registry.register(typed_command(
+        "read_symbol",
+        "Devolve o texto completo de um símbolo (aceita nome qualificado, ex. Tipo::metodo), incluindo doc comments/atributos logo acima; recusa listando os candidatos se o nome for ambíguo.",
+        Effect::ReadFile,
+        true,
+        read_symbol,
     ));
     registry.register(typed_command(
         "show_diff",
@@ -92,19 +119,39 @@ pub fn register_all(registry: &mut Registry) {
     ));
 }
 
-/// Numera as linhas de `text` (1-indexado) — formato que as leituras
-/// (`read`, cada ocorrência de `search`) devolvem, pra que a IA possa
-/// montar o `line_range` de um `edit` sem contar linhas por conta
-/// própria (ADR 0006 §3).
-fn with_line_numbers(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let width = lines.len().max(1).to_string().len();
-    lines
-        .iter()
+/// Numera as linhas `from_line..=to_line` (1-indexadas, inclusive, já
+/// dentro dos limites de `text`) de `text` com o número **absoluto**
+/// de cada linha — nunca renumerado a partir de 1 quando
+/// `from_line > 1` — formato que as leituras (`read`, cada ocorrência
+/// de `search`, o trecho de `edit`, `read_symbol`) devolvem, pra que
+/// a IA possa montar o `line_range` de um `edit` subsequente sem
+/// contar linhas por conta própria (ADR 0006 §3/§8). `total_lines` só
+/// entra na largura do preenchimento — pra que o número de uma linha
+/// no meio do arquivo continue alinhado com o resto, mesmo quando só
+/// um pedaço é devolvido.
+fn numbered_lines(text: &str, from_line: usize, to_line: usize, total_lines: usize) -> String {
+    let width = total_lines.max(1).to_string().len();
+    text.lines()
         .enumerate()
+        .skip(from_line.saturating_sub(1))
+        .take(to_line.saturating_sub(from_line) + 1)
         .map(|(idx, line)| format!("{:>width$} {line}", idx + 1, width = width))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A linha (1-indexada) que contém o caractere `offset` de `text`.
+fn line_number_for_offset(text: &str, offset: usize) -> usize {
+    let mut line = 1;
+    for (count, ch) in text.chars().enumerate() {
+        if count >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+        }
+    }
+    line
 }
 
 /// O offset (em caracteres) de onde cada linha de `text` começa —
@@ -160,15 +207,31 @@ fn open_file(ctx: &mut CommandContext, args: OpenFileArgs) -> Result<OpenFileRes
     })
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct ReadArgs {
     pub path: String,
+    /// Linha inicial (1-indexada, inclusive) do intervalo a ler — o
+    /// arquivo inteiro, a partir da linha 1, se omitida junto com
+    /// `end_line` (ADR 0006 §8, etapa 3f-prep). Fora dos limites do
+    /// arquivo é tolerado, nunca um erro — só resulta num intervalo
+    /// vazio.
+    #[serde(default)]
+    pub start_line: Option<usize>,
+    /// Linha final (1-indexada, inclusive) — até o fim do arquivo,
+    /// se omitida.
+    #[serde(default)]
+    pub end_line: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ReadResult {
-    /// O texto do arquivo, uma linha por linha do original, cada uma
-    /// prefixada pelo seu número (1-indexado).
+    /// O texto pedido, numerado (1-indexado, absoluto — não
+    /// renumerado quando é só um intervalo). Quando `start_line`/
+    /// `end_line` foi dado, a primeira linha é um cabeçalho
+    /// ("linhas X–Y de N") dizendo qual intervalo saiu e quantas
+    /// linhas o arquivo tem no total — omitido quando nenhum dos
+    /// dois argumentos foi passado (o arquivo inteiro, como antes
+    /// desta etapa).
     pub text: String,
     /// Presente se o arquivo mudou no disco desde a última leitura
     /// e este buffer tem alterações ainda não salvas — o texto acima
@@ -179,12 +242,28 @@ pub struct ReadResult {
 
 fn read(ctx: &mut CommandContext, args: ReadArgs) -> Result<ReadResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
+    ctx.workspace.open(&path)?;
     let warning = ctx.workspace.sync_with_disk(&path)?;
     let document = ctx.workspace.document(&path)?;
-    Ok(ReadResult {
-        text: with_line_numbers(&document.full_text()),
-        warning,
-    })
+    let full = document.full_text();
+    let total = full.lines().count();
+
+    let text = if args.start_line.is_none() && args.end_line.is_none() {
+        numbered_lines(&full, 1, total.max(1), total)
+    } else {
+        let start = args.start_line.unwrap_or(1).max(1);
+        let end = args.end_line.unwrap_or(total).min(total);
+        if start > end || start > total {
+            format!("linhas 0–0 de {total}\n")
+        } else {
+            format!(
+                "linhas {start}–{end} de {total}\n{}",
+                numbered_lines(&full, start, end, total)
+            )
+        }
+    };
+
+    Ok(ReadResult { text, warning })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -268,7 +347,7 @@ fn list_files(
     Ok(ListFilesResult { files })
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct EditArgs {
     pub path: String,
     /// O texto exato a substituir — precisa aparecer exatamente uma
@@ -280,12 +359,31 @@ pub struct EditArgs {
     /// inteiro.
     #[serde(default)]
     pub line_range: Option<[usize; 2]>,
+    /// Se `true`, grava a mudança no disco nesta mesma chamada —
+    /// equivalente a chamar `save_file` logo depois, numa única
+    /// ferramenta (ADR 0006 §8, etapa 3f-prep). Muda o efeito desta
+    /// chamada de `WriteBuffer` pra `WriteFile`: pede aprovação se
+    /// quem chama não for o usuário, e vale a mesma regra de
+    /// conflito de `save_file` (recusa com `DiskChanged` se o disco
+    /// mudou desde a última leitura) — nesse caso a edição em
+    /// memória já aconteceu, mas nada foi pro disco.
+    #[serde(default)]
+    pub save: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct EditResult {
     pub from: usize,
     pub to: usize,
+    /// `true` só quando `save` foi pedido e a gravação teve sucesso
+    /// — uma recusa por conflito de disco já é um `CommandError`,
+    /// nunca chega a construir este resultado.
+    pub saved: bool,
+    /// O trecho alterado, com até três linhas de contexto antes e
+    /// depois, numerado com os mesmos números absolutos de `read` —
+    /// pra a IA conferir o efeito sem precisar de um `read` extra
+    /// (ADR 0006 §8, etapa 3f-prep).
+    pub snippet: String,
     /// Mesmo aviso de `ReadResult::warning` — se presente, a busca
     /// por `old_text` abaixo ainda rodou contra o buffer (não contra
     /// o disco mudado), pra nunca descartar a edição pendente.
@@ -295,6 +393,7 @@ pub struct EditResult {
 
 fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
+    ctx.workspace.open(&path)?;
     let warning = ctx.workspace.sync_with_disk(&path)?;
     let document = ctx.workspace.document(&path)?;
     let text = document.full_text();
@@ -338,7 +437,127 @@ fn edit(ctx: &mut CommandContext, args: EditArgs) -> Result<EditResult, CommandE
         ctx.warnings.push(tracking_warning);
     }
 
-    Ok(EditResult { from, to, warning })
+    let saved = if args.save {
+        save_to_disk(ctx, &path)?;
+        true
+    } else {
+        false
+    };
+
+    let updated_text = ctx.workspace.document(&path)?.full_text();
+    let total_lines = updated_text.lines().count().max(1);
+    let edit_start_line = line_number_for_offset(&updated_text, from);
+    let edit_end_line = line_number_for_offset(&updated_text, from + args.new_text.chars().count());
+    let context_start = edit_start_line.saturating_sub(3).max(1);
+    let context_end = (edit_end_line + 3).min(total_lines);
+    let snippet = numbered_lines(&updated_text, context_start, context_end, total_lines);
+
+    Ok(EditResult {
+        from,
+        to,
+        saved,
+        snippet,
+        warning,
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListSymbolsArgs {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SymbolSummary {
+    /// `"fn"`, `"method"`, `"struct"`, `"enum"`, `"trait"`, `"impl"`,
+    /// `"const"` ou `"mod"` em Rust; `"heading"` em Markdown.
+    pub kind: String,
+    /// Já qualificado (`Tipo::metodo`) quando for um método.
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+impl From<nas_syntax::Symbol> for SymbolSummary {
+    fn from(symbol: nas_syntax::Symbol) -> Self {
+        SymbolSummary {
+            kind: symbol.kind.label().to_string(),
+            name: symbol.name,
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListSymbolsResult {
+    pub symbols: Vec<SymbolSummary>,
+}
+
+fn list_symbols(
+    ctx: &mut CommandContext,
+    args: ListSymbolsArgs,
+) -> Result<ListSymbolsResult, CommandError> {
+    let path = ctx.workspace.resolve(&args.path)?;
+    ctx.workspace.open(&path)?;
+    let source = ctx.workspace.document(&path)?.full_text();
+    let symbols = nas_syntax::list_symbols(&path, &source)?;
+    Ok(ListSymbolsResult {
+        symbols: symbols.into_iter().map(SymbolSummary::from).collect(),
+    })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadSymbolArgs {
+    pub path: String,
+    /// Nome do símbolo — aceita qualificado (`Tipo::metodo`) pra
+    /// desambiguar entre tipos diferentes com um método do mesmo
+    /// nome.
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadSymbolResult {
+    pub kind: String,
+    pub name: String,
+    /// O texto do símbolo inteiro — doc comments e atributos
+    /// imediatamente acima inclusos, quando houver — numerado como
+    /// `read`.
+    pub text: String,
+}
+
+fn read_symbol(
+    ctx: &mut CommandContext,
+    args: ReadSymbolArgs,
+) -> Result<ReadSymbolResult, CommandError> {
+    let path = ctx.workspace.resolve(&args.path)?;
+    ctx.workspace.open(&path)?;
+    let source = ctx.workspace.document(&path)?.full_text();
+    let symbols = nas_syntax::list_symbols(&path, &source)?;
+
+    let matches: Vec<_> = symbols
+        .into_iter()
+        .filter(|s| s.name == args.name)
+        .collect();
+    let symbol = match matches.len() {
+        0 => return Err(CommandError::SymbolNotFound(args.name)),
+        1 => matches.into_iter().next().expect("checado acima"),
+        _ => {
+            return Err(CommandError::AmbiguousSymbol(
+                matches
+                    .iter()
+                    .map(|s| format!("{} (linha {})", s.name, s.start_line))
+                    .collect(),
+            ));
+        }
+    };
+
+    let total = source.lines().count().max(1);
+    let text = numbered_lines(&source, symbol.doc_start_line, symbol.end_line, total);
+    Ok(ReadSymbolResult {
+        kind: symbol.kind.label().to_string(),
+        name: symbol.name,
+        text,
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -440,18 +659,31 @@ pub struct SaveFileResult {
 /// por fora — nunca sobrescreve trabalho de outro processo (revisão
 /// da etapa 3c). Quem chama precisa reabrir com `open_file`
 /// (`Workspace::open_or_resync`, que de fato recarrega e resolve a
-/// pendência) antes de tentar salvar de novo.
+/// pendência) antes de tentar salvar de novo. Abre `path` sozinho se
+/// ainda não for um buffer (ADR 0006 §8, etapa 3f-prep) — nesse caso
+/// não há nada em memória além do que já está no disco, então salvar
+/// é um no-op sobre o próprio conteúdo lido.
 fn save_file(ctx: &mut CommandContext, args: SaveFileArgs) -> Result<SaveFileResult, CommandError> {
     let path = ctx.workspace.resolve(&args.path)?;
-    if ctx.workspace.sync_with_disk(&path)?.is_some() {
-        return Err(CommandError::DiskChanged(path.display().to_string()));
-    }
-    ctx.workspace.save(&path)?;
-    let content = ctx.workspace.document(&path)?.full_text();
-    ctx.workspace.record_last_save(&path, &content, &ctx.author);
+    ctx.workspace.open(&path)?;
+    save_to_disk(ctx, &path)?;
     Ok(SaveFileResult {
         path: path.to_string_lossy().into_owned(),
     })
+}
+
+/// O corpo de `save_file`, compartilhado com `edit(save: true)` (ADR
+/// 0006 §8, etapa 3f-prep) — a mesma regra de conflito de disco vale
+/// pros dois. `path` já deve ser o resultado de `resolve`, e já deve
+/// estar aberto.
+fn save_to_disk(ctx: &mut CommandContext, path: &Path) -> Result<(), CommandError> {
+    if ctx.workspace.sync_with_disk(path)?.is_some() {
+        return Err(CommandError::DiskChanged(path.display().to_string()));
+    }
+    ctx.workspace.save(path)?;
+    let content = ctx.workspace.document(path)?.full_text();
+    ctx.workspace.record_last_save(path, &content, &ctx.author);
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -630,6 +862,7 @@ mod tests {
             &mut context,
             ReadArgs {
                 path: path.to_string_lossy().into_owned(),
+                ..Default::default()
             },
         )
         .expect("ler");
@@ -637,20 +870,24 @@ mod tests {
         assert_eq!(result.text, "1 primeira\n2 segunda\n3 terceira");
     }
 
+    /// ADR 0006 §8 (etapa 3f-prep): `read` abre o arquivo sozinho —
+    /// não precisa mais de um `open_file` antes.
     #[test]
-    fn read_sem_open_file_recusa() {
+    fn read_abre_o_arquivo_sozinho_se_ainda_nao_estiver_aberto() {
         let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "primeira\nsegunda");
         let mut ws = workspace(dir.path());
         let mut context = ctx(&mut ws, Author::User);
 
-        let err = read(
+        let result = read(
             &mut context,
             ReadArgs {
-                path: "nunca-aberto.txt".to_string(),
+                path: path.to_string_lossy().into_owned(),
+                ..Default::default()
             },
         )
-        .expect_err("devia recusar");
-        assert!(matches!(err, CommandError::NotOpen(_)));
+        .expect("ler devia abrir o arquivo sozinho");
+        assert_eq!(result.text, "1 primeira\n2 segunda");
     }
 
     #[test]
@@ -720,6 +957,7 @@ mod tests {
                 old_text: "mundo".to_string(),
                 new_text: "terra".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect("editar");
@@ -729,6 +967,7 @@ mod tests {
             &mut context,
             ReadArgs {
                 path: path_str.clone(),
+                ..Default::default()
             },
         )
         .expect("ler")
@@ -762,6 +1001,7 @@ mod tests {
                 old_text: "universo".to_string(),
                 new_text: "terra".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect_err("devia recusar");
@@ -784,6 +1024,7 @@ mod tests {
                 old_text: "gato".to_string(),
                 new_text: "cão".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect_err("devia recusar por ambiguidade");
@@ -796,12 +1037,21 @@ mod tests {
                 old_text: "gato".to_string(),
                 new_text: "cão".to_string(),
                 line_range: Some([3, 3]),
+                save: false,
             },
         )
         .expect("editar desambiguado");
         assert!(result.from > 0);
 
-        let text = read(&mut context, ReadArgs { path }).expect("ler").text;
+        let text = read(
+            &mut context,
+            ReadArgs {
+                path,
+                ..Default::default()
+            },
+        )
+        .expect("ler")
+        .text;
         assert_eq!(text, "1 gato\n2 cachorro\n3 cão");
     }
 
@@ -854,6 +1104,7 @@ mod tests {
                 old_text: "versao 1".to_string(),
                 new_text: "versao 1 editada".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect("editar pra rastrear o arquivo");
@@ -874,6 +1125,7 @@ mod tests {
                 old_text: "editada".to_string(),
                 new_text: "editada de novo".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect("editar de novo");
@@ -918,6 +1170,7 @@ mod tests {
                 old_text: "original".to_string(),
                 new_text: "original rastreado".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect("editar pra rastrear");
@@ -937,6 +1190,7 @@ mod tests {
                 old_text: "rastreado".to_string(),
                 new_text: "mudado".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect("editar de novo");
@@ -946,9 +1200,15 @@ mod tests {
         assert_eq!(result.restored, vec![path_str.clone()]);
         assert!(result.failed.is_empty());
 
-        let text = read(&mut context, ReadArgs { path: path_str })
-            .expect("ler")
-            .text;
+        let text = read(
+            &mut context,
+            ReadArgs {
+                path: path_str,
+                ..Default::default()
+            },
+        )
+        .expect("ler")
+        .text;
         assert_eq!(text, "1 original rastreado");
 
         let history_dir = ws.history_dir().expect("history_dir").to_path_buf();
@@ -978,7 +1238,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&path, "mudou por fora").expect("simular mudança externa");
 
-        let result = read(&mut context, ReadArgs { path: path_str }).expect("ler");
+        let result = read(
+            &mut context,
+            ReadArgs {
+                path: path_str,
+                ..Default::default()
+            },
+        )
+        .expect("ler");
         assert_eq!(result.text, "1 mudou por fora");
         assert!(result.warning.is_none());
     }
@@ -1004,6 +1271,7 @@ mod tests {
                 old_text: "original".to_string(),
                 new_text: "original editado".to_string(),
                 line_range: None,
+                save: false,
             },
         )
         .expect("editar");
@@ -1011,7 +1279,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&path, "mudou por fora").expect("simular mudança externa");
 
-        let result = read(&mut context, ReadArgs { path: path_str }).expect("ler");
+        let result = read(
+            &mut context,
+            ReadArgs {
+                path: path_str,
+                ..Default::default()
+            },
+        )
+        .expect("ler");
         assert_eq!(
             result.text, "1 original editado",
             "o buffer com alterações não deveria ter sido descartado"
@@ -1249,6 +1524,409 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_com_intervalo_devolve_cabecalho_e_linhas_pedidas() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "um\ndois\ntres\nquatro\ncinco");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let result = read(
+            &mut context,
+            ReadArgs {
+                path: path_str,
+                start_line: Some(2),
+                end_line: Some(4),
+            },
+        )
+        .expect("ler intervalo");
+
+        assert_eq!(result.text, "linhas 2–4 de 5\n2 dois\n3 tres\n4 quatro");
+    }
+
+    #[test]
+    fn read_com_intervalo_fora_dos_limites_e_tolerante() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "um\ndois\ntres");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+
+        // end_line além do fim do arquivo: clampa pro total, sem erro.
+        let result = read(
+            &mut context,
+            ReadArgs {
+                path: path_str.clone(),
+                start_line: Some(2),
+                end_line: Some(100),
+            },
+        )
+        .expect("ler intervalo além do fim");
+        assert_eq!(result.text, "linhas 2–3 de 3\n2 dois\n3 tres");
+
+        // start_line além do fim do arquivo: intervalo vazio, sem erro.
+        let result = read(
+            &mut context,
+            ReadArgs {
+                path: path_str,
+                start_line: Some(50),
+                end_line: None,
+            },
+        )
+        .expect("ler com start_line fora dos limites");
+        assert_eq!(result.text, "linhas 0–0 de 3\n");
+    }
+
+    /// ADR 0006 §8 (etapa 3f-prep): `edit` abre o arquivo sozinho —
+    /// não precisa mais de um `open_file` antes.
+    #[test]
+    fn edit_abre_o_arquivo_sozinho_se_ainda_nao_estiver_aberto() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola mundo");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+
+        let result = edit(
+            &mut context,
+            EditArgs {
+                path: path.to_string_lossy().into_owned(),
+                old_text: "mundo".to_string(),
+                new_text: "terra".to_string(),
+                line_range: None,
+                save: false,
+            },
+        )
+        .expect("editar devia abrir o arquivo sozinho");
+        assert_eq!((result.from, result.to), (4, 9));
+        assert!(!result.saved);
+    }
+
+    /// ADR 0006 §8 (etapa 3f-prep): `save_file` abre o arquivo
+    /// sozinho — como não há nada em memória além do que já está no
+    /// disco, salvar é um no-op sobre o próprio conteúdo lido.
+    #[test]
+    fn save_file_abre_o_arquivo_sozinho_se_ainda_nao_estiver_aberto() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+
+        save_file(
+            &mut context,
+            SaveFileArgs {
+                path: path.to_string_lossy().into_owned(),
+            },
+        )
+        .expect("salvar devia abrir o arquivo sozinho");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ola");
+    }
+
+    /// ADR 0006 §8 (etapa 3f-prep): o resultado de `edit` inclui o
+    /// trecho alterado com até três linhas de contexto antes e
+    /// depois, numeradas com os números absolutos do arquivo.
+    #[test]
+    fn edit_devolve_trecho_com_contexto() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let text = "linha1\nlinha2\nlinha3\nALVO\nlinha5\nlinha6\nlinha7\nlinha8";
+        let path = write(dir.path(), "a.txt", text);
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+        open_file(
+            &mut context,
+            OpenFileArgs {
+                path: path_str.clone(),
+            },
+        )
+        .expect("abrir");
+
+        let result = edit(
+            &mut context,
+            EditArgs {
+                path: path_str,
+                old_text: "ALVO".to_string(),
+                new_text: "MUDOU".to_string(),
+                line_range: None,
+                save: false,
+            },
+        )
+        .expect("editar");
+
+        assert_eq!(
+            result.snippet,
+            "1 linha1\n2 linha2\n3 linha3\n4 MUDOU\n5 linha5\n6 linha6\n7 linha7"
+        );
+    }
+
+    /// ADR 0006 §5/§8 (etapa 3f-prep): `edit` com `save: true`, pedido
+    /// por um autor que não é o usuário, pede aprovação de
+    /// `write-file` como `save_file` já pedia — e, sem aprovação, nem
+    /// chega a gravar no disco (a edição em memória continuaria
+    /// isolada caso a chamada tivesse sido aceita só parcialmente, o
+    /// que nunca acontece aqui: o `Registry` recusa antes de chamar
+    /// `edit` de verdade).
+    #[test]
+    fn edit_com_save_pede_aprovacao_de_write_file_pra_quem_nao_e_usuario() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let author = Author::Ai {
+            agent: "teste".to_string(),
+            session: "s1".to_string(),
+        };
+        let mut context = ctx(&mut ws, author);
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+        let path_str = path.to_string_lossy().into_owned();
+
+        registry
+            .run(
+                "open_file",
+                &mut context,
+                serde_json::json!({ "path": path_str }),
+            )
+            .expect("abrir");
+
+        // Sem save: edita livremente, sem aprovação nenhuma — o
+        // efeito continua WriteBuffer.
+        registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "ola", "new_text": "oi" }),
+            )
+            .expect("editar sem save não devia precisar de aprovação");
+
+        // Com save: true, pede aprovação de write-file.
+        let err = registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo", "save": true }),
+            )
+            .expect_err("devia recusar sem aprovação de write-file");
+        assert!(matches!(
+            err,
+            CommandError::NeedsApproval {
+                effect: Effect::WriteFile,
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ola",
+            "nada devia ter ido pro disco"
+        );
+
+        // Com a aprovação concedida, grava no disco na mesma chamada.
+        context.approved_effects.insert(Effect::WriteFile);
+        let result = registry
+            .run(
+                "edit",
+                &mut context,
+                serde_json::json!({ "path": path_str, "old_text": "oi", "new_text": "oi de novo", "save": true }),
+            )
+            .expect("devia aceitar com a aprovação concedida");
+        assert_eq!(result["saved"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "oi de novo",
+            "devia ter gravado no disco nesta mesma chamada"
+        );
+    }
+
+    /// ADR 0006 §8 (etapa 3f-prep): a mesma regra de conflito de
+    /// disco de `save_file` vale pro `save` de `edit` — se o buffer
+    /// já tinha uma edição não salva quando o disco mudou por fora
+    /// (o mesmo cenário que `save_file` recusa), a edição em memória
+    /// desta chamada ainda acontece, mas a chamada inteira recusa
+    /// (nada vai pro disco).
+    #[test]
+    fn edit_com_save_recusa_se_o_disco_mudou() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.txt", "ola");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+        open_file(
+            &mut context,
+            OpenFileArgs {
+                path: path_str.clone(),
+            },
+        )
+        .expect("abrir");
+        edit(
+            &mut context,
+            EditArgs {
+                path: path_str.clone(),
+                old_text: "ola".to_string(),
+                new_text: "ola editado".to_string(),
+                line_range: None,
+                save: false,
+            },
+        )
+        .expect("primeira edição, só em memória");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, "mudou por fora").expect("simular mudança externa");
+
+        let err = edit(
+            &mut context,
+            EditArgs {
+                path: path_str,
+                old_text: "editado".to_string(),
+                new_text: "editado e a IA editou de novo".to_string(),
+                line_range: None,
+                save: true,
+            },
+        )
+        .expect_err("devia recusar o save por conflito de disco");
+        assert!(matches!(err, CommandError::DiskChanged(_)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mudou por fora",
+            "nunca deveria ter sobrescrito a mudança externa"
+        );
+    }
+
+    /// ADR 0006 §8 (etapa 3f-prep): `list_symbols`/`read_symbol` num
+    /// arquivo Rust real do próprio repositório (este mesmo crate,
+    /// `effect.rs`, copiado pra dentro da raiz do `Workspace` de
+    /// teste — `resolve` recusaria o caminho original, fora dela) —
+    /// método qualificado e doc comments inclusos.
+    #[test]
+    fn list_symbols_e_read_symbol_em_arquivo_rust_real_do_repositorio() {
+        let real_content = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/effect.rs"),
+        )
+        .expect("ler o arquivo real do repositório");
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "effect.rs", &real_content);
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let listed = list_symbols(
+            &mut context,
+            ListSymbolsArgs {
+                path: path_str.clone(),
+            },
+        )
+        .expect("listar símbolos");
+        let effect_enum = listed
+            .symbols
+            .iter()
+            .find(|s| s.name == "Effect")
+            .expect("deveria achar o enum Effect");
+        assert_eq!(effect_enum.kind, "enum");
+        assert!(
+            listed
+                .symbols
+                .iter()
+                .any(|s| s.name == "Effect::policy_key" && s.kind == "method"),
+            "deveria achar o método qualificado Effect::policy_key: {listed:?}"
+        );
+
+        let read = read_symbol(
+            &mut context,
+            ReadSymbolArgs {
+                path: path_str,
+                name: "Effect::policy_key".to_string(),
+            },
+        )
+        .expect("ler o símbolo qualificado");
+        assert_eq!(read.kind, "method");
+        assert!(
+            read.text.contains("pedem aprovação"),
+            "devia incluir o doc comment logo acima: {}",
+            read.text
+        );
+    }
+
+    #[test]
+    fn read_symbol_recusa_nome_ambiguo_listando_candidatos() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(
+            dir.path(),
+            "a.rs",
+            "pub struct Dup { x: i32 }\n\npub struct Dup { y: i32 }\n",
+        );
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let err = read_symbol(
+            &mut context,
+            ReadSymbolArgs {
+                path: path_str,
+                name: "Dup".to_string(),
+            },
+        )
+        .expect_err("devia recusar por ambiguidade");
+        match err {
+            CommandError::AmbiguousSymbol(candidates) => {
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates[0].contains("linha 1"));
+                assert!(candidates[1].contains("linha 3"));
+            }
+            other => panic!("esperava AmbiguousSymbol, veio {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_symbol_recusa_nome_inexistente() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.rs", "pub fn existe() {}\n");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let err = read_symbol(
+            &mut context,
+            ReadSymbolArgs {
+                path: path_str,
+                name: "nao_existe".to_string(),
+            },
+        )
+        .expect_err("devia recusar");
+        assert!(matches!(err, CommandError::SymbolNotFound(_)));
+    }
+
+    #[test]
+    fn list_symbols_em_markdown_usa_titulos_como_simbolos() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(
+            dir.path(),
+            "a.md",
+            "# Título\ntexto\n## Subtítulo\nmais texto\n",
+        );
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let result = list_symbols(&mut context, ListSymbolsArgs { path: path_str })
+            .expect("listar símbolos do Markdown");
+
+        assert_eq!(result.symbols.len(), 2);
+        assert_eq!(result.symbols[0].kind, "heading");
+        assert_eq!(result.symbols[0].name, "Título");
+        assert_eq!(result.symbols[1].name, "Subtítulo");
+    }
+
+    #[test]
+    fn list_symbols_recusa_linguagem_nao_suportada() {
+        let dir = tempfile::tempdir().expect("diretório temporário");
+        let path = write(dir.path(), "a.py", "def f():\n    pass\n");
+        let mut ws = workspace(dir.path());
+        let mut context = ctx(&mut ws, Author::User);
+        let path_str = path.to_string_lossy().into_owned();
+
+        let err = list_symbols(&mut context, ListSymbolsArgs { path: path_str })
+            .expect_err("devia recusar linguagem não suportada");
+        assert!(matches!(err, CommandError::UnsupportedLanguage(_)));
+    }
+
     /// ADR 0006 §6 (etapa 3e): a primeira mudança efetiva de uma
     /// sessão de IA cria um checkpoint automático "antes da sessão de
     /// <agent>" — uma segunda mudança efetiva, na mesma sessão, não
@@ -1469,17 +2147,42 @@ mod tests {
     }
 
     #[test]
-    fn registry_expoe_os_dez_comandos_com_efeito() {
+    fn registry_expoe_os_doze_comandos_com_efeito() {
         let mut registry = Registry::new();
         register_all(&mut registry);
 
-        assert_eq!(registry.specs().len(), 10);
+        assert_eq!(registry.specs().len(), 12);
         let edit_spec = registry.get("edit").expect("edit deveria existir");
         assert_eq!(edit_spec.effect, Effect::WriteBuffer);
         assert!(registry.get("comando-que-nao-existe").is_none());
         assert!(
             registry.specs().iter().all(|spec| spec.exposed_to_ai),
-            "os dez comandos deveriam estar marcados como expostos à IA"
+            "os doze comandos deveriam estar marcados como expostos à IA"
+        );
+    }
+
+    /// ADR 0006 §5/§8 (etapa 3f-prep): o efeito de `edit` depende do
+    /// argumento `save` — `max_effect` (usado só pra anotação MCP
+    /// estática) é sempre o pior caso (`WriteFile`), mas
+    /// `effective_effect` por chamada muda com o argumento.
+    #[test]
+    fn edit_tem_efeito_dependente_do_argumento_save() {
+        let mut registry = Registry::new();
+        register_all(&mut registry);
+        let edit_spec = registry.get("edit").expect("edit deveria existir");
+
+        assert_eq!(edit_spec.max_effect, Effect::WriteFile);
+        assert_eq!(
+            edit_spec.effective_effect(&serde_json::json!({})),
+            Effect::WriteBuffer
+        );
+        assert_eq!(
+            edit_spec.effective_effect(&serde_json::json!({ "save": false })),
+            Effect::WriteBuffer
+        );
+        assert_eq!(
+            edit_spec.effective_effect(&serde_json::json!({ "save": true })),
+            Effect::WriteFile
         );
     }
 
@@ -1555,6 +2258,7 @@ mod tests {
             &mut context,
             ReadArgs {
                 path: outside.to_string_lossy().into_owned(),
+                ..Default::default()
             },
         )
         .expect_err("devia recusar");
