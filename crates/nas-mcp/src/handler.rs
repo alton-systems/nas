@@ -304,7 +304,13 @@ fn render_diffs(value: &serde_json::Value) -> String {
 /// 0006 §5/ADR 0007-configuracao-em-camadas.md §5), nunca uma
 /// segunda lista mantida à mão.
 fn spec_to_tool(spec: &CommandSpec) -> Tool {
-    let input_schema = spec.args_schema.as_object().cloned().unwrap_or_default();
+    let mut input_schema = spec.args_schema.as_object().cloned().unwrap_or_default();
+    // `$schema` (a URL do meta-esquema) e `title` (o nome da struct
+    // Rust interna, ex. "EditArgs") não ajudam o agente a chamar a
+    // ferramenta — só inflam `tools/list`, pago em toda mensagem
+    // (ADR 0006 §8, revisão).
+    input_schema.remove("$schema");
+    input_schema.remove("title");
     Tool {
         name: spec.name.into(),
         description: Some(spec.description.into()),
@@ -454,6 +460,34 @@ mod tests {
             project_root: project_root.to_path_buf(),
             history_dir: history_dir.map(Path::to_path_buf),
         })
+    }
+
+    /// ADR 0006 §8 (revisão): orçamento de tamanho pra `tools/list` —
+    /// pago em toda mensagem de uma sessão de IA, então uma
+    /// ferramenta nova ou uma descrição/esquema que cresceu demais
+    /// não pode regredir em silêncio. 5500 caracteres dá uma margem
+    /// sobre os ~4850 medidos com as doze ferramentas de hoje; se
+    /// este teste falhar, encurte descrições antes de subir o
+    /// limite.
+    #[test]
+    fn tools_list_cabe_no_orcamento_de_tamanho() {
+        let mut registry = Registry::new();
+        nas_commands::register_all(&mut registry);
+        let tools: Vec<Tool> = registry
+            .specs()
+            .iter()
+            .filter(|spec| spec.exposed_to_ai)
+            .map(spec_to_tool)
+            .collect();
+        let result = ListToolsResult::with_all_items(tools);
+        let json = serde_json::to_string(&result).expect("serializar tools/list");
+
+        const LIMIT: usize = 5500;
+        assert!(
+            json.len() < LIMIT,
+            "tools/list tem {} caracteres, passou do orçamento de {LIMIT}",
+            json.len()
+        );
     }
 
     #[test]

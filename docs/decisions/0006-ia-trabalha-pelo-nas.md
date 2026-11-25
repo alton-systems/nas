@@ -826,16 +826,50 @@ depois.
   **Tamanho de `tools/list` (pedido no resumo do PR), antes e depois
   desta etapa** (medido chamando `tools/list` de verdade sobre o
   protocolo, `docs/mcp.md`): 10 ferramentas, 4541 caracteres
-  (~1135 tokens estimados, 4 caracteres/token) antes; 12
-  ferramentas, 7187 caracteres (~1796 tokens estimados) depois — um
-  aumento de ~58%, inteiramente das duas ferramentas novas
-  (`list_symbols`/`read_symbol`), a única exceção ao princípio desta
-  etapa. O ganho do resto da etapa (intervalo de `read`, `save` de
-  `edit`, abrir sozinho, trecho de contexto no `edit`) não aparece
-  em `tools/list` — é por chamada, no benchmark (3f): menos
-  `open_file` redundante, menos `read` de arquivo inteiro só pra
-  achar um trecho, menos `save_file` como segunda chamada, menos
-  `read` de confirmação depois de um `edit`.
+  (~1135 tokens estimados, 4 caracteres/token) antes; 12 ferramentas,
+  **4849 caracteres (~1212 tokens estimados) depois** — +7%, não os
+  quase 60% que a primeira versão desta etapa chegou a medir (7187
+  caracteres) antes da revisão abaixo.
+
+  **Revisão de PR: as descrições inflavam `tools/list` com detalhe
+  de implementação, não de uso.** O `schemars` usa, por padrão, o
+  próprio doc comment Rust (`///`) de cada campo como a descrição no
+  esquema JSON — e esses comentários foram escritos pra quem lê o
+  código (referências de ADR, nomes internos como `DiskChanged`/
+  `WriteBuffer`, por que uma regra existe), não pra quem só precisa
+  saber como chamar a ferramenta. Isso vai pro modelo em toda
+  mensagem de uma sessão, então pesa de verdade na métrica de tokens
+  do benchmark (3f) — o `tools/list` em si, não só o custo por
+  chamada. Correção, em três partes:
+  - cada campo que precisa de explicação ganha
+    `#[schemars(description = "...")]` — uma frase curta, escrita
+    pra quem chama (ex.: `save: "grava no disco após editar; pede
+    permissão de escrita"`) — que o `schemars` sempre prioriza sobre
+    o doc comment quando os dois existem; o comentário de
+    implementação continua no código, como `//` comum, fora do
+    esquema; um campo autoevidente (`path`, na maioria dos comandos)
+    não ganha descrição nenhuma, pra não repetir a mesma frase doze
+    vezes;
+  - a descrição de cada um dos doze comandos (o segundo argumento de
+    `typed_command`) virou uma frase objetiva só, sem referência
+    interna (nada de "ADR 0006", `CommandError::...`,
+    `Workspace::...`);
+  - `nas-mcp::spec_to_tool` remove `$schema` (a URL do meta-esquema)
+    e `title` (o nome da struct Rust, ex. `"EditArgs"`) do
+    `inputSchema` de cada ferramenta — nenhum dos dois ajuda o
+    agente a chamar a ferramenta, só repete texto fixo doze vezes.
+
+  Um teste em `nas-mcp` (`tools_list_cabe_no_orcamento_de_tamanho`)
+  monta a mesma lista que `tools/list` devolveria e falha se passar
+  de 5500 caracteres — pra uma ferramenta nova, ou uma descrição que
+  cresça demais depois, não regredir esse número em silêncio.
+
+  O ganho do resto da etapa (intervalo de `read`, `save` de `edit`,
+  abrir sozinho, trecho de contexto no `edit`) não aparece em
+  `tools/list` — é por chamada, no benchmark (3f): menos `open_file`
+  redundante, menos `read` de arquivo inteiro só pra achar um
+  trecho, menos `save_file` como segunda chamada, menos `read` de
+  confirmação depois de um `edit`.
 - **3f** — benchmark comparativo: rodar as cinco tarefas, três vezes
   por lado, em ordem alternada (§7), escrever
   `docs/benchmark-fase3.md` — **incluindo a ressalva de 3c** sobre a
