@@ -45,16 +45,18 @@ depois da primeira chamada.
 ## Permissões
 
 `open_file`, `read`, `search`, `list_files`, `list_symbols`,
-`read_symbol`, `edit` e `checkpoint_create` rodam direto — são
-`Pure`, `ReadFile`, `WriteBuffer` ou `WriteHistory` (ADR 0006 §5):
-nenhum toca o disco do projeto de verdade, nem sai dele. `create_file`,
-`checkpoint_restore` e `save_file` são `WriteFile` — pedem aprovação.
+`read_symbol` e `checkpoint_create` rodam direto — são `Pure`,
+`ReadFile` ou `WriteHistory` (ADR 0006 §5): nenhum toca o disco do
+projeto de verdade, nem sai dele. `create_file`, `checkpoint_restore`,
+`save_file` e `edit` (veja abaixo) são `WriteFile` — pedem aprovação.
 
-**`edit` com `save: true` também é `WriteFile`** (etapa 3f-prep): o
-efeito de uma chamada de `edit` depende do argumento `save` — sem
-ele (ou com `false`), é `WriteBuffer`, livre; com `true`, grava no
-disco na mesma chamada e passa a pedir a mesma aprovação de
-`save_file`.
+**`edit` grava no disco por padrão** (revisão pós-benchmark da etapa
+3f-prep): o efeito de uma chamada de `edit` depende do argumento
+`save` — sem ele, vale `true`, grava no disco na mesma chamada e pede
+a mesma aprovação de `save_file`; com `save: false` explícito, é
+`WriteBuffer`, livre, e nada vai pro disco (útil pra várias edições em
+sequência antes de salvar uma vez só, com `save_file` ou um último
+`edit` sem `save: false`).
 
 A aprovação, nesta etapa, vem só de um arquivo:
 
@@ -128,13 +130,19 @@ ainda não estiver aberto como buffer (etapa 3f-prep) — `open_file`
 continua existindo pra quem quiser abrir explicitamente (ou saber se
 houve aviso de recarregar).
 
-`edit` muda só o buffer deste processo — nada vai pro disco sem
-`save_file` (ou `edit` com `save: true`, abaixo), que recusa (pedindo
-pra reabrir com `open_file`) se o arquivo mudou no disco desde a
-última leitura, pra nunca sobrescrever o trabalho de outro processo.
-O resultado de `edit` inclui o trecho alterado (até três linhas de
-contexto antes e depois, numeradas) — pra conferir o efeito sem
-precisar de um `read` extra.
+`edit` grava no disco na mesma chamada por padrão (acima) — ou
+`save_file` separado, depois de um `edit` com `save: false` — e os
+dois recusam (pedindo pra reabrir com `open_file`) se o arquivo mudou
+no disco desde a última leitura, pra nunca sobrescrever o trabalho de
+outro processo. O resultado de `edit` inclui o trecho alterado (até
+três linhas de contexto antes e depois, numeradas) — pra conferir o
+efeito sem precisar de um `read` extra.
+
+Quando `old_text` não é encontrado, o erro inclui até três linhas (já
+numeradas) da região pesquisada, as mais parecidas com a primeira
+linha de `old_text` — só uma pista pra uma segunda tentativa, nunca
+usada pra decidir uma correspondência de verdade (`edit` continua
+nunca adivinhando, ADR 0006 §3).
 
 `read` aceita `start_line`/`end_line` (1-indexadas, inclusive;
 tolerante a valores fora dos limites do arquivo) pra ler só um

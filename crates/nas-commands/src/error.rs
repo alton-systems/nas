@@ -18,8 +18,14 @@ pub enum CommandError {
     NotOpen(String),
     /// Falha de E/S (abrir, ler, escrever um arquivo; checkpoint).
     Io(io::Error),
-    /// `edit`: o texto antigo não foi encontrado.
-    NoMatch,
+    /// `edit`: o texto antigo não foi encontrado — até três linhas já
+    /// numeradas (`"42 fn parecido() {"`) da região pesquisada, mais
+    /// parecidas com a primeira linha de `old_text`, pra ajudar numa
+    /// segunda tentativa; vazio se nada tiver nenhuma palavra em
+    /// comum. Nunca usado pra decidir uma correspondência de verdade
+    /// — só uma pista no erro, `edit` continua recusando sem aplicar
+    /// nada (ADR 0006 §3: "nunca adivinha").
+    NoMatch(Vec<String>),
     /// `edit`: o texto antigo apareceu mais de uma vez — `count`
     /// ocorrências — sem um `line_range` que desambigue pra uma só.
     Ambiguous(usize),
@@ -68,7 +74,16 @@ impl fmt::Display for CommandError {
                 write!(f, "{path:?} não está aberto — chame open_file primeiro")
             }
             CommandError::Io(err) => write!(f, "{err}"),
-            CommandError::NoMatch => write!(f, "texto antigo não encontrado"),
+            CommandError::NoMatch(candidates) if candidates.is_empty() => {
+                write!(f, "texto antigo não encontrado")
+            }
+            CommandError::NoMatch(candidates) => {
+                write!(
+                    f,
+                    "texto antigo não encontrado — linhas parecidas na região pesquisada:\n{}",
+                    candidates.join("\n")
+                )
+            }
             CommandError::Ambiguous(count) => {
                 write!(
                     f,

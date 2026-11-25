@@ -1,3 +1,10 @@
 /target
 **/target
 *.swp
+
+# Resultados do benchmark (ADR 0006 §7) são gerados por bench/rodar.sh
+# — transcrições completas e JSONs, não versionados; bench/resumir lê
+# daqui pra montar docs/benchmark-fase3.md.
+/bench/resultados/*/
+
+__pycache__/
