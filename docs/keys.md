@@ -377,6 +377,21 @@ revisão — "trecho alterado" — mesmo que hoje só `[review]` de fato
 ligue algo a ele (ver §6). `H` não generaliza: "o próximo arquivo" só
 faz sentido com mais de um arquivo em jogo, o que só a revisão tem.
 
+**Depois de `u` com sucesso, a echo area diz se a rejeição já está no
+disco ou só pendente** — nunca uma mensagem genérica: "Trecho
+rejeitado e salvo." quando não havia buffer aberto pro arquivo (um é
+aberto só pra isto e salvo na hora); "Trecho rejeitado; arquivo com
+alterações não salvas." quando já havia um buffer aberto (a rejeição
+entra ali, sem salvar sozinho — o usuário decide quando salvar, como
+qualquer outra edição dele).
+
+**Um trecho pode ser "arquivo removido"** — o arquivo existia no
+checkpoint e não existe mais (nem buffer, nem disco): aparece como um
+trecho só, com o conteúdo antigo inteiro do lado `-`. `Enter` aceita
+normalmente; `u` recria o arquivo com o conteúdo do checkpoint (mesma
+mensagem salvo/pendente acima); `g h` não tem arquivo real pra abrir
+— avisa em vez de abrir um buffer vazio numa linha que não existe.
+
 A dica which-key de `[review]` é **persistente** na echo area
 enquanto o estado for `Review` — ao contrário da dica de um
 verbo/prefixo/unidade pendente (regra 8), que só aparece até a tecla
