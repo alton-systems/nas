@@ -44,11 +44,17 @@ depois da primeira chamada.
 
 ## Permissões
 
-`open_file`, `read`, `search`, `list_files`, `edit` e
-`checkpoint_create` rodam direto — são `Pure`, `ReadFile`,
-`WriteBuffer` ou `WriteHistory` (ADR 0006 §5): nenhum toca o disco do
-projeto de verdade, nem sai dele. `create_file`, `checkpoint_restore`
-e `save_file` são `WriteFile` — pedem aprovação.
+`open_file`, `read`, `search`, `list_files`, `list_symbols`,
+`read_symbol`, `edit` e `checkpoint_create` rodam direto — são
+`Pure`, `ReadFile`, `WriteBuffer` ou `WriteHistory` (ADR 0006 §5):
+nenhum toca o disco do projeto de verdade, nem sai dele. `create_file`,
+`checkpoint_restore` e `save_file` são `WriteFile` — pedem aprovação.
+
+**`edit` com `save: true` também é `WriteFile`** (etapa 3f-prep): o
+efeito de uma chamada de `edit` depende do argumento `save` — sem
+ele (ou com `false`), é `WriteBuffer`, livre; com `true`, grava no
+disco na mesma chamada e passa a pedir a mesma aprovação de
+`save_file`.
 
 A aprovação, nesta etapa, vem só de um arquivo:
 
@@ -111,15 +117,40 @@ Pra chamar uma ferramenta, acrescente uma linha `tools/call`:
 Vêm do mesmo registro que `nas-commands` usa internamente
 (`Registry::specs()`), filtradas pela marcação `exposed_to_ai` de
 cada comando — não existe uma lista separada pra manter em dia. Hoje,
-dez comandos: `open_file`, `read`, `search`, `list_files`, `edit`,
-`show_diff`, `create_file`, `checkpoint_create`, `checkpoint_restore`
-e `save_file`. O esquema de cada um (nome dos argumentos,
-obrigatórios, descrição) vem de `schemars`, visível via `tools/list`.
+doze comandos: `open_file`, `read`, `search`, `list_files`, `edit`,
+`list_symbols`, `read_symbol`, `show_diff`, `create_file`,
+`checkpoint_create`, `checkpoint_restore` e `save_file`. O esquema de
+cada um (nome dos argumentos, obrigatórios, descrição) vem de
+`schemars`, visível via `tools/list`.
+
+**`read`, `edit` e `save_file` abrem o arquivo sozinhos** se ele
+ainda não estiver aberto como buffer (etapa 3f-prep) — `open_file`
+continua existindo pra quem quiser abrir explicitamente (ou saber se
+houve aviso de recarregar).
 
 `edit` muda só o buffer deste processo — nada vai pro disco sem
-`save_file`, que recusa (pedindo pra reabrir com `open_file`) se o
-arquivo mudou no disco desde a última leitura, pra nunca sobrescrever
-o trabalho de outro processo.
+`save_file` (ou `edit` com `save: true`, abaixo), que recusa (pedindo
+pra reabrir com `open_file`) se o arquivo mudou no disco desde a
+última leitura, pra nunca sobrescrever o trabalho de outro processo.
+O resultado de `edit` inclui o trecho alterado (até três linhas de
+contexto antes e depois, numeradas) — pra conferir o efeito sem
+precisar de um `read` extra.
+
+`read` aceita `start_line`/`end_line` (1-indexadas, inclusive;
+tolerante a valores fora dos limites do arquivo) pra ler só um
+intervalo em vez do arquivo inteiro — o resultado começa com um
+cabeçalho (`linhas X–Y de N`) dizendo qual intervalo saiu e quantas
+linhas o arquivo tem no total.
+
+`list_symbols(path)` lista os símbolos de um arquivo — em Rust:
+funções, métodos (qualificados `Tipo::metodo`), structs, enums,
+traits, impls, consts e mods, cada um com tipo e intervalo de linhas;
+em Markdown: os títulos. Outras extensões recusam com um erro de
+linguagem não suportada. `read_symbol(path, name)` devolve o texto
+completo de um símbolo (aceita o nome qualificado pra desambiguar
+entre tipos), incluindo doc comments/atributos logo acima; se o nome
+bater com mais de um símbolo, recusa listando os candidatos com suas
+linhas.
 
 ## Autoria
 

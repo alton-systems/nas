@@ -378,8 +378,29 @@ que algo de verdade as produzir.
 - **Pedem aprovação**: `WriteFile`, `Shell` e `Network` — tocam o
   disco de verdade (fora do armazenamento do histórico) ou saem do
   projeto. Isso cobre `create_file`, `checkpoint_restore` e
-  `save_file` entre os dez comandos de §1 — `checkpoint_create` não,
+  `save_file` entre os comandos de §1 — `checkpoint_create` não,
   pela razão acima.
+  **Efeito dependente de argumento (revisão da etapa 3f-prep, §8):**
+  `edit` ganhou uma opção `save` que grava a mudança no disco na
+  mesma chamada — o efeito de uma chamada de `edit` passa a ser
+  `WriteBuffer` (livre) ou `WriteFile` (pede aprovação), decidido
+  pelo valor de `save` **daquela chamada**, nunca um efeito fixo por
+  comando. `CommandSpec` passa a distinguir dois efeitos: o nominal
+  (`effect`, o que a maioria dos comandos usa sempre) e o "pior caso"
+  entre todos os argumentos possíveis (`max_effect`) — só este
+  segundo é usado pra anotar a ferramenta em `tools/list`
+  (`destructive_hint`, abaixo), de forma conservadora, já que a lista
+  de ferramentas não vê os argumentos de uma chamada específica
+  ainda. A decisão de aprovação de verdade nunca usa nenhum dos dois
+  direto — usa sempre `effective_effect(args)`, calculado a partir
+  dos argumentos crus da chamada (uma leitura otimista de `args.save`,
+  nunca uma validação completa — essa continua sendo o `Deserialize`
+  de dentro do próprio comando). Esse cálculo mora no `Registry::run`
+  em si (não só em `nas-mcp`), que é o único caminho de execução de
+  qualquer comando — por isso não existe jeito de `edit(save: true)`
+  gravar no disco sem passar pela aprovação de `write-file`, mesmo
+  chamando o registro direto (como um teste faz), sem o adaptador MCP
+  no meio.
   **`--approve-writes` (revisão da etapa 3c, temporário)**: até a
   etapa 3d existir de verdade, `nas --mcp --approve-writes` foi o
   único jeito de liberar `WriteFile` (nunca `Shell`/`Network`, que não
@@ -626,7 +647,7 @@ de edição, e passa a focar em histórico e supervisão sobre o que a IA
 já faz direto, em vez de MCP de edição.
 
 Registro: uma tabela em `docs/benchmark-fase3.md`, uma linha por
-(tarefa, lado, rodada) — dezoito linhas no total (cinco tarefas × dois
+(tarefa, lado, rodada) — trinta linhas no total (cinco tarefas × dois
 lados × três rodadas) — mais o quadro separado de integridade e
 rastreabilidade acima — rodada manual registrada à mão (com coleta
 automatizada por sessão, como descrito nas condições), não um
@@ -746,7 +767,75 @@ depois.
   - duas ferramentas novas — única exceção ao princípio acima, por
     não existir parâmetro equivalente nas ferramentas de hoje:
     `list_symbols` e `read_symbol`, via Tree-sitter, começando por
-    poucas linguagens (não todas de uma vez).
+    Rust e títulos de Markdown (não todas as linguagens de uma vez).
+
+  **Implementado (revisão): `tree-house-bindings`, não a crate
+  oficial `tree-sitter`.** O plano original era a crate oficial
+  `tree-sitter` + `tree-sitter-rust`, com a gramática embutida no
+  binário via `cc` (crate nova, `nas-syntax`, isolando Tree-sitter do
+  resto do workspace do mesmo jeito que a decisão 0001 isola
+  `helix-core`). Na prática, isso **não linka**: `helix-core` (já
+  fixado por aquela mesma decisão 0001) depende de
+  `tree-house-bindings` — o fork do Helix das próprias bindings de
+  tree-sitter, que vendora e compila sua própria cópia do runtime C
+  (`language.c`, `lib.c`, ...). A crate oficial `tree-sitter` vendora
+  e compila **a mesma coisa**, com os mesmos nomes de símbolo C (sem
+  *mangling*, ex. `ts_language_delete`), então o binário `nas`
+  (que precisa das duas metades — `nas-editor`/`helix-core` e
+  `nas-commands`/`nas-syntax`) falha o link com dúzias de `duplicate
+  symbol`. Não existe um jeito de pedir pra nenhuma das duas crates
+  não vendorar sua própria cópia.
+
+  A correção, isolada inteiramente dentro de `nas-syntax` (nenhum
+  outro crate sabe que `tree-house-bindings` existe): depender da
+  **mesma** `tree-house-bindings` que `helix-core` já traz — o Cargo
+  unifica pra uma única cópia compilada quando a versão é
+  compatível, então não há nenhuma duplicação. Antes de usar essa
+  crate de baixo nível, de fato avaliada a camada de cima que o
+  Helix usa pra destaque de sintaxe (`tree-house`, que a reaproveita
+  por baixo) — ela não serve pro que `list_symbols`/`read_symbol`
+  precisam: sua API (`Syntax::new`) exige um `LanguageLoader`
+  fornecendo `LanguageConfig` com *queries* `.scm` compiladas
+  (highlights/injections/locals), pensada pra destaque incremental
+  com injeção de linguagens, não pra "percorrer a árvore de um
+  arquivo e extrair os nomes com seus campos" — a montagem desse
+  aparato só pra satisfazer o contrato, sem usar nada do que ele
+  oferece de fato, seria complexidade sem benefício agora (ela
+  continua candidata óbvia pro destaque de sintaxe de verdade,
+  quando essa etapa chegar — `nas-syntax` não fica menos reaproveitável
+  por isso, já que é a mesma base). A API de baixo nível
+  (`Parser`/`Tree`/`Node`/`TreeCursor`), em troca, é próxima o
+  suficiente da API da crate oficial (que o protótipo original já
+  usava) pra ser uma troca direta — a diferença principal é que o
+  parser precisa de um `Input`/`Cursor` (do `regex-cursor`, pensado
+  pra rope) em vez de aceitar um `&str` puro; como não há
+  fragmentação nenhuma pra percorrer (o arquivo inteiro cabe num `&str`
+  contíguo), a implementação é um `Input` trivial de um único
+  "chunk" (`nas-syntax/src/rust.rs`, `StrInput`). Compatibilidade de
+  versão (ABI) confirmada na prática, não só por leitura: os testes
+  deste crate (`cargo test -p nas-syntax`) de fato chamam
+  `Grammar::try_from(tree_sitter_rust::LANGUAGE)` e falhariam com
+  `IncompatibleVersion` se a gramática gerada por `tree-sitter-rust
+  0.24.2` (ABI 14 ou 15) não estivesse dentro da faixa que o
+  `tree-house-bindings` fixado aceita (`13..=15`); passam. Markdown
+  não usa Tree-sitter nenhum (títulos ATX são reconhecíveis por
+  escaneamento de texto puro, `nas-syntax/src/markdown.rs`), então não
+  há gramática de Markdown cuja compatibilidade de ABI precisasse ser
+  conferida.
+
+  **Tamanho de `tools/list` (pedido no resumo do PR), antes e depois
+  desta etapa** (medido chamando `tools/list` de verdade sobre o
+  protocolo, `docs/mcp.md`): 10 ferramentas, 4541 caracteres
+  (~1135 tokens estimados, 4 caracteres/token) antes; 12
+  ferramentas, 7187 caracteres (~1796 tokens estimados) depois — um
+  aumento de ~58%, inteiramente das duas ferramentas novas
+  (`list_symbols`/`read_symbol`), a única exceção ao princípio desta
+  etapa. O ganho do resto da etapa (intervalo de `read`, `save` de
+  `edit`, abrir sozinho, trecho de contexto no `edit`) não aparece
+  em `tools/list` — é por chamada, no benchmark (3f): menos
+  `open_file` redundante, menos `read` de arquivo inteiro só pra
+  achar um trecho, menos `save_file` como segunda chamada, menos
+  `read` de confirmação depois de um `edit`.
 - **3f** — benchmark comparativo: rodar as cinco tarefas, três vezes
   por lado, em ordem alternada (§7), escrever
   `docs/benchmark-fase3.md` — **incluindo a ressalva de 3c** sobre a
