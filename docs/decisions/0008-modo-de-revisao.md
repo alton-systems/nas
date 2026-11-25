@@ -190,6 +190,36 @@ Vec<Author>`), mas é composição de três coisas que já existem
 (journal, `ChangeSet`/`map_pos` do helix-core, e a decisão já tomada
 de que isso é possível) — não um mecanismo de autoria novo.
 
+**Um trecho que só remove texto é um caso degenerado, não uma
+exceção.** O lado "depois" de um trecho de remoção pura é vazio — uma
+faixa de **tamanho zero** no texto atual — e a entrada do journal que
+fez a remoção, uma vez remapeada, também vira um span de tamanho
+zero (ela apagou texto e não inseriu nada). "Intersecta a faixa do
+trecho", acima, precisa tratar um intervalo de tamanho zero como um
+**ponto**, não como "vazio, nunca toca nada": dois pontos só se
+tocam se coincidirem exatamente; um ponto toca uma faixa não-vazia se
+cair **dentro dela, bordas incluídas** — inclusivo nas duas pontas
+porque uma remoção bem no início ou no fim do arquivo ainda precisa
+contar. Sem essa regra, toda remoção pura apareceria como "autoria
+desconhecida", mesmo com a entrada exata no journal.
+
+**Arquivo removido.** Um arquivo que o checkpoint ("antes") rastreava
+e que agora não existe mais — nem buffer aberto, nem no disco —
+aparece como **um trecho só**, rotulado "arquivo removido", com o
+conteúdo antigo inteiro em linhas `-` (nenhuma linha `+`). A
+identidade do trecho (`hunk_hash`, §5) usa o mesmo formato de sempre
+— `(caminho, checkpoint, "antes" = conteúdo antigo inteiro, "depois"
+= texto vazio, linha de início no "antes" = 1)` — sem precisar de um
+caso especial no hash. A autoria vem do mesmo `attribute_hunk`,
+consultado no ponto `(0, 0)`: como não há texto atual pra comparar, a
+autoria relevante é de quem fez a remoção em si — tipicamente uma
+entrada que apaga do início ao fim do arquivo, cujo span remapeado
+(tamanho zero, por ser uma remoção pura) cai exatamente ali. O resumo
+do topo (acima) conta quantos trechos são arquivo removido, além das
+contagens de sempre — eles já entram nas contagens de arquivos/
+trechos normais, por serem um `ReviewHunk` como outro qualquer; a
+conta extra só destaca quantos são isso.
+
 ### 3. Ações por trecho
 
 Três ações, cada uma agindo sobre o trecho sob o cursor (ou
@@ -199,6 +229,8 @@ selecionado, §4):
   mesma revisão (mesmo checkpoint "antes") depois mostra que aquele
   trecho já foi visto, mesmo que o nas tenha sido fechado e reaberto
   entre as duas vezes. Não muda nenhum texto — é só um registro (§5).
+  Um trecho "arquivo removido" (§2) aceita do mesmo jeito — marcar
+  como revisado não recria nada, só reconhece a remoção.
 - **Rejeitar**: desfaz **só aquele trecho** no arquivo — restaura, só
   naquela faixa, o texto do lado "antes" do trecho (o conteúdo do
   checkpoint) — como uma edição comum do usuário: passa por
@@ -219,11 +251,31 @@ selecionado, §4):
   mesma tecla que, no arquivo real, desfaz a última transação
   (inclusive, se for o caso, a que o próprio rejeitar acabou de
   criar): dois contextos, não dois significados.
+
+  **Rejeitar num trecho "arquivo removido" (§2) recria o arquivo** com
+  o conteúdo do checkpoint, pelo mesmo caminho (edição do usuário,
+  journalada, desfazível com `u` no arquivo real) — a condição de
+  "ainda é o que a IA deixou" aqui é "o arquivo ainda está ausente";
+  se algo já recriou o arquivo com outro conteúdo nesse meio tempo,
+  recusa com a mesma mensagem de sempre, em vez de sobrescrever.
+
+  **A echo area diz se a rejeição ficou salva ou pendente** — as duas
+  situações possíveis depois de rejeitar com sucesso, qualquer um dos
+  dois casos acima: se não havia buffer aberto pra aquele arquivo
+  (um é aberto só pra esta rejeição e salvo na hora, senão o arquivo
+  real nunca mudaria), a mensagem é "Trecho rejeitado e salvo."; se já
+  havia um buffer aberto (a rejeição aplica ali, sem salvar sozinho —
+  o usuário decide quando salvar, como qualquer outra edição dele), a
+  mensagem é "Trecho rejeitado; arquivo com alterações não salvas."
+  Nunca uma mensagem genérica que esconda qual dos dois aconteceu.
 - **Ir até lá**: abre o arquivo (buffer já aberto, ou abre um novo)
   na linha do trecho (lado "depois") e **sai da revisão** — não há
   "voltar pra revisão" automático; reabrir é `Ctrl+t v` (ou `Ctrl+t
   V`, se o checkpoint "antes" não for o padrão) de novo, que retoma
-  de onde a persistência do `aceitar`/`rejeitar` deixou.
+  de onde a persistência do `aceitar`/`rejeitar` deixou. Num trecho
+  "arquivo removido" não há arquivo nenhum pra abrir — avisa isso em
+  vez de abrir um buffer vazio numa linha que não existe; rejeitar é
+  o caminho pra ter algo que abrir de novo.
 
 Um trecho sem seleção/cursor sobre ele (cursor no resumo, por
 exemplo) não tem uma ação válida — as três teclas abaixo não fazem
@@ -476,6 +528,16 @@ nas não tem equivalente), sem precisar de nenhuma contagem manual.
    dentro da revisão, abre o arquivo real na linha do trecho.
 9. `reviews_log.jsonl` registra início, fim e as contagens de uma
    sessão de revisão completa.
+10. Uma remoção pura (a IA apaga uma linha, sem inserir nada) atribui
+    ao autor certo, não "autoria desconhecida"; duas remoções em
+    pontos diferentes do mesmo arquivo não aparecem como "misto"; a
+    mesma remoção tocada por dois autores no mesmo ponto aparece como
+    "misto"; uma remoção bem no início e outra bem no fim do arquivo
+    atribuem corretamente as duas.
+11. Uma sessão de IA que apaga um arquivo (por `checkpoint_restore` ou
+    externamente) faz esse arquivo aparecer na revisão como um trecho
+    "arquivo removido"; rejeitar recria o arquivo com o conteúdo do
+    checkpoint.
 
 ## Consequências
 
