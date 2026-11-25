@@ -1,0 +1,10 @@
+[package]
+name = "nas-syntax"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tree-house-bindings = { version = "0.2", features = ["tree-sitter-language"] }
+tree-sitter-rust = "0.24"
